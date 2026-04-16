@@ -1,0 +1,173 @@
+package jobs
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/riverqueue/river"
+)
+
+// ExpireStacksArgs holds the arguments for the ExpireStacksJob.
+// No fields are needed — it's a periodic maintenance job.
+type ExpireStacksArgs struct{}
+
+func (ExpireStacksArgs) Kind() string { return "expire_stacks" }
+
+// inClusterK8sClient builds an HTTP client using the pod's projected ServiceAccount
+// token and CA certificate. Returns nil (with a warning) if not running in-cluster.
+func inClusterK8sClient() *http.Client {
+	const (
+		tokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+		caFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	)
+	if _, err := os.Stat(tokenFile); err != nil {
+		return nil // not running in-cluster
+	}
+	ca, err := os.ReadFile(caFile)
+	if err != nil {
+		slog.Warn("expire_stacks: cannot read SA CA cert — namespace teardown disabled", "error", err)
+		return nil
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca)
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+	}
+}
+
+// deleteK8sNamespace issues DELETE /api/v1/namespaces/{name} using the pod's SA token.
+// It is safe to call when the namespace does not exist (404 is treated as success).
+// The namespace name must start with nsPrefix as a safety guard.
+func deleteK8sNamespace(ctx context.Context, client *http.Client, namespace, nsPrefix string) error {
+	if !strings.HasPrefix(namespace, nsPrefix) {
+		// Safety guard: never delete namespaces we didn't create.
+		slog.Warn("expire_stacks: refusing to delete namespace — unexpected prefix",
+			"namespace", namespace, "expected_prefix", nsPrefix)
+		return nil
+	}
+
+	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return fmt.Errorf("deleteK8sNamespace: read SA token: %w", err)
+	}
+
+	apiURL := "https://kubernetes.default.svc/api/v1/namespaces/" + namespace
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("deleteK8sNamespace: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(tokenBytes)))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("deleteK8sNamespace: DELETE %s: %w", namespace, err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNotFound:
+		return nil // success or already gone
+	default:
+		return fmt.Errorf("deleteK8sNamespace: k8s returned %d for namespace %s", resp.StatusCode, namespace)
+	}
+}
+
+// ExpireStacksWorker hard-deletes anonymous stacks whose expires_at has passed,
+// and tears down their k8s namespaces when running inside the cluster.
+type ExpireStacksWorker struct {
+	river.WorkerDefaults[ExpireStacksArgs]
+	db           *sql.DB
+	k8sClient    *http.Client // nil when not in-cluster; namespace teardown is skipped
+	nsPrefix     string       // expected namespace prefix, e.g. "instant-apps-"
+}
+
+// NewExpireStacksWorker constructs an ExpireStacksWorker.
+// nsPrefix is the namespace prefix used by the stack provider (e.g. "instant-apps-").
+// Pass an empty string to disable namespace teardown (falls back to log-only).
+func NewExpireStacksWorker(db *sql.DB, nsPrefix string) *ExpireStacksWorker {
+	return &ExpireStacksWorker{
+		db:        db,
+		k8sClient: inClusterK8sClient(),
+		nsPrefix:  nsPrefix,
+	}
+}
+
+// Work queries for expired anonymous stacks and hard-deletes them, tearing down
+// their k8s namespaces when running inside the cluster.
+func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStacksArgs]) error {
+	start := time.Now()
+
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT id::text, slug, namespace
+		FROM stacks
+		WHERE expires_at IS NOT NULL
+		  AND expires_at < now()
+		  AND status NOT IN ('deleted', 'deleting', 'failed', 'stopped')
+	`)
+	if err != nil {
+		return fmt.Errorf("ExpireStacksWorker: query failed: %w", err)
+	}
+	defer rows.Close()
+
+	type expiredStack struct {
+		id        string
+		slug      string
+		namespace string
+	}
+	var expired []expiredStack
+	for rows.Next() {
+		var s expiredStack
+		if err := rows.Scan(&s.id, &s.slug, &s.namespace); err != nil {
+			return fmt.Errorf("ExpireStacksWorker: scan failed: %w", err)
+		}
+		expired = append(expired, s)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("ExpireStacksWorker: rows error: %w", err)
+	}
+	rows.Close()
+
+	var deleted int
+	for _, s := range expired {
+		// Tear down k8s namespace first — if this fails, skip DB deletion so we
+		// can retry next run. Fail-open: if not in-cluster, log and continue.
+		if w.k8sClient != nil && s.namespace != "" {
+			if nsErr := deleteK8sNamespace(ctx, w.k8sClient, s.namespace, w.nsPrefix); nsErr != nil {
+				slog.Error("jobs.expire_stacks.namespace_teardown_failed",
+					"slug", s.slug, "namespace", s.namespace, "error", nsErr)
+				continue // retry next hourly run
+			}
+			slog.Info("jobs.expire_stacks.namespace_deleted", "slug", s.slug, "namespace", s.namespace)
+		} else if s.namespace != "" {
+			slog.Info("jobs.expire_stacks.namespace_skipped",
+				"slug", s.slug,
+				"namespace", s.namespace,
+				"note", "not running in-cluster — namespace left for manual teardown",
+			)
+		}
+
+		if _, err := w.db.ExecContext(ctx, `DELETE FROM stacks WHERE id = $1`, s.id); err != nil {
+			slog.Error("jobs.expire_stacks.delete_failed",
+				"slug", s.slug, "namespace", s.namespace, "error", err)
+			continue
+		}
+		slog.Info("jobs.expire_stacks.deleted", "slug", s.slug, "namespace", s.namespace)
+		deleted++
+	}
+
+	slog.Info("jobs.expire_stacks.completed",
+		"expired_count", deleted,
+		"duration_ms", time.Since(start).Milliseconds(),
+		"job_id", job.ID,
+	)
+	return nil
+}

@@ -1,0 +1,21 @@
+# Binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+vendor/
+
+# OS
+.DS_Store
+
