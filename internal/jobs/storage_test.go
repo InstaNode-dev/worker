@@ -32,7 +32,7 @@ func TestUpdateStorageBytesWorker_NilClient_NoOp(t *testing.T) {
 	defer db.Close()
 
 	// nil provClient — worker should no-op without querying DB.
-	w := jobs.NewUpdateStorageBytesWorker(db, nil)
+	w := jobs.NewUpdateStorageBytesWorker(db, nil, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.UpdateStorageBytesArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestUpdateStorageBytesWorker_UpdatesStorageBytes(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	prov := &mockStorageBytesProvider{}
-	w := jobs.NewUpdateStorageBytesWorker(db, prov)
+	w := jobs.NewUpdateStorageBytesWorker(db, prov, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.UpdateStorageBytesArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestUpdateStorageBytesWorker_DBQueryError_ReturnsError(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, token`).WillReturnError(errDB)
 
 	prov := &mockStorageBytesProvider{}
-	w := jobs.NewUpdateStorageBytesWorker(db, prov)
+	w := jobs.NewUpdateStorageBytesWorker(db, prov, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.UpdateStorageBytesArgs]()); err == nil {
 		t.Fatal("expected error from DB query failure")
 	}
@@ -97,7 +97,7 @@ func TestUpdateStorageBytesWorker_ProviderError_FailOpen(t *testing.T) {
 			return 0, errDB
 		},
 	}
-	w := jobs.NewUpdateStorageBytesWorker(db, prov)
+	w := jobs.NewUpdateStorageBytesWorker(db, prov, nil)
 	// Should NOT return error (fail-open on provider error).
 	if err := w.Work(context.Background(), fakeJob[jobs.UpdateStorageBytesArgs]()); err != nil {
 		t.Fatalf("expected nil (fail-open), got %v", err)

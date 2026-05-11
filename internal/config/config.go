@@ -20,6 +20,7 @@ type Config struct {
 	MinioEndpoint     string // MINIO_ENDPOINT — host:port of MinIO server
 	MinioRootUser     string // MINIO_ROOT_USER — MinIO admin credentials
 	MinioRootPassword string // MINIO_ROOT_PASSWORD
+	MinioBucketName   string // MINIO_BUCKET_NAME — shared bucket name (default: "instant-shared")
 	KubeNamespaceApps string // KUBE_NAMESPACE_APPS — stack namespace prefix (default: "instant-apps")
 }
 
@@ -62,6 +63,7 @@ func Load() *Config {
 		MinioEndpoint:     os.Getenv("MINIO_ENDPOINT"),
 		MinioRootUser:     os.Getenv("MINIO_ROOT_USER"),
 		MinioRootPassword: os.Getenv("MINIO_ROOT_PASSWORD"),
+		MinioBucketName:   getenv("MINIO_BUCKET_NAME", "instant-shared"),
 		KubeNamespaceApps: getenv("KUBE_NAMESPACE_APPS", "instant-apps"),
 	}
 
