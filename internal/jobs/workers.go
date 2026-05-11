@@ -101,7 +101,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 
 	emailClient := NewEmailClient(cfg.ResendAPIKey)
 
-	// Build MinIO admin client for storage IAM cleanup — nil if not configured (fail open).
+	// Build MinIO admin client for storage IAM cleanup — nil unless the legacy
+	// MINIO_* env vars are set. Only used when ExpireAnonymousWorker needs to
+	// release per-IAM-user resources (i.e. self-hosted MinIO backend). With
+	// the OBJECT_STORE_* shared-key backend (DO Spaces / AWS / GCS / R2) this
+	// stays nil because no per-customer IAM was created in the first place.
 	var minioClient *madmin.AdminClient
 	if cfg.MinioEndpoint != "" {
 		if mc, err := madmin.New(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, false); err != nil {
@@ -111,14 +115,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}
 	}
 
-	// Build MinIO storage scanner for the UpdateStorageBytesWorker — nil if
-	// MINIO_ENDPOINT is not set (fail open: storage_bytes updates for MinIO
-	// resources are skipped each run, postgres/redis/mongo continue via the
-	// gRPC provisioner path).
+	// Build the storage_bytes scanner — provider-agnostic, uses plain S3 API
+	// against any backend. Reads OBJECT_STORE_* env vars (which fall back to
+	// the legacy MINIO_* names in config.Load). Nil = fail open: the scanner
+	// is skipped each run and storage_bytes for /storage/new resources isn't
+	// updated. Other resource types (postgres/redis/mongo) continue via the
+	// gRPC provisioner path.
 	var minioScanner MinIOStorageScanner
-	if cfg.MinioEndpoint != "" {
-		if scanner, err := NewMinIOStorageScanner(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
-			slog.Warn("jobs.workers.minio_storage_scanner_init_failed", "error", err)
+	if cfg.ObjectStoreEndpoint != "" {
+		if scanner, err := NewMinIOStorageScanner(cfg.ObjectStoreEndpoint, cfg.ObjectStoreAccessKey, cfg.ObjectStoreSecretKey, cfg.ObjectStoreBucket); err != nil {
+			slog.Warn("jobs.workers.storage_scanner_init_failed", "error", err)
 		} else {
 			minioScanner = scanner
 		}
