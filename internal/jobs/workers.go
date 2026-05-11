@@ -111,6 +111,19 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}
 	}
 
+	// Build MinIO storage scanner for the UpdateStorageBytesWorker — nil if
+	// MINIO_ENDPOINT is not set (fail open: storage_bytes updates for MinIO
+	// resources are skipped each run, postgres/redis/mongo continue via the
+	// gRPC provisioner path).
+	var minioScanner MinIOStorageScanner
+	if cfg.MinioEndpoint != "" {
+		if scanner, err := NewMinIOStorageScanner(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
+			slog.Warn("jobs.workers.minio_storage_scanner_init_failed", "error", err)
+		} else {
+			minioScanner = scanner
+		}
+	}
+
 	workers := river.NewWorkers()
 	river.AddWorker(workers, NewExpireAnonymousWorker(db, provClient, minioClient))
 	river.AddWorker(workers, NewExpireStacksWorker(db, cfg.KubeNamespaceApps+"-"))
@@ -118,7 +131,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, &TrialExpiryWorker{db: db, email: emailClient})
 	river.AddWorker(workers, &WeeklyDigestWorker{db: db, email: emailClient})
 	river.AddWorker(workers, NewEnforceStorageQuotaWorker(db, planRegistry))
-	river.AddWorker(workers, NewUpdateStorageBytesWorker(db, provClient))
+	river.AddWorker(workers, NewUpdateStorageBytesWorker(db, provClient, minioScanner))
 	// Custom-domain reconciler — TXT lookup, HTTP probe, stale-failed sweep.
 	// k8s provider is nil today: the worker module does not import the api's
 	// k8s client. Steps 2/3 (Ingress + cert poll) stay in the api handler.
