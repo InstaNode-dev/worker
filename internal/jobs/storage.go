@@ -23,26 +23,42 @@ type StorageBytesProvider interface {
 	StorageBytes(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType) (int64, error)
 }
 
+// MinIOStorageScanner queries object storage usage by summing object sizes
+// under a tenant's prefix in the shared MinIO bucket. Implemented by
+// minioStorageScanner (storage_minio.go) using github.com/minio/minio-go/v7.
+//
+// Decoupled from StorageBytesProvider so the worker can query MinIO directly
+// using the same admin credentials it already loads for IAM cleanup, instead
+// of paying a gRPC roundtrip through the provisioner for every storage row.
+type MinIOStorageScanner interface {
+	StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error)
+}
+
 // UpdateStorageBytesWorker queries actual infrastructure via the gRPC provisioner to update
 // resources.storage_bytes for all active data resources.
 //
-// Supported resource types: postgres, redis, mongodb, storage (MinIO prefix usage).
+// Supported resource types: postgres, redis, mongodb (via gRPC provisioner),
+// storage (via direct MinIO listing — see MinIOStorageScanner).
 //
 // This worker runs every 6 hours so EnforceStorageQuotaWorker always has
 // fresh data to check against. All provider errors are fail-open — a query
 // failure logs an error and skips that resource rather than failing the job.
 type UpdateStorageBytesWorker struct {
 	river.WorkerDefaults[UpdateStorageBytesArgs]
-	db         *sql.DB
-	provClient StorageBytesProvider // required — always use gRPC provisioner
+	db          *sql.DB
+	provClient  StorageBytesProvider // required for postgres/redis/mongodb; nil → those types skipped
+	minioClient MinIOStorageScanner  // optional; nil → storage rows skipped (fail-open)
 }
 
 // NewUpdateStorageBytesWorker constructs an UpdateStorageBytesWorker.
-// provClient may be nil; if nil, the worker is a no-op (logs a warning each run).
-func NewUpdateStorageBytesWorker(db *sql.DB, provClient StorageBytesProvider) *UpdateStorageBytesWorker {
+// provClient may be nil; if nil, non-storage resources are skipped each run.
+// minioClient may be nil; if nil, storage resources are skipped each run.
+// When both are nil the worker is a no-op (logs a warning each run).
+func NewUpdateStorageBytesWorker(db *sql.DB, provClient StorageBytesProvider, minioClient MinIOStorageScanner) *UpdateStorageBytesWorker {
 	return &UpdateStorageBytesWorker{
-		db:         db,
-		provClient: provClient,
+		db:          db,
+		provClient:  provClient,
+		minioClient: minioClient,
 	}
 }
 
@@ -52,8 +68,8 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.update_storage_bytes")
 	defer span.End()
 
-	if w.provClient == nil {
-		slog.Warn("jobs.update_storage_bytes.skipped", "reason", "no provisioner client configured")
+	if w.provClient == nil && w.minioClient == nil {
+		slog.Warn("jobs.update_storage_bytes.skipped", "reason", "no provisioner client or MinIO scanner configured")
 		return nil
 	}
 
@@ -83,16 +99,48 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 			continue
 		}
 
-		resType := resourceTypeEnum(resourceType)
-		bytes, queryErr := w.provClient.StorageBytes(ctx, token, providerResourceID, resType)
-		if queryErr != nil {
-			slog.Error("jobs.update_storage_bytes.provisioner_error",
-				"resource_id", id,
-				"token", token,
-				"resource_type", resourceType,
-				"error", queryErr,
-			)
-			continue // fail-open — skip this resource
+		var (
+			bytes    int64
+			queryErr error
+		)
+		switch resourceType {
+		case "storage":
+			if w.minioClient == nil {
+				slog.Warn("jobs.update_storage_bytes.minio_scanner_unavailable",
+					"resource_id", id,
+					"token", token,
+				)
+				continue // fail-open — skip until scanner is wired up
+			}
+			bytes, queryErr = w.minioClient.StorageBytes(ctx, token, providerResourceID)
+			if queryErr != nil {
+				slog.Error("jobs.update_storage_bytes.minio_error",
+					"resource_id", id,
+					"token", token,
+					"resource_type", resourceType,
+					"error", queryErr,
+				)
+				continue // fail-open — skip this resource
+			}
+		default:
+			if w.provClient == nil {
+				slog.Warn("jobs.update_storage_bytes.provisioner_unavailable",
+					"resource_id", id,
+					"resource_type", resourceType,
+				)
+				continue
+			}
+			resType := resourceTypeEnum(resourceType)
+			bytes, queryErr = w.provClient.StorageBytes(ctx, token, providerResourceID, resType)
+			if queryErr != nil {
+				slog.Error("jobs.update_storage_bytes.provisioner_error",
+					"resource_id", id,
+					"token", token,
+					"resource_type", resourceType,
+					"error", queryErr,
+				)
+				continue // fail-open — skip this resource
+			}
 		}
 
 		if updateErr := updateStorageBytes(ctx, w.db, uid, bytes); updateErr != nil {
