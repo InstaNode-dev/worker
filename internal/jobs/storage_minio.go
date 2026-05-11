@@ -35,21 +35,59 @@ type minioStorageScanner struct {
 }
 
 // NewMinIOStorageScanner constructs a scanner backed by github.com/minio/minio-go/v7
-// using the same root/admin credentials the worker already loads from
-// MINIO_ENDPOINT / MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (see config.go).
+// against any S3-compatible endpoint (self-hosted MinIO, DO Spaces, AWS S3,
+// GCS, R2, B2, Wasabi). Callers source endpoint + creds + bucket from the
+// OBJECT_STORE_* env vars in config.Load (which fall back to legacy MINIO_*
+// names for backward compat).
+//
+// Auto-detects TLS: if `endpoint` is prefixed with "https://" the scanner uses
+// TLS; "http://" forces plain. Without a scheme, a heuristic kicks in — a
+// hostname containing "digitaloceanspaces.com", "amazonaws.com",
+// "cloudflarestorage.com", "googleapis.com", "wasabisys.com", or
+// "backblazeb2.com" is assumed TLS; everything else (e.g. an in-cluster
+// minio.instant-data.svc.cluster.local) is plain. Callers that need explicit
+// control should call NewS3Scanner directly.
 //
 // Returns nil + error when the endpoint is empty or the client can't be built;
 // callers should fail open and pass nil to NewUpdateStorageBytesWorker.
 func NewMinIOStorageScanner(endpoint, accessKey, secretKey, bucketName string) (*minioStorageScanner, error) {
 	if endpoint == "" {
-		return nil, fmt.Errorf("storage_minio: MINIO_ENDPOINT is required")
+		return nil, fmt.Errorf("storage_minio: OBJECT_STORE_ENDPOINT is required")
 	}
 	if bucketName == "" {
 		bucketName = "instant-shared"
 	}
+
+	// Strip explicit scheme prefix and remember whether TLS was requested.
+	secure := false
+	if strings.HasPrefix(endpoint, "https://") {
+		endpoint = strings.TrimPrefix(endpoint, "https://")
+		secure = true
+	} else if strings.HasPrefix(endpoint, "http://") {
+		endpoint = strings.TrimPrefix(endpoint, "http://")
+		secure = false
+	} else {
+		// Heuristic: managed S3-compatible vendors all serve TLS by default.
+		// In-cluster MinIO uses plain HTTP. Misidentified endpoints can be
+		// fixed by explicitly prefixing http:// or https:// in the env var.
+		for _, vendor := range []string{
+			"digitaloceanspaces.com",
+			"amazonaws.com",
+			"cloudflarestorage.com",
+			"googleapis.com",
+			"wasabisys.com",
+			"backblazeb2.com",
+		} {
+			if strings.Contains(endpoint, vendor) {
+				secure = true
+				break
+			}
+		}
+	}
+
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: false,
+		Secure: secure,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("storage_minio: new client for %s: %w", endpoint, err)

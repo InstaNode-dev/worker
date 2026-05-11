@@ -17,10 +17,22 @@ type Config struct {
 	MaxMindLicenseKey string // MAXMIND_LICENSE_KEY — for GeoLite2 refresh job
 	GeoLite2DBPath    string // GEOLITE2_DB_PATH — local path to the GeoLite2 City MMDB
 	PlansPath         string // PLANS_PATH — path to plans.yaml (optional; uses built-in defaults if empty)
-	MinioEndpoint     string // MINIO_ENDPOINT — host:port of MinIO server
-	MinioRootUser     string // MINIO_ROOT_USER — MinIO admin credentials
-	MinioRootPassword string // MINIO_ROOT_PASSWORD
-	MinioBucketName   string // MINIO_BUCKET_NAME — shared bucket name (default: "instant-shared")
+	// Object storage backend for the storage_bytes scanner
+	// (provider-agnostic — works against MinIO, DO Spaces, AWS S3,
+	// GCS, R2, B2, Wasabi). The scanner uses the standard minio-go
+	// SDK, which speaks plain S3 against any of these endpoints.
+	ObjectStoreEndpoint  string // OBJECT_STORE_ENDPOINT — host:port (e.g. nyc3.digitaloceanspaces.com)
+	ObjectStoreAccessKey string // OBJECT_STORE_ACCESS_KEY — master access key
+	ObjectStoreSecretKey string // OBJECT_STORE_SECRET_KEY — master secret key
+	ObjectStoreBucket    string // OBJECT_STORE_BUCKET — shared bucket (default: instant-shared)
+	ObjectStoreRegion    string // OBJECT_STORE_REGION — e.g. "nyc3" for DO Spaces
+	ObjectStoreSecure    bool   // OBJECT_STORE_SECURE — true for TLS-terminated endpoints
+
+	// Legacy MINIO_* env vars — fallback for backward compat.
+	MinioEndpoint     string
+	MinioRootUser     string
+	MinioRootPassword string
+	MinioBucketName   string
 	KubeNamespaceApps string // KUBE_NAMESPACE_APPS — stack namespace prefix (default: "instant-apps")
 }
 
@@ -60,11 +72,33 @@ func Load() *Config {
 		MaxMindLicenseKey: os.Getenv("MAXMIND_LICENSE_KEY"),
 		GeoLite2DBPath:    getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
 		PlansPath:         os.Getenv("PLANS_PATH"),
+		ObjectStoreEndpoint:  os.Getenv("OBJECT_STORE_ENDPOINT"),
+		ObjectStoreAccessKey: os.Getenv("OBJECT_STORE_ACCESS_KEY"),
+		ObjectStoreSecretKey: os.Getenv("OBJECT_STORE_SECRET_KEY"),
+		ObjectStoreBucket:    getenv("OBJECT_STORE_BUCKET", "instant-shared"),
+		ObjectStoreRegion:    os.Getenv("OBJECT_STORE_REGION"),
+		ObjectStoreSecure:    os.Getenv("OBJECT_STORE_SECURE") == "true",
+
 		MinioEndpoint:     os.Getenv("MINIO_ENDPOINT"),
 		MinioRootUser:     os.Getenv("MINIO_ROOT_USER"),
 		MinioRootPassword: os.Getenv("MINIO_ROOT_PASSWORD"),
 		MinioBucketName:   getenv("MINIO_BUCKET_NAME", "instant-shared"),
 		KubeNamespaceApps: getenv("KUBE_NAMESPACE_APPS", "instant-apps"),
+	}
+
+	// Fall back to legacy MINIO_* names so deployments that haven't
+	// migrated env vars keep working.
+	if cfg.ObjectStoreEndpoint == "" {
+		cfg.ObjectStoreEndpoint = cfg.MinioEndpoint
+	}
+	if cfg.ObjectStoreAccessKey == "" {
+		cfg.ObjectStoreAccessKey = cfg.MinioRootUser
+	}
+	if cfg.ObjectStoreSecretKey == "" {
+		cfg.ObjectStoreSecretKey = cfg.MinioRootPassword
+	}
+	if cfg.ObjectStoreBucket == "instant-shared" && cfg.MinioBucketName != "" {
+		cfg.ObjectStoreBucket = cfg.MinioBucketName
 	}
 
 	slog.Info("worker.config.loaded",
