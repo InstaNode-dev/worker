@@ -18,6 +18,14 @@ import (
 	"instant.dev/worker/internal/provisioner"
 )
 
+// queueReconcile is the dedicated queue for fast periodic reconcilers
+// (deploy-status every 30s, custom-domain every 5min). Isolated from the
+// default queue so a fan-out backlog on bulk jobs (weekly_digest, etc.)
+// cannot starve them — the previous symptom was deploy status staying in
+// "building" indefinitely while 200K weekly_digest rows occupied every
+// worker slot.
+const queueReconcile = "reconcile"
+
 // Workers wraps a running River client.
 type Workers struct {
 	client  *river.Client[pgx.Tx]
@@ -174,10 +182,12 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		// customDomainReconcileInterval in custom_domain_reconcile.go.
 		// RunOnStart=true so a worker restart immediately picks up domains
 		// that became verifiable while we were down.
+		// Routed to the "reconcile" queue so a backlog on the default queue
+		// (e.g. a weekly_digest fan-out) cannot starve it.
 		river.NewPeriodicJob(
 			river.PeriodicInterval(customDomainReconcileInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return CustomDomainReconcileArgs{}, nil
+				return CustomDomainReconcileArgs{}, &river.InsertOpts{Queue: queueReconcile}
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
@@ -185,10 +195,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		// deployStatusReconcileInterval in deploy_status_reconcile.go.
 		// RunOnStart=true so a worker restart immediately reconciles any
 		// deployments stuck in "building" or "deploying" from the last cycle.
+		// On the "reconcile" queue for the same starvation-protection reason.
 		river.NewPeriodicJob(
 			river.PeriodicInterval(deployStatusReconcileInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return DeployStatusReconcileArgs{}, nil
+				return DeployStatusReconcileArgs{}, &river.InsertOpts{Queue: queueReconcile}
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
@@ -196,7 +207,15 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 
 	riverClient, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Queues: map[string]river.QueueConfig{
+			// Bulk email + heavyweight periodics live on the default queue.
+			// A fan-out (one row per team) can blow this to 100K+ rows; the
+			// reconcile queue below guarantees small-but-critical periodic
+			// jobs always have worker capacity.
 			river.QueueDefault: {MaxWorkers: 5},
+			// Reserved for fast, frequent reconcilers (deploy-status every 30s,
+			// custom-domain every 5min). 2 workers is enough because each
+			// invocation does one batched DB query + per-row k8s GETs.
+			queueReconcile: {MaxWorkers: 2},
 		},
 		Workers:      workers,
 		PeriodicJobs: periodicJobs,
@@ -217,7 +236,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	}
 
 	slog.Info("jobs.workers.started",
-		"queues", fmt.Sprintf("%v", []string{river.QueueDefault}),
+		"queues", fmt.Sprintf("%v", []string{river.QueueDefault, queueReconcile}),
 		"max_workers", 5,
 	)
 
