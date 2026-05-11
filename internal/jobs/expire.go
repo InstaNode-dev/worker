@@ -151,7 +151,9 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 }
 
 // expireResourceTypeToProto maps a resource_type string to the protobuf enum.
-// Returns UNSPECIFIED for types without provisioner deprovisioning (queue, webhook, storage).
+// Queue/NATS now provisions dedicated pods (k8s backend) so it needs deprovisioning
+// just like postgres/redis/mongo. Webhook + storage stay UNSPECIFIED — they don't
+// have a per-resource pod (webhook is API-receiver only; storage is bucket-isolated).
 func expireResourceTypeToProto(resourceType string) commonv1.ResourceType {
 	switch resourceType {
 	case "postgres":
@@ -160,6 +162,8 @@ func expireResourceTypeToProto(resourceType string) commonv1.ResourceType {
 		return commonv1.ResourceType_RESOURCE_TYPE_REDIS
 	case "mongodb":
 		return commonv1.ResourceType_RESOURCE_TYPE_MONGODB
+	case "queue":
+		return commonv1.ResourceType_RESOURCE_TYPE_QUEUE
 	default:
 		return commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED
 	}

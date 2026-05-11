@@ -70,7 +70,22 @@ func main() {
 		planRegistry = commonplans.Default()
 	}
 
-	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry)
+	// Build the k8s client used by DeployStatusReconciler. Fails open: if
+	// neither in-cluster config nor kubeconfig is reachable (CI, docker-compose,
+	// bare-metal dev box), we pass nil and the reconciler warn-logs each tick
+	// while every other periodic job keeps running. See
+	// worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
+	deployStatusK8s, k8sErr := jobs.NewK8sDeployStatusClient()
+	if k8sErr != nil {
+		slog.Warn("worker.deploy_status_k8s_client_init_failed",
+			"error", k8sErr,
+			"note", "DeployStatusReconciler will log warnings each tick; other periodic jobs unaffected")
+		deployStatusK8s = nil
+	} else {
+		slog.Info("worker.deploy_status_k8s_client_ready")
+	}
+
+	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, deployStatusK8s)
 	defer workers.Stop()
 
 	// Exit immediately if River failed to start so Kubernetes restarts the pod.

@@ -62,7 +62,13 @@ func (mondayAt8UTCSchedule) Next(t time.Time) time.Time {
 
 // StartWorkers initialises and starts the River background worker pool.
 // It registers all job workers and schedules periodic jobs.
-func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry) *Workers {
+//
+// deployStatusK8s is the k8s client used by DeployStatusReconciler to fetch
+// live Deployment objects from the per-deployment "instant-deploy-<appID>"
+// namespaces. Pass nil when the worker can't reach a cluster — the
+// reconciler logs at WARN each run and other periodic jobs keep functioning.
+// See worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
+func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, deployStatusK8s deployStatusK8sProvider) *Workers {
 	_ = rdb // available for future workers; currently only used by quota checks done via db
 
 	// River requires pgx pool — open a separate connection for the worker pool.
@@ -98,6 +104,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, &WeeklyDigestWorker{db: db, email: emailClient})
 	river.AddWorker(workers, NewEnforceStorageQuotaWorker(db, planRegistry))
 	river.AddWorker(workers, NewUpdateStorageBytesWorker(db, provClient))
+	// Custom-domain reconciler — TXT lookup, HTTP probe, stale-failed sweep.
+	// k8s provider is nil today: the worker module does not import the api's
+	// k8s client. Steps 2/3 (Ingress + cert poll) stay in the api handler.
+	// See custom_domain_reconcile.go for the full SCOPE NOTE.
+	river.AddWorker(workers, NewCustomDomainReconciler(db, nil, nil))
+	// Deploy-status reconciler — sweeps non-terminal deployments and rolls
+	// status forward from live k8s Deployment state every 30s. deployStatusK8s
+	// may be nil (kubeconfig unreachable in CI / docker-compose); the worker
+	// then short-circuits with a WARN each tick. See deploy_status_reconcile.go.
+	river.AddWorker(workers, NewDeployStatusReconciler(db, deployStatusK8s))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -153,6 +169,28 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 				return EnforceStorageQuotaArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Custom-domain reconciler runs every 5 minutes — see
+		// customDomainReconcileInterval in custom_domain_reconcile.go.
+		// RunOnStart=true so a worker restart immediately picks up domains
+		// that became verifiable while we were down.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(customDomainReconcileInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomDomainReconcileArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Deploy-status reconciler runs every 30s — see
+		// deployStatusReconcileInterval in deploy_status_reconcile.go.
+		// RunOnStart=true so a worker restart immediately reconciles any
+		// deployments stuck in "building" or "deploying" from the last cycle.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(deployStatusReconcileInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeployStatusReconcileArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 	}
 
