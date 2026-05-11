@@ -26,6 +26,13 @@ import (
 // worker slot.
 const queueReconcile = "reconcile"
 
+// reconcileInsertOpts is the InsertOpts every reconciler periodic-job builder
+// must return. Extracted so a test can exercise the exact production value
+// (asserting the closures embed the right Queue) without scraping source code.
+func reconcileInsertOpts() *river.InsertOpts {
+	return &river.InsertOpts{Queue: queueReconcile}
+}
+
 // Workers wraps a running River client.
 type Workers struct {
 	client  *river.Client[pgx.Tx]
@@ -187,7 +194,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		river.NewPeriodicJob(
 			river.PeriodicInterval(customDomainReconcileInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return CustomDomainReconcileArgs{}, &river.InsertOpts{Queue: queueReconcile}
+				return CustomDomainReconcileArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
@@ -199,7 +206,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		river.NewPeriodicJob(
 			river.PeriodicInterval(deployStatusReconcileInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return DeployStatusReconcileArgs{}, &river.InsertOpts{Queue: queueReconcile}
+				return DeployStatusReconcileArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
