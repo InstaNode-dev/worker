@@ -18,9 +18,16 @@ type EnforceStorageQuotaArgs struct{}
 
 func (EnforceStorageQuotaArgs) Kind() string { return "enforce_storage_quota" }
 
-// PlanRegistry is the minimal interface needed from plans.Registry.
+// PlanRegistry is the minimal interface needed from plans.Registry across
+// all worker jobs. Methods are added here as new jobs need them; the live
+// *commonplans.Registry satisfies every method, so a superset is always
+// safe — test mocks just need the new method stubbed.
 type PlanRegistry interface {
 	StorageLimitMB(tier, service string) int
+	// ConnectionsLimit is consumed by QuotaWallNudgeWorker.
+	ConnectionsLimit(tier, service string) int
+	// ProvisionLimit is consumed by QuotaWallNudgeWorker.
+	ProvisionLimit(tier string) int
 }
 
 // StorageQuotaChecker is the minimal interface needed for storage quota checks.

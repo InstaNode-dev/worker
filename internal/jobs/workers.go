@@ -147,6 +147,12 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewExpiryReminderWorker(db, emailClient), nrApp))
 	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorker(db, planRegistry), nrApp))
 	river.AddWorker(workers, WithObservability(NewUpdateStorageBytesWorker(db, provClient, minioScanner), nrApp))
+	// Quota-wall nudge — Track U1. Periodic scan that writes a single
+	// near_quota_wall audit row per team per 24h when any axis (storage,
+	// connections, provisions) crosses 80% of the tier limit. The
+	// dashboard reads the latest row via GET /api/v1/usage/wall and
+	// renders an upgrade banner. See quota_wall_nudge.go.
+	river.AddWorker(workers, WithObservability(NewQuotaWallNudgeWorker(db, planRegistry), nrApp))
 	// Custom-domain reconciler — TXT lookup, HTTP probe, stale-failed sweep.
 	// k8s provider is nil today: the worker module does not import the api's
 	// k8s client. Steps 2/3 (Ingress + cert poll) stay in the api handler.
@@ -210,6 +216,19 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(6*time.Hour),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return EnforceStorageQuotaArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Quota-wall nudge — Track U1. Runs every 30 minutes; the 24h
+		// dedupe in the job guarantees at most one audit row per team
+		// per day no matter how many ticks see the same condition.
+		// RunOnStart=false: a worker restart doesn't need to immediately
+		// re-scan — the previous run's nudges are still inside the 24h
+		// dedupe window and the dashboard banner will still render.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(quotaWallNudgeInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return QuotaWallNudgeArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
