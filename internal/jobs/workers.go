@@ -10,6 +10,7 @@ import (
 	madmin "github.com/minio/madmin-go/v3"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/newrelic/go-agent/v3/newrelic"
 	"github.com/redis/go-redis/v9"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
@@ -83,7 +84,7 @@ func (mondayAt8UTCSchedule) Next(t time.Time) time.Time {
 // namespaces. Pass nil when the worker can't reach a cluster — the
 // reconciler logs at WARN each run and other periodic jobs keep functioning.
 // See worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
-func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, deployStatusK8s deployStatusK8sProvider) *Workers {
+func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, deployStatusK8s deployStatusK8sProvider, nrApp *newrelic.Application) *Workers {
 	_ = rdb // available for future workers; currently only used by quota checks done via db
 
 	// River requires pgx pool — open a separate connection for the worker pool.
@@ -131,24 +132,31 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	}
 
 	workers := river.NewWorkers()
-	river.AddWorker(workers, NewExpireAnonymousWorker(db, provClient, minioClient))
-	river.AddWorker(workers, NewExpireStacksWorker(db, cfg.KubeNamespaceApps+"-"))
-	river.AddWorker(workers, NewRefreshGeoDBWorker())
-	river.AddWorker(workers, &TrialExpiryWorker{db: db, email: emailClient})
-	river.AddWorker(workers, &WeeklyDigestWorker{db: db, email: emailClient})
-	river.AddWorker(workers, NewExpiryReminderWorker(db, emailClient))
-	river.AddWorker(workers, NewEnforceStorageQuotaWorker(db, planRegistry))
-	river.AddWorker(workers, NewUpdateStorageBytesWorker(db, provClient, minioScanner))
+	// Each worker is wrapped in WithObservability so every job execution
+	// stamps tid + trace_id on ctx and (optionally) opens a New Relic
+	// transaction. nrApp may be nil — the wrapper still does the ctx work.
+	// See middleware.go for the full contract.
+	river.AddWorker(workers, WithObservability(NewExpireAnonymousWorker(db, provClient, minioClient), nrApp))
+	river.AddWorker(workers, WithObservability(NewExpireStacksWorker(db, cfg.KubeNamespaceApps+"-"), nrApp))
+	river.AddWorker(workers, WithObservability(NewRefreshGeoDBWorker(), nrApp))
+	// TrialExpiry / WeeklyDigest are registered via composite literal, so the
+	// generic type parameter can't be inferred from the constructor return —
+	// it must be supplied explicitly.
+	river.AddWorker(workers, WithObservability[TrialExpiryArgs](&TrialExpiryWorker{db: db, email: emailClient}, nrApp))
+	river.AddWorker(workers, WithObservability[WeeklyDigestArgs](&WeeklyDigestWorker{db: db, email: emailClient}, nrApp))
+	river.AddWorker(workers, WithObservability(NewExpiryReminderWorker(db, emailClient), nrApp))
+	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorker(db, planRegistry), nrApp))
+	river.AddWorker(workers, WithObservability(NewUpdateStorageBytesWorker(db, provClient, minioScanner), nrApp))
 	// Custom-domain reconciler — TXT lookup, HTTP probe, stale-failed sweep.
 	// k8s provider is nil today: the worker module does not import the api's
 	// k8s client. Steps 2/3 (Ingress + cert poll) stay in the api handler.
 	// See custom_domain_reconcile.go for the full SCOPE NOTE.
-	river.AddWorker(workers, NewCustomDomainReconciler(db, nil, nil))
+	river.AddWorker(workers, WithObservability(NewCustomDomainReconciler(db, nil, nil), nrApp))
 	// Deploy-status reconciler — sweeps non-terminal deployments and rolls
 	// status forward from live k8s Deployment state every 30s. deployStatusK8s
 	// may be nil (kubeconfig unreachable in CI / docker-compose); the worker
 	// then short-circuits with a WARN each tick. See deploy_status_reconcile.go.
-	river.AddWorker(workers, NewDeployStatusReconciler(db, deployStatusK8s))
+	river.AddWorker(workers, WithObservability(NewDeployStatusReconciler(db, deployStatusK8s), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
