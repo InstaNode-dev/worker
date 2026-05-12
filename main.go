@@ -13,19 +13,35 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 
+	"instant.dev/common/buildinfo"
+	"instant.dev/common/logctx"
 	commonplans "instant.dev/common/plans"
 	"instant.dev/worker/internal/config"
 	"instant.dev/worker/internal/db"
 	"instant.dev/worker/internal/jobs"
+	"instant.dev/worker/internal/obs"
 	"instant.dev/worker/internal/provisioner"
 	"instant.dev/worker/internal/telemetry"
 )
 
 func main() {
-	// Structured JSON logging.
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
+	// Structured JSON logging — wrapped in logctx so every line carries
+	// service + commit_id + (when present) tid / trace_id / team_id.
+	base := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slog.LevelInfo,
+		AddSource: true,
+	})
+	slog.SetDefault(slog.New(logctx.NewHandler("worker", base)))
+
+	// New Relic Go agent. Fail-open on empty / missing license so local dev
+	// and CI runs (which never get a real key) still boot. Matches the
+	// contract of telemetry.InitTracer below.
+	nrApp, _ := obs.InitNewRelic()
+	defer func() {
+		if nrApp != nil {
+			nrApp.Shutdown(5 * time.Second)
+		}
+	}()
 
 	shutdownTracer := telemetry.InitTracer("instant-worker", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
@@ -85,7 +101,7 @@ func main() {
 		slog.Info("worker.deploy_status_k8s_client_ready")
 	}
 
-	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, deployStatusK8s)
+	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, deployStatusK8s, nrApp)
 	defer workers.Stop()
 
 	// Exit immediately if River failed to start so Kubernetes restarts the pod.
@@ -102,7 +118,8 @@ func main() {
 	// If River's goroutines panic after start, Go crashes the process and k8s restarts.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"ok":true,"service":"instant-worker"}`)
+		fmt.Fprintf(w, `{"ok":true,"service":"instant-worker","commit_id":%q,"build_time":%q,"version":%q}`,
+			buildinfo.GitSHA, buildinfo.BuildTime, buildinfo.Version)
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 	srv := &http.Server{Addr: ":8091", Handler: mux}
@@ -117,7 +134,13 @@ func main() {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	slog.Info("worker.started", "environment", cfg.Environment, "liveness_port", 8091)
+	slog.Info("worker.started",
+		"environment", cfg.Environment,
+		"liveness_port", 8091,
+		"commit_id", buildinfo.GitSHA,
+		"build_time", buildinfo.BuildTime,
+		"version", buildinfo.Version,
+	)
 	<-ctx.Done()
 	slog.Info("worker.shutdown")
 }
