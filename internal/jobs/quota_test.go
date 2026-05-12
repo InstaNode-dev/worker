@@ -12,7 +12,10 @@ import (
 
 var errDB = errors.New("db error")
 
-// mockPlanRegistry is a simple PlanRegistry stub.
+// mockPlanRegistry is a simple PlanRegistry stub. ConnectionsLimit /
+// ProvisionLimit are stubbed at "unlimited" so EnforceStorageQuotaWorker
+// tests don't accidentally fire the wall-nudge axes — those have their
+// own dedicated tests in quota_wall_nudge_test.go.
 type mockPlanRegistry struct {
 	limitMB int
 }
@@ -20,6 +23,9 @@ type mockPlanRegistry struct {
 func (m *mockPlanRegistry) StorageLimitMB(tier, service string) int {
 	return m.limitMB
 }
+
+func (m *mockPlanRegistry) ConnectionsLimit(tier, service string) int { return -1 }
+func (m *mockPlanRegistry) ProvisionLimit(tier string) int             { return -1 }
 
 func TestEnforceStorageQuotaWorker_NoResources_NoSuspend(t *testing.T) {
 	db, mock, err := sqlmock.New()
