@@ -136,6 +136,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, NewRefreshGeoDBWorker())
 	river.AddWorker(workers, &TrialExpiryWorker{db: db, email: emailClient})
 	river.AddWorker(workers, &WeeklyDigestWorker{db: db, email: emailClient})
+	river.AddWorker(workers, NewExpiryReminderWorker(db, emailClient))
 	river.AddWorker(workers, NewEnforceStorageQuotaWorker(db, planRegistry))
 	river.AddWorker(workers, NewUpdateStorageBytesWorker(db, provClient, minioScanner))
 	// Custom-domain reconciler — TXT lookup, HTTP probe, stale-failed sweep.
@@ -201,6 +202,17 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(6*time.Hour),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return EnforceStorageQuotaArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Expiry reminder — hourly sweep that emails owners of claimed-but-unpaid
+		// (tier='free') resources whose expires_at is inside the next 4 hours.
+		// Dedupe lives in the DB (resources.expiry_reminded_at) so one row gets
+		// at most one email no matter how many ticks see it. See expiry_reminder.go.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(1*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ExpiryReminderArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),

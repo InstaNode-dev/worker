@@ -74,6 +74,52 @@ func (c *EmailClient) SendTrialWarning(ctx context.Context, to string, resourceC
 	return c.send(ctx, to, subject, plain, html)
 }
 
+// SendExpiryReminder warns a claimed-but-unpaid user that one of their
+// free-tier resources is about to expire. The reminder is dispatched by
+// the hourly ExpiryReminderWorker (see expiry_reminder.go) once per
+// resource — dedupe is enforced in the DB via resources.expiry_reminded_at.
+//
+// hoursRemaining is the integer hours until `expires_at`. We always render
+// at least 1 to keep the copy honest ("expires in 0h" reads like it's
+// already gone — the next reaper run will handle that case).
+func (c *EmailClient) SendExpiryReminder(ctx context.Context, to, resourceType string, hoursRemaining int) error {
+	if hoursRemaining < 1 {
+		hoursRemaining = 1
+	}
+
+	subject := fmt.Sprintf("Your instanode %s expires in %dh", resourceType, hoursRemaining)
+
+	plain := fmt.Sprintf(`Heads up — your instanode %s expires in about %d hour(s).
+
+Free-tier resources are deleted 24h after you claim them unless you subscribe.
+
+Keep it running for $9/mo (Hobby) — your data and connection string stay the same:
+https://instanode.dev/app/billing
+
+— The instanode.dev team
+`, resourceType, hoursRemaining)
+
+	safeType := htmlEscape(resourceType)
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
+  <h2>Your instanode %s expires in about %dh</h2>
+  <p>Free-tier resources are deleted 24h after you claim them unless you subscribe.</p>
+  <p>Keep it running for <strong>$9/mo (Hobby)</strong> — your data and connection string stay the same.</p>
+  <p style="margin-top:32px;">
+    <a href="https://instanode.dev/app/billing"
+       style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
+      Keep my %s &rarr;
+    </a>
+  </p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
+</body>
+</html>`, safeType, hoursRemaining, safeType)
+
+	return c.send(ctx, to, subject, plain, html)
+}
+
 func (c *EmailClient) SendTrialExpired(ctx context.Context, to string) error {
 	subject := "Your instant.dev trial has ended"
 	plain := "Your instant.dev trial has ended. Provisioned resources are suspended — your data is safe.\n\nReactivate your account for $12/mo to resume service.\n\nReactivate: https://instant.dev/billing/checkout\n\n— The instant.dev team\n"
