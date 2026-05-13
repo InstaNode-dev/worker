@@ -19,14 +19,26 @@ type Config struct {
 	//
 	// EMAIL_PROVIDER selects the implementation:
 	//   "brevo"     → POST to Brevo /v3/smtp/email with BREVO_TEMPLATE_IDS mapping
+	//   "ses"       → AWS SES v2 SendEmail with SES_TEMPLATE_NAMES mapping
 	//   "noop" / "" → silent no-op (NoopProvider; default — fail-open)
-	//   "ses" / "sendgrid" → reserved for future implementations
+	//   "sendgrid"  → reserved for future implementations
 	//
-	// Swapping providers later = one line in internal/email/factory.go + one new
-	// file under internal/email/. No forwarder change, no mapping change.
-	EmailProvider    string            // EMAIL_PROVIDER
-	BrevoAPIKey      string            // BREVO_API_KEY
-	BrevoTemplateIDs map[string]int    // BREVO_TEMPLATE_IDS (JSON object: audit_log.kind → numeric template id)
+	// Swapping providers later = flip EMAIL_PROVIDER + populate that provider's
+	// env vars. No forwarder change, no mapping change.
+	EmailProvider    string         // EMAIL_PROVIDER
+	BrevoAPIKey      string         // BREVO_API_KEY
+	BrevoTemplateIDs map[string]int // BREVO_TEMPLATE_IDS (JSON object: audit_log.kind → numeric template id)
+
+	// SES_* env vars — populated only when EMAIL_PROVIDER=ses. SES_AWS_*
+	// names are scoped (not bare AWS_*) so they can't be confused with
+	// general-purpose AWS creds used elsewhere in the cluster (e.g. the
+	// storage-bytes scanner, which uses OBJECT_STORE_* and may point at
+	// a non-AWS S3-compatible backend).
+	SESAWSRegion     string            // SES_AWS_REGION
+	SESAWSAccessKey  string            // SES_AWS_ACCESS_KEY_ID
+	SESAWSSecretKey  string            // SES_AWS_SECRET_ACCESS_KEY
+	SESFromEmail     string            // SES_FROM_EMAIL (must be a verified SES identity)
+	SESTemplateNames map[string]string // SES_TEMPLATE_NAMES (JSON object: audit_log.kind → SES template name)
 
 	Environment       string // ENVIRONMENT
 	MaxMindLicenseKey string // MAXMIND_LICENSE_KEY — for GeoLite2 refresh job
@@ -86,6 +98,11 @@ func Load() *Config {
 		EmailProvider:     os.Getenv("EMAIL_PROVIDER"),
 		BrevoAPIKey:       os.Getenv("BREVO_API_KEY"),
 		BrevoTemplateIDs:  parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
+		SESAWSRegion:      os.Getenv("SES_AWS_REGION"),
+		SESAWSAccessKey:   os.Getenv("SES_AWS_ACCESS_KEY_ID"),
+		SESAWSSecretKey:   os.Getenv("SES_AWS_SECRET_ACCESS_KEY"),
+		SESFromEmail:      os.Getenv("SES_FROM_EMAIL"),
+		SESTemplateNames:  parseSESTemplateNames(os.Getenv("SES_TEMPLATE_NAMES")),
 		Environment:       getenv("ENVIRONMENT", "development"),
 		MaxMindLicenseKey: os.Getenv("MAXMIND_LICENSE_KEY"),
 		GeoLite2DBPath:    getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
@@ -126,6 +143,10 @@ func Load() *Config {
 		"email_provider", cfg.EmailProvider,
 		"brevo_key_set", cfg.BrevoAPIKey != "",
 		"brevo_template_count", len(cfg.BrevoTemplateIDs),
+		"ses_region", cfg.SESAWSRegion,
+		"ses_key_set", cfg.SESAWSAccessKey != "",
+		"ses_from_set", cfg.SESFromEmail != "",
+		"ses_template_count", len(cfg.SESTemplateNames),
 	)
 	return cfg
 }
@@ -151,6 +172,31 @@ func parseBrevoTemplateIDs(raw string) map[string]int {
 			"note", "BREVO_TEMPLATE_IDS must be a JSON object of kind→int; falling back to empty map",
 		)
 		return map[string]int{}
+	}
+	return m
+}
+
+// parseSESTemplateNames decodes the SES_TEMPLATE_NAMES env var. The expected
+// shape is a JSON object mapping audit_log.kind → SES template name (string,
+// not numeric — SES references templates by name unlike Brevo):
+//
+//   SES_TEMPLATE_NAMES='{"subscription.upgraded": "tier-upgraded-v1", "near_quota_wall": "quota-wall-nudge-v1"}'
+//
+// Empty string returns an empty map (SES will then SkipNoTemplate on every
+// send — operator opted into "AWS creds set, no templates yet"). A malformed
+// value logs an ERROR and returns empty so the worker still boots — easier
+// to debug a SkipNoTemplate stream than a boot crash from a fat-fingered JSON.
+func parseSESTemplateNames(raw string) map[string]string {
+	if raw == "" {
+		return map[string]string{}
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		slog.Error("worker.config.ses_template_names_invalid",
+			"error", err,
+			"note", "SES_TEMPLATE_NAMES must be a JSON object of kind→string; falling back to empty map",
+		)
+		return map[string]string{}
 	}
 	return m
 }
