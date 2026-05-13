@@ -17,9 +17,9 @@ EventEmailForwarderWorker (jobs/event_email_forwarder.go)
         ▼
 email.EmailProvider (interface)
         │
-        ├─ email.BrevoProvider      (live today — internal/email/brevo_provider.go)
+        ├─ email.BrevoProvider      (live — internal/email/brevo_provider.go)
+        ├─ email.SESProvider        (live — internal/email/ses_provider.go)
         ├─ email.NoopProvider       (fallback when EMAIL_PROVIDER unset)
-        ├─ email.SESProvider        (stubbed — internal/email/ses_provider.go)
         └─ email.SendGridProvider   (not implemented)
 ```
 
@@ -113,102 +113,117 @@ pipeline.
 The factory prints a single WARN line at boot when noop is selected so
 the operator knows email is dropped.
 
-## Adding a new provider in <100 LOC — the SES walkthrough
+## SES (AWS Simple Email Service)
 
-The whole point of this seam is that swapping providers is small. Here's
-the recipe for SES:
+The SES provider is **live** — flip `EMAIL_PROVIDER=ses` and populate the
+`SES_*` env vars below to swap from Brevo without touching forwarder code.
 
-### 1. Create `internal/email/ses_provider.go`
+### Configuration
 
-A working skeleton is already in the repo (commented `not wired`):
+| Env var                       | Meaning                                                                                  |
+|-------------------------------|------------------------------------------------------------------------------------------|
+| `EMAIL_PROVIDER`              | `ses` to enable.                                                                          |
+| `SES_AWS_REGION`              | AWS region the SES identity lives in (e.g. `us-east-1`). No default — SES is regional.    |
+| `SES_AWS_ACCESS_KEY_ID`       | IAM access key with `ses:SendEmail` permission.                                           |
+| `SES_AWS_SECRET_ACCESS_KEY`   | IAM secret key.                                                                           |
+| `SES_FROM_EMAIL`              | Verified SES identity (single email or domain identity).                                  |
+| `SES_TEMPLATE_NAMES`          | JSON object mapping `audit_log.kind` to an SES **template name** (string, not numeric).   |
 
-```go
-package email
+Names are scoped `SES_AWS_*` (not bare `AWS_*`) so they can't be confused
+with general-purpose AWS creds used elsewhere in the cluster (e.g. the
+storage-bytes scanner reads `OBJECT_STORE_*` and may point at a non-AWS
+S3-compatible backend).
 
-import (
-    "context"
-    "fmt"
-)
+### Example
 
-type SESConfig struct {
-    Region          string            // AWS_REGION
-    AccessKeyID     string            // AWS_ACCESS_KEY_ID
-    SecretAccessKey string            // AWS_SECRET_ACCESS_KEY
-    TemplateNames   map[string]string // SES_TEMPLATE_NAMES: kind → SES template name
-    SourceAddress   string            // SES_SOURCE_ADDRESS: verified sender
-}
-
-type SESProvider struct {
-    cfg SESConfig
-    // sesClient *sesv2.Client — when wiring for real
-}
-
-func NewSESProvider(cfg SESConfig) (*SESProvider, error) {
-    if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
-        return nil, fmt.Errorf("ses: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY required")
-    }
-    return &SESProvider{cfg: cfg}, nil
-}
-
-func (p *SESProvider) Name() string { return providerNameSES }
-
-func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
-    tmpl, ok := p.cfg.TemplateNames[evt.Kind]
-    if !ok {
-        return &SendError{Class: SendClassSkippedNoTemplate,
-            Message: fmt.Sprintf("ses: no template for kind %q", evt.Kind)}
-    }
-    // sesv2.SendEmail with Destination.ToAddresses=[evt.Recipient],
-    //                     Content.Template={TemplateName: tmpl, TemplateData: jsonOf(evt.Params)}
-    // Then classify the error:
-    //   - smithy.APIError code 400/InvalidParameterValue → Permanent
-    //   - smithy.APIError code 5xx                        → Transient
-    //   - net.Error                                       → Transient
-    _ = tmpl
-    return nil
-}
+```bash
+EMAIL_PROVIDER=ses
+SES_AWS_REGION=us-east-1
+SES_AWS_ACCESS_KEY_ID=AKIA...
+SES_AWS_SECRET_ACCESS_KEY=...
+SES_FROM_EMAIL=hello@instanode.dev
+SES_TEMPLATE_NAMES='{
+  "onboarding.claimed":        "instanode-onboarding-claimed-v1",
+  "subscription.upgraded":     "instanode-tier-upgraded-v1",
+  "near_quota_wall":           "instanode-near-quota-wall-v1",
+  "resource.expiry_imminent":  "instanode-resource-expiring-v1",
+  "subscription.downgraded":   "instanode-tier-downgraded-v1",
+  "subscription.canceled":     "instanode-subscription-canceled-v1",
+  "experiment.conversion":     "instanode-experiment-conversion-v1",
+  "admin.tier_changed":        "instanode-admin-tier-changed-v1",
+  "admin.promo_issued":        "instanode-admin-promo-issued-v1"
+}'
 ```
 
-### 2. Add a case in `internal/email/factory.go`
+A kind not present in the map produces `SendClassSkippedNoTemplate`, same
+as Brevo — operators can bring up SES with credentials first and add
+templates one at a time.
 
-```go
-case providerNameSES:
-    return NewSESProvider(cfg.SES)
-```
+### Wire details
 
-(plus an `SES SESConfig` field on `Config`)
+* API: `sesv2.SendEmail` from `github.com/aws/aws-sdk-go-v2/service/sesv2`.
+* Sender: `FromEmailAddress = SES_FROM_EMAIL` — must be a verified SES identity.
+* Destination: `Destination.ToAddresses = [evt.Recipient]`.
+* Template body: `Content.Template.TemplateName + TemplateData` (JSON of
+  `evt.Params` — flat `string→string`).
+* No dedupe header — SES doesn't support per-request idempotency, so a
+  forwarder retry inside the same audit row's 60s window can send a
+  duplicate. The forwarder's cursor advance on Permanent / Skipped + hold
+  on Transient minimises but doesn't eliminate this. Mitigated in practice
+  by SES's own internal deduplication on identical message-id within a
+  short window.
 
-### 3. Add env-var parsing in `internal/config/config.go`
+### Error classification
 
-```go
-SESAccessKey:     os.Getenv("AWS_ACCESS_KEY_ID"),
-SESSecretKey:     os.Getenv("AWS_SECRET_ACCESS_KEY"),
-SESRegion:        getenv("AWS_REGION", "us-east-1"),
-SESTemplateNames: parseStringMap(os.Getenv("SES_TEMPLATE_NAMES")),
-SESSourceAddress: os.Getenv("SES_SOURCE_ADDRESS"),
-```
+| AWS SES error                                                           | `SendClass`         | Forwarder action                            |
+|-------------------------------------------------------------------------|---------------------|---------------------------------------------|
+| `nil` (2xx equivalent)                                                  | success             | Advance cursor                              |
+| `MessageRejected` / `BadRequestException` / `InvalidParameterException` | `Permanent`         | Advance cursor + log ERROR                  |
+| `NotFoundException` (template name typo)                                | `Permanent`         | Advance cursor + log ERROR                  |
+| `MailFromDomainNotVerifiedException` / `AccountSuspendedException`      | `Permanent`         | Advance cursor + log ERROR                  |
+| `UnrecognizedClientException` / `AccessDeniedException` (bad creds)     | `Permanent`         | Advance cursor + log ERROR                  |
+| `ThrottlingException` / `TooManyRequestsException` / `SendingPausedException` | `Transient`   | Hold cursor, retry next tick                |
+| `InternalServiceErrorException` / `ServiceUnavailableException` (5xx)   | `Transient`         | Hold cursor, retry next tick                |
+| `net.Error` (dns / connection / timeout)                                | `Transient`         | Hold cursor, retry next tick                |
+| `context.DeadlineExceeded` / `context.Canceled`                         | `Transient`         | Hold cursor (caller's ctx died)             |
+| Unknown error type / unrecognised SES code with `FaultClient`           | `Permanent`         | Advance cursor (don't pin queue on unknown) |
+| Unknown error type / unrecognised SES code with `FaultServer`           | `Transient`         | Hold cursor, retry                          |
 
-### 4. Wire in `internal/jobs/workers.go`
+### SES sandbox caveat
 
-The wiring is **already provider-agnostic** — the existing call is:
+Fresh AWS accounts land in the **SES sandbox** where every recipient
+address must be individually verified before SES will deliver to it.
+An operator flipping `EMAIL_PROVIDER=ses` on a sandbox account will see
+`MessageRejected` on every unverified recipient (logged as Permanent —
+cursor advances, row burns).
 
-```go
-emailProvider, err := email.NewProvider(email.Config{
-    Provider: cfg.EmailProvider,
-    Brevo:    email.BrevoConfig{...},
-    SES:      email.SESConfig{...},  // <- only this line is new
-})
-```
+To exit the sandbox: AWS console → SES → Account dashboard → "Request
+production access". Approval is usually same-day. Until then, set
+`EMAIL_PROVIDER=brevo` (or keep it on Brevo) for real customer email,
+and use `EMAIL_PROVIDER=ses` only against verified internal addresses.
 
-### 5. Tests
+### Binary-size cost
 
-Copy `internal/email/brevo_provider_test.go` to
-`internal/email/ses_provider_test.go` and replace the httptest assertions
-with whatever SES client mock you prefer (aws-sdk-go-v2 has good support).
+The aws-sdk-go-v2 SES dependency adds ~8MB to the worker binary
+(~92MB → ~99MB). This is a one-time cost for the deployment image; the
+runtime memory overhead is negligible (the SDK lazy-loads region endpoints).
 
-That's it. **No changes** to `event_email_forwarder.go`,
-`event_email_mapping.go`, or any of their tests. That's the test of
-agnosticism.
+## Adding a new provider in <100 LOC
+
+The seam is provider-agnostic. To add (say) SendGrid:
+
+1. Create `internal/email/sendgrid_provider.go` implementing `EmailProvider`
+   (look at `ses_provider.go` for a template — same shape, different SDK).
+2. Add `case providerNameSendGrid: return NewSendGridProvider(cfg.SendGrid)`
+   to `internal/email/factory.go` plus a `SendGrid SendGridConfig` field on
+   `Config`.
+3. Add `SendGrid*` env-var parsing in `internal/config/config.go`.
+4. Pass `cfg.SendGrid*` into `email.SendGridConfig{...}` in
+   `internal/jobs/workers.go`.
+5. Tests: mirror `ses_provider_test.go` with a fake client interface.
+
+**No changes** to `event_email_forwarder.go`, `event_email_mapping.go`,
+or any of their tests. That's the test of agnosticism.
 
 ## What lives where
 
@@ -218,9 +233,10 @@ internal/email/
   factory.go             NewProvider(cfg) — single switch
   noop_provider.go       Silent-skip implementation (fallback)
   brevo_provider.go      Brevo v3 transactional implementation
-  ses_provider.go        SES skeleton (not wired)
+  ses_provider.go        AWS SES v2 implementation
   provider_test.go       Factory + interface contract tests
   brevo_provider_test.go Hermetic httptest-backed Brevo tests
+  ses_provider_test.go   Hermetic fake-client SES tests
 
 internal/jobs/
   event_email_forwarder.go        Provider-agnostic worker
@@ -234,4 +250,5 @@ internal/jobs/
 * **Worker boots with `EMAIL_PROVIDER=brevo` but no `BREVO_API_KEY`** → fast crash with explicit error. Set the secret and redeploy.
 * **Want to disable email temporarily** → set `EMAIL_PROVIDER=noop`. Per-tick logs at INFO show rows being skipped silently.
 * **Adding a new event kind** → edit `internal/jobs/event_email_mapping.go` (add `auditKindFoo` const + builder + entries in both slice and map). Add the kind to `BREVO_TEMPLATE_IDS`. No provider code changes.
-* **Migrating Brevo → SES** → flip `EMAIL_PROVIDER=ses`. Templates in Brevo do not migrate automatically; you maintain `SES_TEMPLATE_NAMES` independently. The forwarder is unchanged.
+* **Migrating Brevo → SES** → flip `EMAIL_PROVIDER=ses` and populate `SES_AWS_REGION`, `SES_AWS_ACCESS_KEY_ID`, `SES_AWS_SECRET_ACCESS_KEY`, `SES_FROM_EMAIL`, `SES_TEMPLATE_NAMES`. Templates in Brevo do not migrate automatically; you maintain `SES_TEMPLATE_NAMES` independently. The forwarder is unchanged. **SES sandbox** — fresh AWS accounts can only send to verified recipient addresses until you request production access in the SES console.
+* **Worker boots with `EMAIL_PROVIDER=ses` but no `SES_AWS_REGION` / creds / `SES_FROM_EMAIL`** → fast crash with explicit error per missing field. Operator opted into SES, silently noop'ing would hide the misconfiguration.

@@ -20,7 +20,7 @@ import (
 const (
 	providerNameNoop     = "noop"
 	providerNameBrevo    = "brevo"
-	providerNameSES      = "ses"      // reserved — stub in ses_provider.go
+	providerNameSES      = "ses"      // live — see ses_provider.go
 	providerNameSendGrid = "sendgrid" // reserved — not yet implemented
 )
 
@@ -42,8 +42,12 @@ type Config struct {
 	// Provider == providerNameBrevo.
 	Brevo BrevoConfig
 
-	// Future: SES SESConfig, SendGrid SendGridConfig. Keep grouped so
-	// adding a provider doesn't pollute the top-level Config namespace.
+	// SES holds SES-specific configuration. Populated only when
+	// Provider == providerNameSES.
+	SES SESConfig
+
+	// Future: SendGrid SendGridConfig. Keep grouped so adding a
+	// provider doesn't pollute the top-level Config namespace.
 }
 
 // NewProvider builds the EmailProvider selected by cfg.Provider. Returns
@@ -64,13 +68,14 @@ func NewProvider(cfg Config) (EmailProvider, error) {
 	case providerNameBrevo:
 		return NewBrevoProvider(cfg.Brevo)
 
-	// case providerNameSES:
-	//     return NewSESProvider(cfg.SES)
+	case providerNameSES:
+		return NewSESProvider(cfg.SES)
+
 	// case providerNameSendGrid:
 	//     return NewSendGridProvider(cfg.SendGrid)
 
 	default:
-		return nil, fmt.Errorf("email: unknown EMAIL_PROVIDER %q (supported: %q, %q, %q)",
-			cfg.Provider, providerNameNoop, providerNameBrevo, "")
+		return nil, fmt.Errorf("email: unknown EMAIL_PROVIDER %q (supported: %q, %q, %q, %q)",
+			cfg.Provider, providerNameNoop, providerNameBrevo, providerNameSES, "")
 	}
 }
