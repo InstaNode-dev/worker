@@ -36,6 +36,12 @@ const (
 	auditKindExperimentConversion   = "experiment.conversion"
 	auditKindAdminTierChanged       = "admin.tier_changed"
 	auditKindAdminPromoIssued       = "admin.promo_issued"
+	// auditKindChurnRiskFlagged is written by the daily ChurnPredictorWorker
+	// (churn_predictor.go). The Brevo template configured under this key
+	// (operator wires it via BREVO_TEMPLATE_IDS) is the "we miss you"
+	// reactivation email. Metadata carries tier, last_activity_days_ago,
+	// active_resource_count, email — see buildChurnRiskFlagged below.
+	auditKindChurnRiskFlagged       = "churn.risk_flagged"
 )
 
 // auditRow is the projection of audit_log + users used by the forwarder.
@@ -74,6 +80,7 @@ var supportedAuditKinds = []string{
 	auditKindExperimentConversion,
 	auditKindAdminTierChanged,
 	auditKindAdminPromoIssued,
+	auditKindChurnRiskFlagged,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
@@ -89,6 +96,7 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	auditKindExperimentConversion:   buildExperimentClicked,
 	auditKindAdminTierChanged:       buildTierChangedByAdmin,
 	auditKindAdminPromoIssued:       buildPromoCodeReceived,
+	auditKindChurnRiskFlagged:       buildChurnRiskFlagged,
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────
@@ -254,5 +262,30 @@ func buildPromoCodeReceived(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "kind", "kind")
 	copyMetaStr(params, meta, "value", "value")
 	copyMetaStr(params, meta, "expires_at", "expires_at")
+	return params, true
+}
+
+// buildChurnRiskFlagged is the per-kind builder for "we miss you"
+// reactivation emails (audit_log.kind = "churn.risk_flagged"). The
+// daily ChurnPredictorWorker writes these rows; this builder reads
+// them back into the Params map that the configured email provider
+// (Brevo today) uses to fill the template.
+//
+// Params shape:
+//   tier                    — team's current plan tier (hobby/pro/growth)
+//   last_activity_days_ago  — float; 0 means "no recorded activity ever"
+//   active_resource_count   — int; how many resources still standing
+//
+// All numbers stringify via fmt.Sprint (copyMetaStr); the JSON decode
+// surfaces them as float64 so "7" arrives as "7" not "7.000000".
+func buildChurnRiskFlagged(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "tier", "tier")
+	copyMetaStr(params, meta, "last_activity_days_ago", "last_activity_days_ago")
+	copyMetaStr(params, meta, "active_resource_count", "active_resource_count")
 	return params, true
 }

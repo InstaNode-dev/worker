@@ -77,6 +77,21 @@ func (mondayAt8UTCSchedule) Next(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day()+daysUntilMonday, 8, 0, 0, 0, time.UTC)
 }
 
+// dailyAt3UTCSchedule implements river.PeriodicSchedule for every day 03:00 UTC.
+// Used by ChurnPredictorWorker: 03:00 UTC is mid-day in Asia / late-night in
+// Europe / sleeping-hours in North America — a quiet slot that won't compete
+// with peak-hour provisioning traffic on the platform DB.
+type dailyAt3UTCSchedule struct{}
+
+func (dailyAt3UTCSchedule) Next(t time.Time) time.Time {
+	t = t.UTC()
+	next := time.Date(t.Year(), t.Month(), t.Day(), 3, 0, 0, 0, time.UTC)
+	if !next.After(t) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
 // StartWorkers initialises and starts the River background worker pool.
 // It registers all job workers and schedules periodic jobs.
 //
@@ -201,6 +216,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// always non-nil (NoopProvider when EMAIL_PROVIDER is unset). See
 	// event_email_forwarder.go for the full contract.
 	river.AddWorker(workers, WithObservability(NewEventEmailForwarderWorker(db, rdb, emailProvider), nrApp))
+	// Churn predictor — daily 03:00 UTC scan that writes a
+	// churn.risk_flagged audit_log row for every non-Team team that
+	// has been inactive for 7+ days, still has active resources, and
+	// hasn't been flagged in the last 30 days. The event-email
+	// forwarder above drains those rows into the "we_miss_you"
+	// reactivation email via the configured provider. See
+	// churn_predictor.go for the activity-kind / dedupe rationale.
+	river.AddWorker(workers, WithObservability(NewChurnPredictorWorker(db), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -328,6 +351,19 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(eventEmailForwarderInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return EventEmailForwarderArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Churn predictor — runs daily at 03:00 UTC. The 30-day dedupe
+		// guarantees at most one churn.risk_flagged row per team per
+		// month regardless of restart cadence. RunOnStart=false: a
+		// worker restart in the middle of the day shouldn't immediately
+		// re-scan — wait for the next scheduled 03:00 slot so the
+		// scan happens during quiet hours.
+		river.NewPeriodicJob(
+			dailyAt3UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ChurnPredictorArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
