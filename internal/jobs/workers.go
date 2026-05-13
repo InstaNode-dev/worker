@@ -157,6 +157,15 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability[TrialExpiryArgs](&TrialExpiryWorker{db: db, email: emailClient}, nrApp))
 	river.AddWorker(workers, WithObservability[WeeklyDigestArgs](&WeeklyDigestWorker{db: db, email: emailClient}, nrApp))
 	river.AddWorker(workers, WithObservability(NewExpiryReminderWorker(db, emailClient), nrApp))
+	// Resource-expiry-imminent producer: every 10 minutes, scan for
+	// authenticated resources whose expires_at falls inside the next hour
+	// and write one resource.expiry_imminent audit_log row per resource per
+	// 12h dedupe window. The Loops event forwarder drains those rows into
+	// Brevo lifecycle emails (event = resource_expiring_soon). Separate from
+	// ExpiryReminderWorker because the delivery channel (Loops/Brevo vs
+	// Resend) and dedupe surface (audit_log subquery vs resources column)
+	// are independent. See expire_imminent.go for the full SCOPE NOTE.
+	river.AddWorker(workers, WithObservability(NewExpireImminentWorker(db), nrApp))
 	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorker(db, planRegistry), nrApp))
 	river.AddWorker(workers, WithObservability(NewUpdateStorageBytesWorker(db, provClient, minioScanner), nrApp))
 	// Quota-wall nudge — Track U1. Periodic scan that writes a single
@@ -257,6 +266,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(1*time.Hour),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return ExpiryReminderArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Resource-expiry-imminent — every 10 minutes, write a
+		// resource.expiry_imminent audit row for any authenticated
+		// resource whose expires_at falls inside the next hour. Dedupe
+		// is enforced inside the candidate query (12h window on the
+		// audit_log table) so the dispatch cadence is independent of
+		// the per-resource email frequency. See expire_imminent.go for
+		// the freshness-window rationale.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(expireImminentInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ExpireImminentArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
