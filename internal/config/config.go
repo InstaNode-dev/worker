@@ -13,6 +13,7 @@ type Config struct {
 	ProvisionerAddr   string // PROVISIONER_ADDR — gRPC addr of provisioner service
 	ProvisionerSecret string // PROVISIONER_SECRET
 	ResendAPIKey      string // RESEND_API_KEY — for digest/trial emails
+	LoopsAPIKey       string // LOOPS_API_KEY — for Loops.so event forwarding (lifecycle email). Empty = forwarder is a no-op.
 	Environment       string // ENVIRONMENT
 	MaxMindLicenseKey string // MAXMIND_LICENSE_KEY — for GeoLite2 refresh job
 	GeoLite2DBPath    string // GEOLITE2_DB_PATH — local path to the GeoLite2 City MMDB
@@ -68,6 +69,7 @@ func Load() *Config {
 		ProvisionerAddr:   os.Getenv("PROVISIONER_ADDR"),
 		ProvisionerSecret: os.Getenv("PROVISIONER_SECRET"),
 		ResendAPIKey:      os.Getenv("RESEND_API_KEY"),
+		LoopsAPIKey:       os.Getenv("LOOPS_API_KEY"),
 		Environment:       getenv("ENVIRONMENT", "development"),
 		MaxMindLicenseKey: os.Getenv("MAXMIND_LICENSE_KEY"),
 		GeoLite2DBPath:    getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
@@ -105,6 +107,7 @@ func Load() *Config {
 		"environment", cfg.Environment,
 		"provisioner_addr_set", cfg.ProvisionerAddr != "",
 		"resend_key_set", cfg.ResendAPIKey != "",
+		"loops_key_set", cfg.LoopsAPIKey != "",
 	)
 	return cfg
 }
