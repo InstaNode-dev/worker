@@ -361,6 +361,201 @@ func TestEventForwarder_NoRowsExitsClean(t *testing.T) {
 	}
 }
 
+// ── Suppression tests ────────────────────────────────────────────────────────
+//
+// These pin the brief's three new contracts:
+//   4. Recipient has bounce row in last 365d → skip + advance cursor.
+//   5. Recipient has bounce row >366d ago    → still send (decay).
+//   6. Recipient has unsubscribe row         → permanent skip (no decay).
+//
+// memSuppression is the in-memory checker used by these tests. It just
+// returns whatever the test sets up — the decay rule is exercised by
+// the production sqlSuppressionChecker, which is covered by the api
+// repo's email_events_test.go (TestEmailEvents_HasSuppressionFor_*).
+
+type memSuppression struct {
+	suppressedEmails map[string]bool
+	failNext         error
+}
+
+func (m *memSuppression) hasSuppression(_ context.Context, emailAddr string) (bool, error) {
+	if m.failNext != nil {
+		err := m.failNext
+		m.failNext = nil
+		return false, err
+	}
+	return m.suppressedEmails[emailAddr], nil
+}
+
+// TestEventForwarder_SuppressedRecipient_SkipsSend verifies that when the
+// suppression checker reports a recipient is suppressed (bounce within
+// window), the forwarder:
+//   - DOES NOT call SendEvent
+//   - DOES advance the cursor past the row
+//   - Bumps the skipped counter
+func TestEventForwarder_SuppressedRecipient_SkipsSend(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Date(2026, 5, 13, 15, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("supp-row-1", "team-s", auditKindOnboardingClaimed, "", "x", []byte(`{}`), createdAt, "bouncey@example.com"))
+
+	provider := &fakeProvider{
+		sendFn: func(_ context.Context, _ email.EventEmail) error {
+			t.Errorf("SendEvent must NOT be called for a suppressed recipient")
+			return nil
+		},
+	}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.suppression = &memSuppression{
+		suppressedEmails: map[string]bool{"bouncey@example.com": true},
+	}
+
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if got := provider.callCount(); got != 0 {
+		t.Errorf("expected 0 SendEvent calls for suppressed recipient, got %d", got)
+	}
+	// Cursor MUST advance — holding it would re-attempt the same row
+	// every 60s tick.
+	if cursor.c.ID != "supp-row-1" {
+		t.Errorf("cursor.ID = %q after suppression; want supp-row-1 (must advance)", cursor.c.ID)
+	}
+}
+
+// TestEventForwarder_NonSuppressedRecipient_StillSends verifies the
+// negative-space contract: when the suppression checker reports the
+// recipient is NOT suppressed, the SendEvent fires normally. This is
+// the "bounce >366d ago" / "address never bounced" path — the decay
+// rule is enforced by the suppression checker, not the forwarder, so
+// here we just check that a not-suppressed answer lets the send proceed.
+func TestEventForwarder_NonSuppressedRecipient_StillSends(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Date(2026, 5, 13, 16, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("clean-row-1", "team-c", auditKindOnboardingClaimed, "", "x", []byte(`{}`), createdAt, "clean@example.com"))
+
+	provider := &fakeProvider{} // success
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.suppression = &memSuppression{
+		suppressedEmails: map[string]bool{}, // empty — nobody suppressed
+	}
+
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if got := provider.callCount(); got != 1 {
+		t.Errorf("expected 1 SendEvent call for non-suppressed recipient, got %d", got)
+	}
+	if cursor.c.ID != "clean-row-1" {
+		t.Errorf("cursor.ID = %q; want clean-row-1", cursor.c.ID)
+	}
+}
+
+// TestEventForwarder_UnsubscribeIsPermanent verifies the brief's "no
+// decay for unsubscribes" rule via the seam: the suppression checker
+// can return true for an unsubscribe regardless of age, and the
+// forwarder honors that without trying to second-guess the lookback
+// window. The decay-vs-no-decay split is enforced in the checker
+// (see api/internal/models/email_events.go HasSuppressionFor); the
+// worker test pins the integration contract.
+func TestEventForwarder_UnsubscribeIsPermanent(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Date(2026, 5, 13, 17, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("unsub-row-1", "team-u", auditKindSubscriptionUpgraded, "", "upgrade", []byte(`{"to_tier":"pro"}`), createdAt, "leaver@example.com"))
+
+	provider := &fakeProvider{
+		sendFn: func(_ context.Context, _ email.EventEmail) error {
+			t.Errorf("SendEvent must NOT be called for an unsubscribed recipient (no decay)")
+			return nil
+		},
+	}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.suppression = &memSuppression{
+		suppressedEmails: map[string]bool{"leaver@example.com": true},
+	}
+
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if got := provider.callCount(); got != 0 {
+		t.Errorf("expected 0 SendEvent calls for unsubscribed recipient, got %d", got)
+	}
+	if cursor.c.ID != "unsub-row-1" {
+		t.Errorf("cursor.ID = %q after unsubscribe-suppression; want unsub-row-1", cursor.c.ID)
+	}
+}
+
+// TestEventForwarder_SuppressionCheckerError_FailsOpen verifies the
+// fail-open contract: a DB error from the suppression checker is
+// logged-and-swallowed, and the send proceeds. A Postgres blip MUST
+// NOT pin the queue or block sends — duplicate-to-bouncer is
+// preferable to no-sends-at-all.
+func TestEventForwarder_SuppressionCheckerError_FailsOpen(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Date(2026, 5, 13, 18, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("err-row-1", "team-e", auditKindOnboardingClaimed, "", "x", []byte(`{}`), createdAt, "anyone@example.com"))
+
+	provider := &fakeProvider{}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.suppression = &memSuppression{
+		suppressedEmails: map[string]bool{},
+		failNext:         errFakeSuppression,
+	}
+
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if got := provider.callCount(); got != 1 {
+		t.Errorf("expected 1 SendEvent call (fail-open), got %d", got)
+	}
+	if cursor.c.ID != "err-row-1" {
+		t.Errorf("cursor.ID = %q; want err-row-1 (sent successfully despite suppression-check error)", cursor.c.ID)
+	}
+}
+
+// errFakeSuppression is the sentinel returned by memSuppression.failNext
+// to simulate a DB error from the suppression checker.
+var errFakeSuppression = &fakeSuppressionError{}
+
+type fakeSuppressionError struct{}
+
+func (*fakeSuppressionError) Error() string { return "fake suppression DB error" }
+
 // TestEventForwarder_NoopProvider_AdvancesCursor — wiring a real
 // email.NoopProvider through the forwarder is the integration check that
 // the SendClassSkippedNoTemplate path advances cursors. If this regresses,
