@@ -16,6 +16,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
 	"instant.dev/worker/internal/config"
+	"instant.dev/worker/internal/email"
 	"instant.dev/worker/internal/provisioner"
 )
 
@@ -103,16 +104,27 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 
 	emailClient := NewEmailClient(cfg.ResendAPIKey)
 
-	// Loops.so HTTP client — nil when LOOPS_API_KEY is unset (fail-open).
-	// LoopsEventForwarderWorker handles the nil case with a per-tick warn.
-	loopsClient := newLoopsClient(cfg.LoopsAPIKey)
-	if loopsClient == nil {
-		slog.Warn("jobs.workers.loops_disabled",
-			"reason", "LOOPS_API_KEY not set — lifecycle email forwarding is a no-op",
+	// Event-email provider — provider-agnostic seam. The factory chooses the
+	// implementation from EMAIL_PROVIDER (Brevo today; SES/SendGrid possible
+	// later) and returns NoopProvider when nothing is configured (fail-open).
+	// Construction failure here (unknown provider name, brevo missing key)
+	// is fatal: the operator opted into a real provider, silently falling
+	// back to noop would hide the misconfiguration.
+	emailProvider, err := email.NewProvider(email.Config{
+		Provider: cfg.EmailProvider,
+		Brevo: email.BrevoConfig{
+			APIKey:      cfg.BrevoAPIKey,
+			TemplateIDs: cfg.BrevoTemplateIDs,
+		},
+	})
+	if err != nil {
+		slog.Error("jobs.workers.email_provider_init_failed",
+			"error", err,
+			"email_provider", cfg.EmailProvider,
 		)
-	} else {
-		slog.Info("jobs.workers.loops_enabled")
+		return &Workers{}
 	}
+	slog.Info("jobs.workers.email_provider_ready", "name", emailProvider.Name())
 
 	// Build MinIO admin client for storage IAM cleanup — nil unless the legacy
 	// MINIO_* env vars are set. Only used when ExpireAnonymousWorker needs to
@@ -175,11 +187,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// may be nil (kubeconfig unreachable in CI / docker-compose); the worker
 	// then short-circuits with a WARN each tick. See deploy_status_reconcile.go.
 	river.AddWorker(workers, WithObservability(NewDeployStatusReconciler(db, deployStatusK8s), nrApp))
-	// Loops.so event forwarder — drains audit_log rows into Loops every 60s
-	// for lifecycle email triggering. loopsClient is nil iff LOOPS_API_KEY is
-	// unset, in which case the worker logs + exits cleanly each tick. See
-	// loops_event_forwarder.go for the full contract.
-	river.AddWorker(workers, WithObservability(NewLoopsEventForwarderWorker(db, rdb, loopsClient), nrApp))
+	// Event-email forwarder — drains audit_log rows into the configured
+	// provider every 60s for lifecycle email triggering. The provider is
+	// always non-nil (NoopProvider when EMAIL_PROVIDER is unset). See
+	// event_email_forwarder.go for the full contract.
+	river.AddWorker(workers, WithObservability(NewEventEmailForwarderWorker(db, rdb, emailProvider), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -285,14 +297,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
-		// Loops.so event forwarder runs every loopsForwarderInterval (60s).
+		// Event-email forwarder runs every eventEmailForwarderInterval (60s).
 		// RunOnStart=false: a worker restart should pick up the cursor on
 		// the next tick, not race to fire a duplicate batch. See
-		// loops_event_forwarder.go for the cursor / idempotency contract.
+		// event_email_forwarder.go for the cursor / idempotency contract.
 		river.NewPeriodicJob(
-			river.PeriodicInterval(loopsForwarderInterval),
+			river.PeriodicInterval(eventEmailForwarderInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return LoopsEventForwarderArgs{}, nil
+				return EventEmailForwarderArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
