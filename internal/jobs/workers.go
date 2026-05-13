@@ -116,6 +116,13 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			APIKey:      cfg.BrevoAPIKey,
 			TemplateIDs: cfg.BrevoTemplateIDs,
 		},
+		SES: email.SESConfig{
+			AWSRegion:     cfg.SESAWSRegion,
+			AWSAccessKey:  cfg.SESAWSAccessKey,
+			AWSSecretKey:  cfg.SESAWSSecretKey,
+			FromEmail:     cfg.SESFromEmail,
+			TemplateNames: cfg.SESTemplateNames,
+		},
 	})
 	if err != nil {
 		slog.Error("jobs.workers.email_provider_init_failed",
