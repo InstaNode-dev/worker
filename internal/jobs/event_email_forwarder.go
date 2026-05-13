@@ -77,6 +77,93 @@ const eventEmailCursorKey = "email:event_forwarder:last_audit_cursor"
 // pattern-match dedupe headers in provider dashboards.
 const eventEmailIdempotencyPrefix = "audit-"
 
+// Suppression-related constants — mirrored from the api package's
+// internal/models.email_events.go so the worker doesn't import the api
+// module. Keep these values in sync across the two repos.
+//
+//   eventEmailSuppressionBounceDecay: how long a hard bounce / spam
+//   complaint stays in the suppression set. After this window the
+//   forwarder will attempt sends to the address again — bounces decay
+//   because a previously-bouncing inbox may have been fixed.
+//
+//   Unsubscribes intentionally do NOT decay — see
+//   suppressionUnsubscribeDecaysNever for the rationale.
+const eventEmailSuppressionBounceDecay = 365 * 24 * time.Hour
+
+// suppressionEventTypesDecaying is the set of event_type values that obey
+// the eventEmailSuppressionBounceDecay window. Soft bounces deliberately
+// omitted (transient — retry is the correct behavior).
+var suppressionEventTypesDecaying = []string{"bounce", "spam_complaint"}
+
+// suppressionEventTypeUnsubscribe is the SQL string for the unsubscribe
+// event_type. Pulled to a constant so a typo in the suppression query
+// can't silently keep nudging an unsubscribed user.
+const suppressionEventTypeUnsubscribe = "unsubscribe"
+
+// suppressionChecker is the seam the forwarder uses to ask "should I
+// skip this recipient?". Production wires a real Postgres-backed
+// implementation (sqlSuppressionChecker below); tests supply an
+// in-memory map so the forwarder spec stays hermetic.
+//
+// Returns (true, nil) when the recipient has a suppression row, (false,
+// nil) when they don't, and (false, err) on a DB error. The forwarder
+// fail-OPENS on errors (treats them as "not suppressed") so a Redis or
+// Postgres blip doesn't stall the queue. The downside — sending a
+// duplicate to a bouncing inbox during a DB outage — is preferable to
+// the alternative — pinning the queue behind a transient failure.
+type suppressionChecker interface {
+	hasSuppression(ctx context.Context, emailAddr string) (bool, error)
+}
+
+// sqlSuppressionChecker is the production implementation. Two queries
+// fired in series — one for unsubscribes (no decay), one for bounces +
+// spam complaints (365d decay). The composite index
+// idx_email_events_email_type means each is a single range scan even
+// when email_events grows to millions of rows.
+type sqlSuppressionChecker struct {
+	db *sql.DB
+}
+
+func (s *sqlSuppressionChecker) hasSuppression(ctx context.Context, emailAddr string) (bool, error) {
+	if emailAddr == "" {
+		return false, nil
+	}
+
+	// Path 1: unsubscribes. No decay window — once a user unsubscribes
+	// we stay unsubscribed until they re-opt-in.
+	var found int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM email_events
+		WHERE email = $1 AND event_type = $2
+		LIMIT 1
+	`, emailAddr, suppressionEventTypeUnsubscribe).Scan(&found)
+	if err == nil {
+		return true, nil
+	}
+	if err != sql.ErrNoRows {
+		return false, fmt.Errorf("hasSuppression unsubscribe: %w", err)
+	}
+
+	// Path 2: bounces + spam complaints with the 365d decay window.
+	decayCutoff := time.Now().UTC().Add(-eventEmailSuppressionBounceDecay)
+	err = s.db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM email_events
+		WHERE email = $1
+		  AND event_type = ANY($2::text[])
+		  AND created_at > $3
+		LIMIT 1
+	`, emailAddr, pq.Array(suppressionEventTypesDecaying), decayCutoff).Scan(&found)
+	if err == nil {
+		return true, nil
+	}
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return false, fmt.Errorf("hasSuppression decay: %w", err)
+}
+
 // eventCursor is the watermark structure. CreatedAt + ID together give a
 // strict total order even when multiple rows share a microsecond timestamp.
 type eventCursor struct {
@@ -140,30 +227,55 @@ func (s *redisEventCursorStore) write(ctx context.Context, c eventCursor) error 
 // EventEmailForwarderWorker is the River worker. db is the platform Postgres,
 // cursor is the watermark store (Redis in production), and provider is the
 // configured email provider (NoopProvider when EMAIL_PROVIDER is unset).
+// suppression decides "should we skip this recipient because they bounced
+// or unsubscribed?" — fail-open on DB errors (see suppressionChecker doc).
 type EventEmailForwarderWorker struct {
 	river.WorkerDefaults[EventEmailForwarderArgs]
-	db       *sql.DB
-	cursor   eventCursorStore
-	provider email.EmailProvider
+	db          *sql.DB
+	cursor      eventCursorStore
+	provider    email.EmailProvider
+	suppression suppressionChecker
 }
 
 // NewEventEmailForwarderWorker constructs the worker. provider MUST be
 // non-nil — the factory in internal/email returns NoopProvider rather than
 // nil when no email provider is configured, so this constructor has no
-// fail-open branch.
+// fail-open branch. The suppression checker is wired to the same *sql.DB
+// the forwarder reads audit_log from; email_events lives in the platform
+// Postgres alongside audit_log, so one connection serves both queries.
 func NewEventEmailForwarderWorker(db *sql.DB, rdb *redis.Client, provider email.EmailProvider) *EventEmailForwarderWorker {
 	return &EventEmailForwarderWorker{
-		db:       db,
-		cursor:   &redisEventCursorStore{rdb: rdb},
-		provider: provider,
+		db:          db,
+		cursor:      &redisEventCursorStore{rdb: rdb},
+		provider:    provider,
+		suppression: &sqlSuppressionChecker{db: db},
 	}
 }
 
 // newEventEmailForwarderWorkerForTest constructs a worker with an injectable
 // cursor store. Used only by unit tests so they don't need a live Redis.
 // Package-private so external callers must use NewEventEmailForwarderWorker.
+//
+// Suppression defaults to a permissive (always-false) checker so existing
+// tests that don't care about the suppression path keep working unchanged.
+// Tests that DO want to exercise suppression should set `w.suppression`
+// directly after construction.
 func newEventEmailForwarderWorkerForTest(db *sql.DB, cursor eventCursorStore, provider email.EmailProvider) *EventEmailForwarderWorker {
-	return &EventEmailForwarderWorker{db: db, cursor: cursor, provider: provider}
+	return &EventEmailForwarderWorker{
+		db:          db,
+		cursor:      cursor,
+		provider:    provider,
+		suppression: noopSuppressionChecker{},
+	}
+}
+
+// noopSuppressionChecker is the "everyone is sendable" stub used by tests
+// that don't care about suppression. Production NEVER uses this — the
+// production constructor wires sqlSuppressionChecker.
+type noopSuppressionChecker struct{}
+
+func (noopSuppressionChecker) hasSuppression(context.Context, string) (bool, error) {
+	return false, nil
 }
 
 // Work runs one sweep of audit_log → email provider.
@@ -233,6 +345,38 @@ batchLoop:
 			)
 			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
 				return fmt.Errorf("event_email_forwarder: advance cursor after builder skip: %w", advErr)
+			}
+			skipped++
+			continue
+		}
+
+		// Suppression check — before any send, verify the recipient hasn't
+		// already told us "stop". Bounces decay after 365d (the inbox may
+		// have been fixed), unsubscribes never decay. See
+		// sqlSuppressionChecker for the query shape; on DB errors the
+		// checker fails-OPEN so we don't pin the queue.
+		suppressed, supErr := w.suppression.hasSuppression(ctx, row.OwnerEmail)
+		if supErr != nil {
+			// Log + treat as "not suppressed" — see fail-open rationale.
+			slog.Warn("jobs.event_email_forwarder.suppression_check_failed",
+				"audit_id", row.ID,
+				"error", supErr,
+				"note", "fail-open: continuing as if recipient is sendable",
+			)
+		}
+		if suppressed {
+			// Skip + advance cursor. Logged at INFO with NO recipient
+			// address — operators can see counts in the
+			// jobs.event_email_forwarder.completed summary at the bottom
+			// of the sweep. The audit_id is enough for forensic lookup
+			// without leaking the suppressed email into log streams.
+			slog.Info("jobs.event_email_forwarder.recipient_suppressed",
+				"audit_id", row.ID,
+				"kind", row.Kind,
+				"note", "skip — recipient has bounce/unsubscribe/spam_complaint in suppression window",
+			)
+			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
+				return fmt.Errorf("event_email_forwarder: advance cursor after suppression: %w", advErr)
 			}
 			skipped++
 			continue
