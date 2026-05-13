@@ -85,7 +85,8 @@ func (mondayAt8UTCSchedule) Next(t time.Time) time.Time {
 // reconciler logs at WARN each run and other periodic jobs keep functioning.
 // See worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
 func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, deployStatusK8s deployStatusK8sProvider, nrApp *newrelic.Application) *Workers {
-	_ = rdb // available for future workers; currently only used by quota checks done via db
+	// rdb is used by LoopsEventForwarderWorker (cursor storage). Other
+	// workers access redis indirectly via the platform DB.
 
 	// River requires pgx pool — open a separate connection for the worker pool.
 	pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
@@ -101,6 +102,17 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	}
 
 	emailClient := NewEmailClient(cfg.ResendAPIKey)
+
+	// Loops.so HTTP client — nil when LOOPS_API_KEY is unset (fail-open).
+	// LoopsEventForwarderWorker handles the nil case with a per-tick warn.
+	loopsClient := newLoopsClient(cfg.LoopsAPIKey)
+	if loopsClient == nil {
+		slog.Warn("jobs.workers.loops_disabled",
+			"reason", "LOOPS_API_KEY not set — lifecycle email forwarding is a no-op",
+		)
+	} else {
+		slog.Info("jobs.workers.loops_enabled")
+	}
 
 	// Build MinIO admin client for storage IAM cleanup — nil unless the legacy
 	// MINIO_* env vars are set. Only used when ExpireAnonymousWorker needs to
@@ -163,6 +175,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// may be nil (kubeconfig unreachable in CI / docker-compose); the worker
 	// then short-circuits with a WARN each tick. See deploy_status_reconcile.go.
 	river.AddWorker(workers, WithObservability(NewDeployStatusReconciler(db, deployStatusK8s), nrApp))
+	// Loops.so event forwarder — drains audit_log rows into Loops every 60s
+	// for lifecycle email triggering. loopsClient is nil iff LOOPS_API_KEY is
+	// unset, in which case the worker logs + exits cleanly each tick. See
+	// loops_event_forwarder.go for the full contract.
+	river.AddWorker(workers, WithObservability(NewLoopsEventForwarderWorker(db, rdb, loopsClient), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -267,6 +284,17 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 				return DeployStatusReconcileArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Loops.so event forwarder runs every loopsForwarderInterval (60s).
+		// RunOnStart=false: a worker restart should pick up the cursor on
+		// the next tick, not race to fire a duplicate batch. See
+		// loops_event_forwarder.go for the cursor / idempotency contract.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(loopsForwarderInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return LoopsEventForwarderArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
 		),
 	}
 
