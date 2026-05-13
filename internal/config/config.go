@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,7 +14,20 @@ type Config struct {
 	ProvisionerAddr   string // PROVISIONER_ADDR — gRPC addr of provisioner service
 	ProvisionerSecret string // PROVISIONER_SECRET
 	ResendAPIKey      string // RESEND_API_KEY — for digest/trial emails
-	LoopsAPIKey       string // LOOPS_API_KEY — for Loops.so event forwarding (lifecycle email). Empty = forwarder is a no-op.
+
+	// Event-email provider — see internal/email/.
+	//
+	// EMAIL_PROVIDER selects the implementation:
+	//   "brevo"     → POST to Brevo /v3/smtp/email with BREVO_TEMPLATE_IDS mapping
+	//   "noop" / "" → silent no-op (NoopProvider; default — fail-open)
+	//   "ses" / "sendgrid" → reserved for future implementations
+	//
+	// Swapping providers later = one line in internal/email/factory.go + one new
+	// file under internal/email/. No forwarder change, no mapping change.
+	EmailProvider    string            // EMAIL_PROVIDER
+	BrevoAPIKey      string            // BREVO_API_KEY
+	BrevoTemplateIDs map[string]int    // BREVO_TEMPLATE_IDS (JSON object: audit_log.kind → numeric template id)
+
 	Environment       string // ENVIRONMENT
 	MaxMindLicenseKey string // MAXMIND_LICENSE_KEY — for GeoLite2 refresh job
 	GeoLite2DBPath    string // GEOLITE2_DB_PATH — local path to the GeoLite2 City MMDB
@@ -69,7 +83,9 @@ func Load() *Config {
 		ProvisionerAddr:   os.Getenv("PROVISIONER_ADDR"),
 		ProvisionerSecret: os.Getenv("PROVISIONER_SECRET"),
 		ResendAPIKey:      os.Getenv("RESEND_API_KEY"),
-		LoopsAPIKey:       os.Getenv("LOOPS_API_KEY"),
+		EmailProvider:     os.Getenv("EMAIL_PROVIDER"),
+		BrevoAPIKey:       os.Getenv("BREVO_API_KEY"),
+		BrevoTemplateIDs:  parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
 		Environment:       getenv("ENVIRONMENT", "development"),
 		MaxMindLicenseKey: os.Getenv("MAXMIND_LICENSE_KEY"),
 		GeoLite2DBPath:    getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
@@ -107,7 +123,34 @@ func Load() *Config {
 		"environment", cfg.Environment,
 		"provisioner_addr_set", cfg.ProvisionerAddr != "",
 		"resend_key_set", cfg.ResendAPIKey != "",
-		"loops_key_set", cfg.LoopsAPIKey != "",
+		"email_provider", cfg.EmailProvider,
+		"brevo_key_set", cfg.BrevoAPIKey != "",
+		"brevo_template_count", len(cfg.BrevoTemplateIDs),
 	)
 	return cfg
+}
+
+// parseBrevoTemplateIDs decodes the BREVO_TEMPLATE_IDS env var. The expected
+// shape is a JSON object mapping audit_log.kind → numeric Brevo template id:
+//
+//   BREVO_TEMPLATE_IDS='{"subscription.upgraded": 12, "near_quota_wall": 7}'
+//
+// Empty string returns an empty map (Brevo will then SkipNoTemplate on every
+// send — operator opted into "API key set, no templates yet"). A malformed
+// value logs an ERROR and returns empty so the worker still boots — a
+// templated message that drops back to SkipNoTemplate is easier to debug
+// than a boot crash for a marketing operator who fat-fingered the JSON.
+func parseBrevoTemplateIDs(raw string) map[string]int {
+	if raw == "" {
+		return map[string]int{}
+	}
+	m := map[string]int{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		slog.Error("worker.config.brevo_template_ids_invalid",
+			"error", err,
+			"note", "BREVO_TEMPLATE_IDS must be a JSON object of kind→int; falling back to empty map",
+		)
+		return map[string]int{}
+	}
+	return m
 }
