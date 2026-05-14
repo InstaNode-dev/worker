@@ -312,7 +312,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// doesn't block worker boot. See each worker's Work() top for the
 	// exact WARN line emitted.
 	river.AddWorker(workers, WithObservability(NewCustomerBackupSchedulerWorker(db), nrApp))
-	river.AddWorker(workers, WithObservability(NewCustomerBackupRunner(db, backupStore, cfg.BackupS3Bucket, cfg.BackupS3PathPrefix, cfg.AESKey, backupPlans), nrApp))
+	// FIX-H #65/#Q47 — wire the refund client so terminal MANUAL backup
+	// failures credit the team's daily counter via the api's internal
+	// /internal/teams/:id/backup-quota/refund endpoint. Empty apiBase /
+	// jwtSecret disables the refund (logs WARN, no-op) — matches the
+	// rest of the worker's fail-open posture.
+	customerRunner := NewCustomerBackupRunner(db, backupStore, cfg.BackupS3Bucket, cfg.BackupS3PathPrefix, cfg.AESKey, backupPlans).
+		WithRefundClient(cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil)
+	river.AddWorker(workers, WithObservability(customerRunner, nrApp))
 	river.AddWorker(workers, WithObservability(NewCustomerRestoreRunner(db, backupStore, cfg.BackupS3Bucket, cfg.AESKey), nrApp))
 
 	// Platform-DB backup — nightly 02:00 UTC pg_dump of the platform DB to
