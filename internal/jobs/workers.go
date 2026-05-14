@@ -273,6 +273,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// terminate for grace-expired teams. WARN-noops when the api URL or
 	// WORKER_INTERNAL_JWT_SECRET is unset.
 	river.AddWorker(workers, WithObservability(NewPaymentGraceTerminatorWorker(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil), nrApp))
+	// GitHub auto-deploy dispatcher (W11 — migration 035 in the api repo).
+	// Drains pending_github_deploys rows inserted by the api's /webhooks/github/:webhook_id
+	// receive endpoint. Fetches the github archive tarball and POSTs to
+	// /deploy/:appID/redeploy with the worker's internal JWT. No-op when
+	// INSTANT_API_INTERNAL_URL or WORKER_INTERNAL_JWT_SECRET is unset — same
+	// fail-open posture as PaymentGraceTerminator. See
+	// github_deploy_dispatcher.go for the per-step contract.
+	river.AddWorker(workers, WithObservability(NewGitHubDeployDispatcher(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret), nrApp))
 	// Customer-backup pipeline — three workers, two cron schedules.
 	//
 	//   scheduler (every hour)  — inserts pending resource_backups rows for
@@ -471,6 +479,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(deployStatusReconcileInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return DeployStatusReconcileArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// GitHub auto-deploy dispatcher — every 30s. RunOnStart=true so a
+		// worker restart drains rows that piled up while the worker was
+		// down. Same starvation-protection queue as the other reconcilers.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(githubDispatcherInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return GitHubDeployDispatcherArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
