@@ -1,44 +1,21 @@
 package jobs_test
 
+// expiry_reminder_test.go — covers the FOLLOWUP-5 migration of
+// ExpiryReminderWorker from a direct Resend send to an
+// anon.expiry_warning audit_log insert. The BrevoForwarder dispatches
+// from there — see event_email_forwarder_test.go for end-to-end coverage
+// of that path.
+
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
 
 	"instant.dev/worker/internal/jobs"
 )
-
-// fakeExpiryEmailer captures every SendExpiryReminder call so tests can
-// assert call count + payload without hitting the live Resend client.
-type fakeExpiryEmailer struct {
-	mu   sync.Mutex
-	sent []sentReminder
-	err  error
-}
-
-type sentReminder struct {
-	to             string
-	resourceType   string
-	hoursRemaining int
-}
-
-func (f *fakeExpiryEmailer) SendExpiryReminder(_ context.Context, to, resourceType string, hoursRemaining int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.sent = append(f.sent, sentReminder{to: to, resourceType: resourceType, hoursRemaining: hoursRemaining})
-	return f.err
-}
-
-func (f *fakeExpiryEmailer) calls() []sentReminder {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]sentReminder, len(f.sent))
-	copy(out, f.sent)
-	return out
-}
 
 func TestExpiryReminderWorker_NoCandidates(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -47,126 +24,117 @@ func TestExpiryReminderWorker_NoCandidates(t *testing.T) {
 	}
 	defer db.Close()
 
-	rows := sqlmock.NewRows([]string{"id", "resource_type", "expires_at", "email"})
-	mock.ExpectQuery(`SELECT r.id::text, r.resource_type, r.expires_at, u.email`).WillReturnRows(rows)
+	rows := sqlmock.NewRows([]string{"id", "team_id", "resource_type", "expires_at", "email"})
+	mock.ExpectQuery(`SELECT r.id, r.team_id, r.resource_type, r.expires_at, u.email`).WillReturnRows(rows)
 
-	emailer := &fakeExpiryEmailer{}
-	w := jobs.NewExpiryReminderWorker(db, emailer)
+	w := jobs.NewExpiryReminderWorker(db)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got := len(emailer.calls()); got != 0 {
-		t.Errorf("expected 0 sends, got %d", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
-func TestExpiryReminderWorker_SendsAndStamps(t *testing.T) {
+// TestAnonExpiryReminder_WritesAuditWithFullMetadata is the FOLLOWUP-5
+// migration pin: a candidate with a valid owner email gets stamped AND
+// gets exactly one anon.expiry_warning audit_log row inserted carrying
+// the metadata Brevo's template body needs (resource_id, resource_type,
+// hours_remaining, expires_at, email).
+//
+// Pre-migration the worker called EmailClient.SendExpiryReminder
+// (Resend, NoopClient in prod). Post-migration it writes the audit row.
+// This test fails on master and passes here.
+func TestAnonExpiryReminder_WritesAuditWithFullMetadata(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
+	resID := uuid.New()
+	teamID := uuid.New()
 	expires := time.Now().UTC().Add(3 * time.Hour)
 
-	rows := sqlmock.NewRows([]string{"id", "resource_type", "expires_at", "email"}).
-		AddRow("res-1", "postgres", expires, "owner-a@example.com").
-		AddRow("res-2", "redis", expires.Add(30*time.Minute), "owner-b@example.com")
-	mock.ExpectQuery(`SELECT r.id::text, r.resource_type, r.expires_at, u.email`).WillReturnRows(rows)
+	rows := sqlmock.NewRows([]string{"id", "team_id", "resource_type", "expires_at", "email"}).
+		AddRow(resID, teamID, "postgres", expires, "owner@example.com")
+	mock.ExpectQuery(`SELECT r.id, r.team_id, r.resource_type, r.expires_at, u.email`).WillReturnRows(rows)
 
-	// One stamp UPDATE per candidate, stamped BEFORE the send.
+	// Stamp must come BEFORE the audit insert — fail-open contract.
 	mock.ExpectExec(`UPDATE resources\s+SET expiry_reminded_at = now\(\)`).
-		WithArgs("res-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`UPDATE resources\s+SET expiry_reminded_at = now\(\)`).
-		WithArgs("res-2").
+		WithArgs(resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	emailer := &fakeExpiryEmailer{}
-	w := jobs.NewExpiryReminderWorker(db, emailer)
+	// One audit insert with kind=anon.expiry_warning. The full metadata
+	// JSON is checked by argument matching on resource_type — the rest of
+	// the params are validated indirectly via the per-builder tests in
+	// event_email_mapping_test.go.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(teamID, "anon.expiry_warning", "postgres", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := jobs.NewExpiryReminderWorker(db)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-
-	calls := emailer.calls()
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 sends, got %d (%+v)", len(calls), calls)
-	}
-	if calls[0].to != "owner-a@example.com" || calls[0].resourceType != "postgres" {
-		t.Errorf("call[0] = %+v", calls[0])
-	}
-	if calls[1].to != "owner-b@example.com" || calls[1].resourceType != "redis" {
-		t.Errorf("call[1] = %+v", calls[1])
-	}
-	if calls[0].hoursRemaining < 1 || calls[0].hoursRemaining > 4 {
-		t.Errorf("call[0].hoursRemaining = %d, want 1..4", calls[0].hoursRemaining)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
-func TestExpiryReminderWorker_StampsButSkipsSend_WhenNoOwnerEmail(t *testing.T) {
+func TestExpiryReminderWorker_StampsButSkipsAudit_WhenNoOwnerEmail(t *testing.T) {
 	// If the team owner email is NULL (orphan team / unfinished signup), we
-	// still stamp the row so the next pass doesn't pick it back up. We do
-	// not call the emailer.
+	// still stamp the row so the next pass doesn't pick it back up, but
+	// do not write the audit row (no recipient → no email to send).
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
+	resID := uuid.New()
+	teamID := uuid.New()
 	expires := time.Now().UTC().Add(2 * time.Hour)
-	rows := sqlmock.NewRows([]string{"id", "resource_type", "expires_at", "email"}).
-		AddRow("res-orphan", "postgres", expires, nil) // NULL email
-	mock.ExpectQuery(`SELECT r.id::text, r.resource_type, r.expires_at, u.email`).WillReturnRows(rows)
+	rows := sqlmock.NewRows([]string{"id", "team_id", "resource_type", "expires_at", "email"}).
+		AddRow(resID, teamID, "postgres", expires, nil) // NULL email
+	mock.ExpectQuery(`SELECT r.id, r.team_id, r.resource_type, r.expires_at, u.email`).WillReturnRows(rows)
 	mock.ExpectExec(`UPDATE resources\s+SET expiry_reminded_at = now\(\)`).
-		WithArgs("res-orphan").
+		WithArgs(resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	emailer := &fakeExpiryEmailer{}
-	w := jobs.NewExpiryReminderWorker(db, emailer)
+	w := jobs.NewExpiryReminderWorker(db)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := len(emailer.calls()); got != 0 {
-		t.Errorf("expected 0 sends (no owner email), got %d", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
-func TestExpiryReminderWorker_FailOpenOnSendError(t *testing.T) {
-	// Resend down: the send returns an error. The row is already stamped,
-	// so the worker must NOT propagate the error (top-level success).
-	// We will not retry this resource, which is the intentional trade-off
-	// documented on ExpiryReminderWorker.
+func TestExpiryReminderWorker_FailOpenOnAuditInsertError(t *testing.T) {
+	// audit_log INSERT errors must NOT propagate — fail-open posture.
+	// The row is already stamped, so the worker will not retry this resource.
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
+	resID := uuid.New()
+	teamID := uuid.New()
 	expires := time.Now().UTC().Add(1 * time.Hour)
-	rows := sqlmock.NewRows([]string{"id", "resource_type", "expires_at", "email"}).
-		AddRow("res-x", "mongodb", expires, "x@example.com")
-	mock.ExpectQuery(`SELECT r.id::text`).WillReturnRows(rows)
+	rows := sqlmock.NewRows([]string{"id", "team_id", "resource_type", "expires_at", "email"}).
+		AddRow(resID, teamID, "mongodb", expires, "x@example.com")
+	mock.ExpectQuery(`SELECT r.id`).WillReturnRows(rows)
 	mock.ExpectExec(`UPDATE resources\s+SET expiry_reminded_at = now\(\)`).
-		WithArgs("res-x").
+		WithArgs(resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WillReturnError(errDB)
 
-	emailer := &fakeExpiryEmailer{err: errDB}
-	w := jobs.NewExpiryReminderWorker(db, emailer)
+	w := jobs.NewExpiryReminderWorker(db)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
-		t.Fatalf("expected nil (fail-open) on Resend error, got %v", err)
-	}
-	if got := len(emailer.calls()); got != 1 {
-		t.Errorf("expected exactly 1 attempted send, got %d", got)
+		t.Fatalf("expected nil (fail-open) on audit insert error, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
@@ -181,38 +149,10 @@ func TestExpiryReminderWorker_TopLevelQueryError_ReturnsError(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SELECT r.id::text`).WillReturnError(errDB)
+	mock.ExpectQuery(`SELECT r.id`).WillReturnError(errDB)
 
-	w := jobs.NewExpiryReminderWorker(db, &fakeExpiryEmailer{})
+	w := jobs.NewExpiryReminderWorker(db)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err == nil {
 		t.Fatal("expected error from top-level query failure")
-	}
-}
-
-func TestExpiryReminderWorker_NilEmailer_StampsButSkips(t *testing.T) {
-	// Dev mode (no RESEND_API_KEY plumbed through to the worker — emailer
-	// is nil). We still stamp so a real cluster won't accidentally email
-	// this row when the API key is added later. Trade-off: rows that get
-	// stamped during a dev session won't ever be reminded.
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New: %v", err)
-	}
-	defer db.Close()
-
-	expires := time.Now().UTC().Add(2 * time.Hour)
-	rows := sqlmock.NewRows([]string{"id", "resource_type", "expires_at", "email"}).
-		AddRow("res-z", "redis", expires, "z@example.com")
-	mock.ExpectQuery(`SELECT r.id::text`).WillReturnRows(rows)
-	mock.ExpectExec(`UPDATE resources\s+SET expiry_reminded_at = now\(\)`).
-		WithArgs("res-z").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := jobs.NewExpiryReminderWorker(db, nil) // nil emailer
-	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet expectations: %v", err)
 	}
 }

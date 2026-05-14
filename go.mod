@@ -17,7 +17,6 @@ require (
 	github.com/newrelic/go-agent/v3 v3.43.3
 	github.com/prometheus/client_golang v1.21.0
 	github.com/redis/go-redis/v9 v9.6.1
-	github.com/resend/resend-go/v2 v2.28.0
 	github.com/riverqueue/river v0.11.4
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.11.4
 	github.com/riverqueue/river/rivertype v0.11.4
