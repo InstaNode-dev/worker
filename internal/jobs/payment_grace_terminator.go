@@ -55,6 +55,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
+	"instant.dev/worker/internal/apiclient"
+	"instant.dev/worker/internal/circuit"
 )
 
 // PaymentGraceTerminatorArgs is the River job payload — no fields.
@@ -86,12 +88,19 @@ const auditKindPaymentGraceTerminated = "payment.grace_terminated"
 const paymentGraceTerminatorActor = "system"
 
 // PaymentGraceTerminatorWorker drives the terminator flow.
+//
+// The httpCli field is wrapped in apiclient.Client when the worker is
+// constructed via NewPaymentGraceTerminatorWorker — every call to the
+// api goes through that wrapper's circuit breaker. If you bypass the
+// constructor in tests, the wrapped client falls back to the raw
+// http.Client; the breaker is only attached via the apiCli field.
 type PaymentGraceTerminatorWorker struct {
 	river.WorkerDefaults[PaymentGraceTerminatorArgs]
 	db        *sql.DB
-	httpCli   *http.Client
-	apiBase   string // e.g. http://instant-api.instant.svc.cluster.local:8080
-	jwtSecret string // shared with the api side under WORKER_INTERNAL_JWT_SECRET
+	httpCli   *http.Client      // raw client retained for tests / back-compat
+	apiCli    *apiclient.Client // circuit-breaker-wrapped wrapper, used by terminate()
+	apiBase   string            // e.g. http://instant-api.instant.svc.cluster.local:8080
+	jwtSecret string            // shared with the api side under WORKER_INTERNAL_JWT_SECRET
 }
 
 // NewPaymentGraceTerminatorWorker constructs the worker. apiBase and
@@ -105,6 +114,7 @@ func NewPaymentGraceTerminatorWorker(db *sql.DB, apiBase, jwtSecret string, http
 	return &PaymentGraceTerminatorWorker{
 		db:        db,
 		httpCli:   httpCli,
+		apiCli:    apiclient.New(httpCli),
 		apiBase:   strings.TrimRight(apiBase, "/"),
 		jwtSecret: jwtSecret,
 	}
@@ -255,8 +265,27 @@ func (w *PaymentGraceTerminatorWorker) terminate(ctx context.Context, teamID uui
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "instanode-worker/grace-terminator")
 
-	resp, doErr := w.httpCli.Do(req)
+	// Use the breaker-wrapped client. When the api is hosed and the
+	// breaker is open, this returns circuit.ErrOpen immediately —
+	// the caller's "log and continue" branch (next periodic tick will
+	// re-process the row) takes over instead of burning the request
+	// timeout per candidate.
+	cli := w.apiCli
+	if cli == nil {
+		// Belt-and-braces: tests that construct the worker as a
+		// literal struct (no constructor) still get raw http.Do.
+		cli = apiclient.New(w.httpCli)
+		w.apiCli = cli
+	}
+	resp, doErr := cli.Do(req)
 	if doErr != nil {
+		if errors.Is(doErr, circuit.ErrOpen) {
+			slog.Warn("payment_grace_terminator.api_circuit_open",
+				"team_id", teamID,
+				"note", "leaving row 'active'; next tick will retry",
+			)
+			return doErr
+		}
 		return fmt.Errorf("api request: %w", doErr)
 	}
 	defer resp.Body.Close()
