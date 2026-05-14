@@ -5,11 +5,27 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
+	"strconv"
 	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
+
+// envInt reads a positive integer from an env var, falling back to def.
+// Bad values fall back too — worker must not refuse to start on a typo.
+func envInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
 
 // ErrDBConnect is returned when the Postgres connection cannot be established.
 type ErrDBConnect struct {
@@ -41,8 +57,10 @@ func ConnectPostgres(databaseURL string) *sql.DB {
 		panic(&ErrDBConnect{Cause: err})
 	}
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	maxOpen := envInt("WORKER_PG_MAX_OPEN_CONNS", 10)
+	maxIdle := envInt("WORKER_PG_MAX_IDLE_CONNS", 5)
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	db.SetConnMaxIdleTime(2 * time.Minute)
 
@@ -54,8 +72,8 @@ func ConnectPostgres(databaseURL string) *sql.DB {
 	}
 
 	slog.Info("worker.db.postgres.connected",
-		"max_open_conns", 10,
-		"max_idle_conns", 5,
+		"max_open_conns", maxOpen,
+		"max_idle_conns", maxIdle,
 	)
 	return db
 }
