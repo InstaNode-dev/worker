@@ -11,18 +11,31 @@ package jobs
 //   - last_reminder_at IS NULL OR last_reminder_at < now() - 2h  (cooldown)
 //
 // For each candidate, CAS-advance reminders_sent (so two ticks don't fire
-// the same reminder twice), then dispatch an email AND write a
-// deploy.expiring_soon audit_log row. The CAS happens BEFORE the email
-// send for the same reason as ExpiryReminderWorker — we accept "never send"
-// over "send twice", because the dashboard expiry banner is the
-// authoritative warning surface.
+// the same reminder twice), then write a deploy.expiring_soon audit_log
+// row carrying every param the email template needs. The BrevoForwarder
+// (event_email_forwarder.go) picks up that audit row on its next 60s tick
+// and POSTs to Brevo. The CAS happens BEFORE the audit insert for the
+// same reason as ExpiryReminderWorker — we accept "never send" over
+// "send twice".
+//
+// Email-send migration (2026-05-14, FIX-I/J→Brevo migration):
+//   - PREVIOUSLY: this worker called EmailClient.SendDeployExpiring
+//     directly. In production RESEND_API_KEY was unset, so all sends went
+//     to NoopClient and customers never got reminders.
+//   - NOW: the audit_log row IS the trigger. event_email_forwarder.go
+//     joins users + audit_log, calls eventEmailBuilders[kind] to build
+//     params, and POSTs to Brevo using BREVO_TEMPLATE_IDS[kind].
+//   - The metadata MUST carry every field the email body needs
+//     (deploy_url, make_permanent_url, app_id) — see emitDeployExpiringSoonAudit
+//     below.
 //
 // Cadence in practice: a deploy that lands at T0 with auto_24h TTL fires
 // reminders at T+12h, T+14h, T+16h, T+18h, T+20h, T+22h — six emails over
 // the final 12h.
 //
 // Audit kind: deploy.expiring_soon. Metadata: {deploy_id, team_id,
-// reminder_index, hours_remaining, expires_at}.
+// reminder_index, hours_remaining, expires_at, app_id, deploy_url,
+// make_permanent_url}.
 
 import (
 	"context"
@@ -46,19 +59,13 @@ type DeploymentReminderArgs struct{}
 // Kind is the River job kind.
 func (DeploymentReminderArgs) Kind() string { return "deployment_reminder" }
 
-// DeployReminderEmailer is the minimum email surface needed for the
-// reminder worker. Extracted as an interface so tests can supply a fake.
-type DeployReminderEmailer interface {
-	SendDeployExpiring(ctx context.Context, to, deployName, deployURL string, hoursRemaining int, makePermanentURL string) error
-}
-
 // DeploymentReminderWorker scans for deployments approaching their TTL
-// and dispatches reminder emails + audit rows. Idempotent across ticks
-// via the CAS guard on (reminders_sent, last_reminder_at).
+// and writes deploy.expiring_soon audit_log rows. Idempotent across ticks
+// via the CAS guard on (reminders_sent, last_reminder_at). The actual
+// email dispatch is handled by event_email_forwarder.go (BrevoForwarder).
 type DeploymentReminderWorker struct {
 	river.WorkerDefaults[DeploymentReminderArgs]
-	db    *sql.DB
-	email DeployReminderEmailer
+	db *sql.DB
 
 	// lookahead is the warning window (default 12h).
 	lookahead time.Duration
@@ -67,13 +74,15 @@ type DeploymentReminderWorker struct {
 	cooldown time.Duration
 }
 
-// NewDeploymentReminderWorker constructs the worker. Pass nil email to
-// run in dev (the row will still be CAS-advanced so subsequent ticks don't
-// re-attempt).
-func NewDeploymentReminderWorker(db *sql.DB, email DeployReminderEmailer) *DeploymentReminderWorker {
+// NewDeploymentReminderWorker constructs the worker. The email argument
+// is accepted (and ignored) to preserve the existing call site signature
+// in workers.go while the Resend→Brevo migration ships; emails are now
+// dispatched by event_email_forwarder.go off the audit_log row this worker
+// writes. The parameter will be removed in a follow-up once all callers
+// are updated.
+func NewDeploymentReminderWorker(db *sql.DB, _ any) *DeploymentReminderWorker {
 	return &DeploymentReminderWorker{
 		db:        db,
-		email:     email,
 		lookahead: 12 * time.Hour,
 		cooldown:  2 * time.Hour,
 	}
@@ -165,8 +174,7 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 	for _, r := range candidates {
 		// CAS-advance reminders_sent + last_reminder_at. If another tick
 		// already advanced the row, this returns rowsAffected=0 and we
-		// short-circuit before sending the email — eliminates the
-		// duplicate-send race.
+		// short-circuit — eliminates the duplicate-fire race.
 		advanced, casErr := advanceReminderCAS(ctx, w.db, r.id, r.remindersSent, w.cooldown)
 		if casErr != nil {
 			slog.Warn("jobs.deployment_reminder.cas_failed",
@@ -187,48 +195,30 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 			hoursRemaining = 1
 		}
 
-		// Audit emit BEFORE the email send. Even if the email send fails,
-		// the audit row records that the worker entered the dispatch path
-		// — useful for debugging "did we even try to email this user?".
-		emitDeployExpiringSoonAudit(w.db, r, hoursRemaining)
-
-		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
-			slog.Warn("jobs.deployment_reminder.no_owner_email",
-				"deploy_id", r.id, "team_id", r.teamID,
-				"note", "row CAS-advanced; subsequent ticks will skip it")
-			skipped++
-			continue
-		}
-
-		if w.email == nil {
-			// Dev mode (no email backend wired). CAS already advanced;
-			// treat as a successful skip.
-			slog.Info("jobs.deployment_reminder.email_disabled",
-				"deploy_id", r.id, "to", r.ownerEmail.String)
-			skipped++
-			continue
-		}
-
+		// Audit emit — the BrevoForwarder picks this up on its next tick
+		// and POSTs to Brevo using BREVO_TEMPLATE_IDS["deploy.expiring_soon"].
+		// The metadata MUST carry every field the email template needs
+		// (deploy_url, make_permanent_url, app_id, hours_remaining).
 		deployURL := r.appURL.String
 		if deployURL == "" {
 			deployURL = "https://" + r.appID + ".deployment.instanode.dev"
 		}
 		makePermanentURL := "https://api.instanode.dev/api/v1/deployments/" + r.id + "/make-permanent"
-		if sendErr := w.email.SendDeployExpiring(ctx,
-			r.ownerEmail.String, r.appID, deployURL,
-			hoursRemaining, makePermanentURL,
-		); sendErr != nil {
-			slog.Error("jobs.deployment_reminder.send_failed",
-				"deploy_id", r.id, "to", r.ownerEmail.String, "error", sendErr,
-				"note", "CAS already advanced; will not retry this row this cycle")
-			skipped++
-			continue
+		emitDeployExpiringSoonAudit(w.db, r, hoursRemaining, deployURL, makePermanentURL)
+
+		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
+			// The forwarder's LEFT JOIN users will resolve a recipient at
+			// dispatch time — we don't block the audit on it here.
+			slog.Info("jobs.deployment_reminder.audited_no_owner",
+				"deploy_id", r.id, "team_id", r.teamID,
+				"note", "forwarder will resolve recipient at dispatch")
 		}
 
-		slog.Info("jobs.deployment_reminder.sent",
-			"deploy_id", r.id, "to", r.ownerEmail.String,
+		slog.Info("jobs.deployment_reminder.audited",
+			"deploy_id", r.id,
 			"hours_remaining", hoursRemaining,
 			"reminder_index", r.remindersSent+1,
+			"note", "audit_log row written; BrevoForwarder will dispatch the email",
 		)
 		metrics.DeployRemindersSentTotal.Inc()
 		sent++
@@ -308,32 +298,49 @@ func advanceReminderCAS(ctx context.Context, db *sql.DB, deployIDStr string, exp
 }
 
 // emitDeployExpiringSoonAudit writes one row to audit_log for a reminder.
-// Best-effort, fire-and-forget — errors are logged but never bubble up.
 // Mirrors the api's emitDeployAudit pattern.
-func emitDeployExpiringSoonAudit(db *sql.DB, r deployReminderRow, hoursRemaining int) {
+//
+// Migration note (2026-05-14, FIX-I/J→Brevo): this audit row IS the
+// trigger for the customer email — the BrevoForwarder (see
+// event_email_forwarder.go) drains audit_log every 60s, joins users to
+// resolve the recipient, calls buildDeployExpiringSoon to build params,
+// and POSTs to Brevo using BREVO_TEMPLATE_IDS["deploy.expiring_soon"].
+// The metadata fields below MUST stay in sync with buildDeployExpiringSoon
+// in event_email_mapping.go.
+//
+// IMPORTANT: this function is now SYNCHRONOUS (was previously goroutine'd).
+// The reason: the CAS guard in advanceReminderCAS only protects against
+// duplicate sends, NOT against "CAS succeeded but audit insert never
+// happened" — and dropping the audit means dropping the email. Running
+// the insert synchronously means a transient DB blip surfaces as a logged
+// WARN; the CAS still holds, so the row won't be re-tried this cycle.
+// The acceptable failure mode is "one missed reminder" not "no reminder
+// for this run".
+func emitDeployExpiringSoonAudit(db *sql.DB, r deployReminderRow, hoursRemaining int, deployURL, makePermanentURL string) {
 	meta, _ := json.Marshal(map[string]any{
-		"deploy_id":       r.id,
-		"team_id":         r.teamID,
-		"reminder_index":  r.remindersSent + 1,
-		"hours_remaining": hoursRemaining,
-		"expires_at":      r.expiresAt.UTC().Format(time.RFC3339),
+		"deploy_id":          r.id,
+		"team_id":            r.teamID,
+		"app_id":             r.appID,
+		"reminder_index":     r.remindersSent + 1,
+		"hours_remaining":    hoursRemaining,
+		"expires_at":         r.expiresAt.UTC().Format(time.RFC3339),
+		"deploy_url":         deployURL,
+		"make_permanent_url": makePermanentURL,
 	})
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		teamUUID, parseErr := uuid.Parse(r.teamID)
-		if parseErr != nil {
-			slog.Warn("jobs.deployment_reminder.audit.bad_team_id",
-				"team_id", r.teamID, "error", parseErr)
-			return
-		}
-		_, err := db.ExecContext(ctx, `
-			INSERT INTO audit_log (team_id, kind, actor, resource_type, summary, metadata)
-			VALUES ($1, 'deploy.expiring_soon', 'system', 'deploy', $2, $3)
-		`, teamUUID, "deploy "+r.appID+" expiring soon", meta)
-		if err != nil {
-			slog.Warn("jobs.deployment_reminder.audit.insert_failed",
-				"deploy_id", r.id, "error", err)
-		}
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	teamUUID, parseErr := uuid.Parse(r.teamID)
+	if parseErr != nil {
+		slog.Warn("jobs.deployment_reminder.audit.bad_team_id",
+			"team_id", r.teamID, "error", parseErr)
+		return
+	}
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO audit_log (team_id, kind, actor, resource_type, summary, metadata)
+		VALUES ($1, 'deploy.expiring_soon', 'system', 'deploy', $2, $3)
+	`, teamUUID, "deploy "+r.appID+" expiring soon", meta)
+	if err != nil {
+		slog.Warn("jobs.deployment_reminder.audit.insert_failed",
+			"deploy_id", r.id, "error", err)
+	}
 }

@@ -138,3 +138,122 @@ func TestEventEmail_BuildResourceExpiringIncludesResourceType(t *testing.T) {
 		t.Errorf("hours_remaining = %q; want \"4\"", params["hours_remaining"])
 	}
 }
+
+// TestEventEmail_FixIJKindsRegistered pins the 2026-05-14 Resend→Brevo
+// migration: every FIX-I/J deploy + deletion kind that's expected to fire
+// via the BrevoForwarder MUST be in supportedAuditKinds, MUST have a
+// builder, and MUST extract the kind-specific params the Brevo template
+// body references.
+//
+// Note: deploy.deletion_requested is deliberately NOT in this list — the
+// api sends that email synchronously (the user is waiting on the HTTP
+// response). Registering it would duplicate the send.
+//
+// FAILS on master (kinds weren't in the slice). PASSES post-migration.
+func TestEventEmail_FixIJKindsRegistered(t *testing.T) {
+	expected := []string{
+		auditKindDeployExpiringSoon,
+		auditKindDeployExpired,
+		auditKindDeployMadePermanent,
+		auditKindDeployDeletionConfirmed,
+		auditKindDeployDeletionCancelled,
+		auditKindDeployDeletionExpired,
+	}
+	supportedSet := map[string]bool{}
+	for _, k := range supportedAuditKinds {
+		supportedSet[k] = true
+	}
+	for _, k := range expected {
+		if !supportedSet[k] {
+			t.Errorf("FIX-I/J migration: %q missing from supportedAuditKinds — BrevoForwarder will never pick up the audit row", k)
+		}
+		if _, ok := eventEmailBuilders[k]; !ok {
+			t.Errorf("FIX-I/J migration: %q has no eventEmailBuilders entry — forwarder will hit no_builder_for_kind and skip the row", k)
+		}
+	}
+
+	// And the inverse: _requested must NOT be wired up here — that would
+	// duplicate the api's synchronous send.
+	if _, ok := eventEmailBuilders[auditKindDeployDeletionRequested]; ok {
+		t.Errorf("deploy.deletion_requested MUST NOT have an eventEmailBuilder — the api sends this email synchronously; registering it here would duplicate the send")
+	}
+	for _, k := range supportedAuditKinds {
+		if k == auditKindDeployDeletionRequested {
+			t.Errorf("deploy.deletion_requested MUST NOT be in supportedAuditKinds — the api sends this email synchronously; the audit row is observability only")
+		}
+	}
+}
+
+// TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields verifies
+// the audit metadata flows the fields the Brevo email template's
+// substitution variables expect: deploy_name (app_id), deploy_url,
+// make_permanent_url, hours_remaining, reminder_index. A missing
+// deploy_url renders an empty link in the email body — broken UX even
+// though the send technically succeeded.
+func TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields(t *testing.T) {
+	row := auditRow{
+		ID:         "x",
+		TeamID:     "t",
+		Kind:       auditKindDeployExpiringSoon,
+		OwnerEmail: "u@example.com",
+		Metadata: []byte(`{
+			"deploy_id":"deploy-1",
+			"app_id":"myapp",
+			"deploy_url":"https://myapp.deployment.instanode.dev",
+			"make_permanent_url":"https://api.instanode.dev/api/v1/deployments/deploy-1/make-permanent",
+			"hours_remaining":4,
+			"expires_at":"2026-05-14T12:00:00Z",
+			"reminder_index":3
+		}`),
+	}
+	params, ok := buildDeployExpiringSoon(row)
+	if !ok {
+		t.Fatal("builder returned ok=false unexpectedly")
+	}
+	if params["deploy_name"] != "myapp" {
+		t.Errorf("deploy_name = %q; want myapp (template body references {{ params.deploy_name }})", params["deploy_name"])
+	}
+	if params["deploy_url"] != "https://myapp.deployment.instanode.dev" {
+		t.Errorf("deploy_url = %q; want full https URL", params["deploy_url"])
+	}
+	if params["make_permanent_url"] != "https://api.instanode.dev/api/v1/deployments/deploy-1/make-permanent" {
+		t.Errorf("make_permanent_url = %q; want make-permanent endpoint", params["make_permanent_url"])
+	}
+	if params["hours_remaining"] != "4" {
+		t.Errorf("hours_remaining = %q; want \"4\"", params["hours_remaining"])
+	}
+	if params["reminder_index"] != "3" {
+		t.Errorf("reminder_index = %q; want \"3\"", params["reminder_index"])
+	}
+}
+
+// TestEventEmail_BuildDeployDeletionConfirmedFlowsContext — the
+// "deletion confirmed" email body references resource_id, pending_deletion_id,
+// and freed_at. Pin the builder reads them out of the metadata correctly.
+func TestEventEmail_BuildDeployDeletionConfirmedFlowsContext(t *testing.T) {
+	row := auditRow{
+		ID:         "x",
+		TeamID:     "t",
+		Kind:       auditKindDeployDeletionConfirmed,
+		OwnerEmail: "u@example.com",
+		Metadata: []byte(`{
+			"resource_id":"deploy-2",
+			"pending_deletion_id":"pd-1",
+			"freed_at":"2026-05-14T13:00:00Z",
+			"age_seconds_in_pending":120
+		}`),
+	}
+	params, ok := buildDeployDeletionConfirmed(row)
+	if !ok {
+		t.Fatal("builder returned ok=false unexpectedly")
+	}
+	if params["resource_id"] != "deploy-2" {
+		t.Errorf("resource_id = %q; want deploy-2", params["resource_id"])
+	}
+	if params["pending_deletion_id"] != "pd-1" {
+		t.Errorf("pending_deletion_id = %q; want pd-1", params["pending_deletion_id"])
+	}
+	if params["freed_at"] != "2026-05-14T13:00:00Z" {
+		t.Errorf("freed_at = %q; want \"2026-05-14T13:00:00Z\"", params["freed_at"])
+	}
+}
