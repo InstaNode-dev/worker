@@ -48,4 +48,33 @@ var (
 		Name: "instant_resource_degraded_count",
 		Help: "Active resources currently flagged degraded=true (sampled per heartbeat run)",
 	}, []string{"resource_type"})
+
+	// Deploy TTL metrics (Wave FIX-J). Labelled by ttl_policy so the NR
+	// dashboard can compare auto_24h vs permanent populations.
+	DeployTTLStateGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_deploy_ttl_state",
+		Help: "Active deployments by ttl_policy (auto_24h | permanent | custom). Sampled per reminder tick.",
+	}, []string{"policy"})
+
+	// DeployExpiringSoonTotal counts deployments observed in the reminder
+	// window during each tick — sum across ticks so an operator can
+	// confirm "yes, the reminder loop is alive."
+	DeployExpiringSoonTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_deploy_expiring_soon_total",
+		Help: "Total deployments seen in the 12h reminder window across reminder ticks (cumulative).",
+	})
+
+	// DeployExpiredTotal counts rows soft-deleted by the deployment_expirer
+	// job (one increment per row that crosses to status='expired').
+	DeployExpiredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_deploy_expired_total",
+		Help: "Deployments soft-deleted (status='expired') by the expirer worker.",
+	})
+
+	// DeployRemindersSentTotal counts reminder emails actually dispatched
+	// to a real owner email (post-CAS, post-email-send).
+	DeployRemindersSentTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_deploy_reminders_sent_total",
+		Help: "Deploy expiry reminder emails dispatched successfully.",
+	})
 )

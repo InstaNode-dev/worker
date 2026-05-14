@@ -305,6 +305,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// only — no api round-trip, so no JWT-signing needed. See
 	// pending_deletion_expirer.go.
 	river.AddWorker(workers, WithObservability(NewPendingDeletionExpirerWorker(db), nrApp))
+	// Deploy TTL reminder (Wave FIX-J) — every 60s, scan deployments whose
+	// expires_at falls within the next 12h and CAS-advance the
+	// reminders_sent counter to fire the next 2h-spaced reminder. Six
+	// reminders total. Idempotent across ticks via the CAS guard. Email
+	// dispatch best-effort — see deployment_reminder.go.
+	river.AddWorker(workers, WithObservability(NewDeploymentReminderWorker(db, emailClient), nrApp))
+	// Deploy TTL expirer (Wave FIX-J) — every 60s, scan deployments whose
+	// expires_at has passed and soft-delete (status='expired'). Sends a
+	// one-shot "your deploy expired" email. See deployment_expirer.go.
+	river.AddWorker(workers, WithObservability(NewDeploymentExpirerWorker(db, emailClient), nrApp))
 	// Customer-backup pipeline — three workers, two cron schedules.
 	//
 	//   scheduler (every hour)  — inserts pending resource_backups rows for
@@ -567,6 +577,29 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 				return EventEmailForwarderArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Deploy TTL reminder (Wave FIX-J) — every 60s. RunOnStart=false:
+		// the 2h cooldown CAS guarantees a worker restart can't fire
+		// spurious reminders, so there's no urgency to scan immediately
+		// after boot. The next scheduled tick within 60s catches us up.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(60*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeploymentReminderArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Deploy TTL expirer (Wave FIX-J) — every 60s. RunOnStart=true so
+		// a worker restart immediately picks up deploys that crossed their
+		// expires_at while the worker was down. The guarded UPDATE
+		// (status NOT IN ('deleted','expired')) prevents re-processing
+		// already-expired rows.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(60*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeploymentExpirerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 		// Churn predictor — runs daily at 03:00 UTC. The 30-day dedupe
 		// guarantees at most one churn.risk_flagged row per team per
