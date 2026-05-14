@@ -124,8 +124,15 @@ var supportedAuditKinds = []string{
 	auditKindDeployExpired,
 	auditKindDeployMadePermanent,
 	// Wave FIX-I email-confirmed deletion lifecycle (migrated from inline
-	// api Resend send → audit-driven Brevo 2026-05-14):
-	auditKindDeployDeletionRequested,
+	// api Resend send → audit-driven Brevo 2026-05-14).
+	//
+	// NOTE: deploy.deletion_requested is INTENTIONALLY omitted. The api
+	// (deletion_confirm.go:200) sends the "click to confirm" email
+	// synchronously via its own Brevo-routed Client because the user is
+	// waiting on the HTTP response (we need to roll back the pending row
+	// if the send fails). Registering _requested here would dispatch a
+	// duplicate. The audit row IS written by the api as observability,
+	// just not as an email trigger.
 	auditKindDeployDeletionConfirmed,
 	auditKindDeployDeletionCancelled,
 	auditKindDeployDeletionExpired,
@@ -160,7 +167,8 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	auditKindDeployExpired:       buildDeployExpired,
 	auditKindDeployMadePermanent: buildDeployMadePermanent,
 	// Wave FIX-I email-confirmed deletion (migrated 2026-05-14).
-	auditKindDeployDeletionRequested: buildDeployDeletionRequested,
+	// _requested intentionally absent — sent synchronously by the api;
+	// see supportedAuditKinds comment.
 	auditKindDeployDeletionConfirmed: buildDeployDeletionConfirmed,
 	auditKindDeployDeletionCancelled: buildDeployDeletionCancelled,
 	auditKindDeployDeletionExpired:   buildDeployDeletionExpired,
@@ -417,23 +425,13 @@ func buildDeployMadePermanent(row auditRow) (map[string]string, bool) {
 // Metadata shapes (set by api/internal/handlers/deletion_confirm.go and
 // worker/internal/jobs/pending_deletion_expirer.go):
 //
-//   deploy.deletion_requested — {team_id, resource_id, pending_deletion_id, expires_at, email_sent_to, resource_label}
 //   deploy.deletion_confirmed — {team_id, resource_id, pending_deletion_id, freed_at, age_seconds_in_pending}
 //   deploy.deletion_cancelled — {team_id, resource_id, pending_deletion_id}
 //   deploy.deletion_expired   — {team_id, resource_id, pending_deletion_id, age_seconds}
-
-func buildDeployDeletionRequested(row auditRow) (map[string]string, bool) {
-	if !requireEmail(row) {
-		return nil, false
-	}
-	meta := decodeMeta(row.Metadata)
-	params := baseParams(row)
-	copyMetaStr(params, meta, "resource_id", "resource_id")
-	copyMetaStr(params, meta, "resource_label", "resource_label")
-	copyMetaStr(params, meta, "pending_deletion_id", "pending_deletion_id")
-	copyMetaStr(params, meta, "expires_at", "expires_at")
-	return params, true
-}
+//
+// deploy.deletion_requested is sent SYNCHRONOUSLY by the api (the user is
+// waiting on the HTTP response) so it does not have an event-driven
+// builder — see supportedAuditKinds for the duplicate-suppression note.
 
 func buildDeployDeletionConfirmed(row auditRow) (map[string]string, bool) {
 	if !requireEmail(row) {

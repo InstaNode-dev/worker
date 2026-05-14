@@ -140,9 +140,14 @@ func TestEventEmail_BuildResourceExpiringIncludesResourceType(t *testing.T) {
 }
 
 // TestEventEmail_FixIJKindsRegistered pins the 2026-05-14 Resend→Brevo
-// migration: every FIX-I/J deploy + deletion kind MUST be in
-// supportedAuditKinds, MUST have a builder, and MUST extract the
-// kind-specific params the Brevo template body references.
+// migration: every FIX-I/J deploy + deletion kind that's expected to fire
+// via the BrevoForwarder MUST be in supportedAuditKinds, MUST have a
+// builder, and MUST extract the kind-specific params the Brevo template
+// body references.
+//
+// Note: deploy.deletion_requested is deliberately NOT in this list — the
+// api sends that email synchronously (the user is waiting on the HTTP
+// response). Registering it would duplicate the send.
 //
 // FAILS on master (kinds weren't in the slice). PASSES post-migration.
 func TestEventEmail_FixIJKindsRegistered(t *testing.T) {
@@ -150,7 +155,6 @@ func TestEventEmail_FixIJKindsRegistered(t *testing.T) {
 		auditKindDeployExpiringSoon,
 		auditKindDeployExpired,
 		auditKindDeployMadePermanent,
-		auditKindDeployDeletionRequested,
 		auditKindDeployDeletionConfirmed,
 		auditKindDeployDeletionCancelled,
 		auditKindDeployDeletionExpired,
@@ -165,6 +169,17 @@ func TestEventEmail_FixIJKindsRegistered(t *testing.T) {
 		}
 		if _, ok := eventEmailBuilders[k]; !ok {
 			t.Errorf("FIX-I/J migration: %q has no eventEmailBuilders entry — forwarder will hit no_builder_for_kind and skip the row", k)
+		}
+	}
+
+	// And the inverse: _requested must NOT be wired up here — that would
+	// duplicate the api's synchronous send.
+	if _, ok := eventEmailBuilders[auditKindDeployDeletionRequested]; ok {
+		t.Errorf("deploy.deletion_requested MUST NOT have an eventEmailBuilder — the api sends this email synchronously; registering it here would duplicate the send")
+	}
+	for _, k := range supportedAuditKinds {
+		if k == auditKindDeployDeletionRequested {
+			t.Errorf("deploy.deletion_requested MUST NOT be in supportedAuditKinds — the api sends this email synchronously; the audit row is observability only")
 		}
 	}
 }
@@ -212,35 +227,33 @@ func TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields(t *testing.
 	}
 }
 
-// TestEventEmail_BuildDeployDeletionRequestedFlowsResourceLabel — the
-// deletion email body says "Confirm deletion of <resource_label>".
-// resource_label is the human-readable name set by deletion_confirm.go
-// ("deployment my-app" / "stack my-stack"); a missing one renders an
-// empty subject line.
-func TestEventEmail_BuildDeployDeletionRequestedFlowsResourceLabel(t *testing.T) {
+// TestEventEmail_BuildDeployDeletionConfirmedFlowsContext — the
+// "deletion confirmed" email body references resource_id, pending_deletion_id,
+// and freed_at. Pin the builder reads them out of the metadata correctly.
+func TestEventEmail_BuildDeployDeletionConfirmedFlowsContext(t *testing.T) {
 	row := auditRow{
 		ID:         "x",
 		TeamID:     "t",
-		Kind:       auditKindDeployDeletionRequested,
+		Kind:       auditKindDeployDeletionConfirmed,
 		OwnerEmail: "u@example.com",
 		Metadata: []byte(`{
 			"resource_id":"deploy-2",
-			"resource_label":"deployment my-app",
 			"pending_deletion_id":"pd-1",
-			"expires_at":"2026-05-14T13:00:00Z"
+			"freed_at":"2026-05-14T13:00:00Z",
+			"age_seconds_in_pending":120
 		}`),
 	}
-	params, ok := buildDeployDeletionRequested(row)
+	params, ok := buildDeployDeletionConfirmed(row)
 	if !ok {
 		t.Fatal("builder returned ok=false unexpectedly")
-	}
-	if params["resource_label"] != "deployment my-app" {
-		t.Errorf("resource_label = %q; want \"deployment my-app\" (email subject line uses this)", params["resource_label"])
 	}
 	if params["resource_id"] != "deploy-2" {
 		t.Errorf("resource_id = %q; want deploy-2", params["resource_id"])
 	}
 	if params["pending_deletion_id"] != "pd-1" {
 		t.Errorf("pending_deletion_id = %q; want pd-1", params["pending_deletion_id"])
+	}
+	if params["freed_at"] != "2026-05-14T13:00:00Z" {
+		t.Errorf("freed_at = %q; want \"2026-05-14T13:00:00Z\"", params["freed_at"])
 	}
 }
