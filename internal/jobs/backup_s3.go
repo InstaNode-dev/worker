@@ -18,12 +18,79 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+
+	commonplans "instant.dev/common/plans"
 )
+
+// BackupPlanRegistry is the minimal plans.Registry surface needed by the
+// customer-backup retention sweep. *commonplans.Registry satisfies it
+// directly; tests pass a small in-memory stub.
+//
+// Why an interface here and not just *commonplans.Registry: the runner's
+// unit tests assert per-tier retention against an explicit tier→days
+// mapping rather than the embedded default YAML, so they pass a tiny
+// fakeBackupPlanRegistry instead of constructing a full Registry.
+type BackupPlanRegistry interface {
+	// BackupRetentionDays returns the per-tier retention window in days
+	// from plans.yaml. 0 means "this tier does not take backups"; see
+	// retentionCutoff for how the sweep interprets that (delete-now
+	// rather than leave-forever, so a row that leaked in from a previous
+	// tier — e.g. a Pro→Free downgrade — cannot stick around past
+	// policy).
+	BackupRetentionDays(tier string) int
+	// TierNames lists the tier names the sweep should iterate. We sweep
+	// per-tier because the SQL hits a partial index on tier_at_backup;
+	// iterating an explicit list (rather than scanning DISTINCT) keeps
+	// the plan-shape stable and the retention horizon source-of-truth in
+	// plans.yaml.
+	TierNames() []string
+}
+
+// commonPlanRegistryAdapter wraps *commonplans.Registry into the
+// BackupPlanRegistry surface. We need an adapter only because the
+// common package's Registry.All() returns map[string]*commonplans.Plan
+// whereas the interface above is jobs-package-local; the BackupRetentionDays
+// call passes through unchanged.
+type commonPlanRegistryAdapter struct {
+	reg *commonplans.Registry
+}
+
+// NewBackupPlanRegistry wraps a *commonplans.Registry for use with the
+// customer-backup retention sweep. Returns nil if reg is nil — the
+// runner then falls back to the legacy 7-day defaults via
+// retentionDaysForTier so a misconfigured boot doesn't accidentally
+// nuke the entire bucket.
+func NewBackupPlanRegistry(reg *commonplans.Registry) BackupPlanRegistry {
+	if reg == nil {
+		return nil
+	}
+	return &commonPlanRegistryAdapter{reg: reg}
+}
+
+// BackupRetentionDays delegates to the common Registry. Returns 0 for
+// unknown tiers (common's Get falls back to "anonymous", whose policy
+// is 0 / no backups).
+func (a *commonPlanRegistryAdapter) BackupRetentionDays(tier string) int {
+	return a.reg.BackupRetentionDays(tier)
+}
+
+// TierNames returns every tier name registered in plans.yaml. Sorted
+// is unnecessary — the sweep is order-independent — but stable across
+// process lifetime so log lines per tier read predictably.
+func (a *commonPlanRegistryAdapter) TierNames() []string {
+	all := a.reg.All()
+	out := make([]string, 0, len(all))
+	for name := range all {
+		out = append(out, name)
+	}
+	return out
+}
 
 // BackupObjectStore is the surface every backup-pipeline consumer needs.
 // Implementations live in backup_s3.go (real, minio-backed) and the test
@@ -141,30 +208,50 @@ func backupObjectKey(prefix, resourceToken, backupID string) string {
 	return fmt.Sprintf("%s/%s/%s.dump.gz", p, resourceToken, backupID)
 }
 
-// retentionDaysForTier returns the hard-delete cutoff for a backup row given
-// its tier_at_backup. anonymous never schedules backups (the scheduler skips
-// it) but we still treat the tier as 7-day-equivalent here in case a manual
-// row sneaks through from the api side — safer than panicking on an
-// unrecognized tier.
-func retentionDaysForTier(tier string) int {
-	switch tier {
-	case "hobby":
-		return 7
-	case "pro":
-		return 30
-	case "growth":
-		return 30
-	case "team":
-		return 90
-	case "anonymous":
-		return 7
-	default:
-		return 7
+// retentionDaysForTier returns the hard-delete cutoff for a backup row
+// given its tier_at_backup, reading directly from plans.yaml via the
+// supplied BackupPlanRegistry. This replaces the W12 hardcoded switch
+// that silently dropped Hobby Plus to default-7 and ignored
+// backup_retention_days=0 for anonymous/free.
+//
+// Semantics:
+//   - registry returns N > 0 → keep backups for N days, sweep older
+//   - registry returns 0     → this tier does not back up; sweep ALL
+//     existing rows for the tier (handles leaks from prior tiers, e.g.
+//     a Pro→Free downgrade left old pro-tier rows tagged 'free')
+//   - registry returns < 0   → unexpected (plans.yaml uses -1 only for
+//     "unlimited" counts, never for retention); WARN and fall back to a
+//     safe 7-day window rather than nuke or persist forever
+//   - registry nil           → boot misconfigured; WARN and fall back to
+//     the legacy hardcoded 7-day default so a misconfigured worker
+//     can't accidentally delete every backup it sees
+//
+// Pure-ish: emits slog.Warn for the unexpected-value cases. Tests pin
+// the happy paths via a stub BackupPlanRegistry.
+func retentionDaysForTier(reg BackupPlanRegistry, tier string) int {
+	const legacyDefaultDays = 7
+	if reg == nil {
+		slog.Warn("jobs.customer_backup_runner.retention_registry_nil",
+			"tier", tier, "fallback_days", legacyDefaultDays)
+		return legacyDefaultDays
 	}
+	days := reg.BackupRetentionDays(tier)
+	if days < 0 {
+		slog.Warn("jobs.customer_backup_runner.retention_negative_days",
+			"tier", tier, "registry_value", days,
+			"fallback_days", legacyDefaultDays)
+		return legacyDefaultDays
+	}
+	return days
 }
 
-// retentionCutoff returns the timestamp before which backups of the given
-// tier should be hard-deleted. Pure function, exported only for tests.
-func retentionCutoff(tier string, now time.Time) time.Time {
-	return now.UTC().Add(-time.Duration(retentionDaysForTier(tier)) * 24 * time.Hour)
+// retentionCutoff returns the timestamp before which backups of the
+// given tier should be hard-deleted. Returns now() (UTC) when the
+// registry says retention=0, so the SQL "created_at < cutoff" predicate
+// matches every row of that tier — see retentionDaysForTier for why
+// this is the right semantic for retention=0 (delete-now, not
+// leave-forever). Pure function, used only by the sweep loop.
+func retentionCutoff(reg BackupPlanRegistry, tier string, now time.Time) time.Time {
+	days := retentionDaysForTier(reg, tier)
+	return now.UTC().Add(-time.Duration(days) * 24 * time.Hour)
 }

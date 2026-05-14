@@ -101,7 +101,12 @@ func main() {
 		slog.Info("worker.deploy_status_k8s_client_ready")
 	}
 
-	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, deployStatusK8s, nrApp)
+	// Build the BackupPlanRegistry adapter from the same *commonplans.Registry.
+	// CustomerBackupRunner reads tier→retention_days from plans.yaml via this
+	// adapter; passing nil falls back to a legacy 7-day default with a WARN.
+	backupPlans := jobs.NewBackupPlanRegistry(planRegistry)
+
+	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, backupPlans, deployStatusK8s, nrApp)
 	defer workers.Stop()
 
 	// Exit immediately if River failed to start so Kubernetes restarts the pod.

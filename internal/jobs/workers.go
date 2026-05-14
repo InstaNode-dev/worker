@@ -118,7 +118,15 @@ func (dailyAt2UTCSchedule) Next(t time.Time) time.Time {
 // namespaces. Pass nil when the worker can't reach a cluster — the
 // reconciler logs at WARN each run and other periodic jobs keep functioning.
 // See worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
-func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, deployStatusK8s deployStatusK8sProvider, nrApp *newrelic.Application) *Workers {
+// backupPlanRegistry is the BackupPlanRegistry surface used by
+// CustomerBackupRunner. main.go wraps its *commonplans.Registry via
+// NewBackupPlanRegistry; this lets StartWorkers stay free of a direct
+// import on instant.dev/common/plans (the narrow PlanRegistry interface
+// covers the existing quota workers' needs).
+//
+// Pass nil to fall back to the legacy hardcoded 7-day retention default
+// — retentionDaysForTier WARNs in that case.
+func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, backupPlans BackupPlanRegistry, deployStatusK8s deployStatusK8sProvider, nrApp *newrelic.Application) *Workers {
 	// rdb is used by LoopsEventForwarderWorker (cursor storage). Other
 	// workers access redis indirectly via the platform DB.
 
@@ -295,7 +303,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// doesn't block worker boot. See each worker's Work() top for the
 	// exact WARN line emitted.
 	river.AddWorker(workers, WithObservability(NewCustomerBackupSchedulerWorker(db), nrApp))
-	river.AddWorker(workers, WithObservability(NewCustomerBackupRunner(db, backupStore, cfg.BackupS3Bucket, cfg.BackupS3PathPrefix, cfg.AESKey), nrApp))
+	river.AddWorker(workers, WithObservability(NewCustomerBackupRunner(db, backupStore, cfg.BackupS3Bucket, cfg.BackupS3PathPrefix, cfg.AESKey, backupPlans), nrApp))
 	river.AddWorker(workers, WithObservability(NewCustomerRestoreRunner(db, backupStore, cfg.BackupS3Bucket, cfg.AESKey), nrApp))
 
 	// Platform-DB backup — nightly 02:00 UTC pg_dump of the platform DB to

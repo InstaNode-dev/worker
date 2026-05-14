@@ -119,22 +119,25 @@ func (realPgDumpRunner) Run(ctx context.Context, connURL string, w io.Writer) er
 // in production the constructor below requires both.
 type CustomerBackupRunnerWorker struct {
 	river.WorkerDefaults[CustomerBackupRunnerArgs]
-	db       *sql.DB
-	store    BackupObjectStore
-	pgDump   pgDumpRunner
-	bucket   string
-	prefix   string
-	aesKey   string // hex, decoded at use site via crypto.ParseAESKey
-	now      func() time.Time
-	timeout  time.Duration
-	batchN   int
+	db      *sql.DB
+	store   BackupObjectStore
+	pgDump  pgDumpRunner
+	bucket  string
+	prefix  string
+	aesKey  string // hex, decoded at use site via crypto.ParseAESKey
+	plans   BackupPlanRegistry
+	now     func() time.Time
+	timeout time.Duration
+	batchN  int
 }
 
 // NewCustomerBackupRunner constructs a runner with production defaults.
 // store may be nil — the worker then logs WARN and skips every batch
 // (fail-open). aesKey may be empty — same WARN-and-skip behavior, since we
-// refuse to dump from a plaintext connection_url.
-func NewCustomerBackupRunner(db *sql.DB, store BackupObjectStore, bucket, prefix, aesKey string) *CustomerBackupRunnerWorker {
+// refuse to dump from a plaintext connection_url. plans may be nil —
+// retentionDaysForTier then falls back to a hardcoded 7-day default and
+// logs a WARN; the sweep still runs but with a coarse policy.
+func NewCustomerBackupRunner(db *sql.DB, store BackupObjectStore, bucket, prefix, aesKey string, plans BackupPlanRegistry) *CustomerBackupRunnerWorker {
 	return &CustomerBackupRunnerWorker{
 		db:      db,
 		store:   store,
@@ -142,6 +145,7 @@ func NewCustomerBackupRunner(db *sql.DB, store BackupObjectStore, bucket, prefix
 		bucket:  bucket,
 		prefix:  prefix,
 		aesKey:  aesKey,
+		plans:   plans,
 		now:     time.Now,
 		timeout: backupPerRunTimeout,
 		batchN:  backupBatchSize,
@@ -486,9 +490,18 @@ func (w *CustomerBackupRunnerWorker) writeAudit(
 // can lazily exclude such rows from the list/restore endpoints.
 func (w *CustomerBackupRunnerWorker) runRetentionSweep(ctx context.Context) {
 	// We sweep tier-by-tier so each tier's WHERE clause hits the partial
-	// index efficiently. Three tiers x one query = cheap.
-	for _, tier := range []string{"hobby", "pro", "growth", "team", "anonymous"} {
-		cutoff := retentionCutoff(tier, w.now())
+	// index on tier_at_backup efficiently. The tier list comes from the
+	// plans.Registry (not a hardcoded slice) so newly-added tiers in
+	// plans.yaml — e.g. hobby_plus, hobby_plus_yearly, pro_yearly — get
+	// retention applied the moment the worker boots with the new
+	// embedded YAML. If the registry is nil (boot misconfigured) we
+	// fall back to the historical five tiers so the sweep still runs.
+	tiers := []string{"hobby", "pro", "growth", "team", "anonymous"}
+	if w.plans != nil {
+		tiers = w.plans.TierNames()
+	}
+	for _, tier := range tiers {
+		cutoff := retentionCutoff(w.plans, tier, w.now())
 		rows, err := w.db.QueryContext(ctx, `
 			SELECT id::text, s3_key
 			FROM resource_backups
