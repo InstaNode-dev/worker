@@ -3,20 +3,12 @@ package jobs
 // prober.go — common interface used by provisioner_reconciler and
 // resource_heartbeat to verify that a customer-facing resource is reachable.
 //
-// Why a separate seam:
-//
-//   The worker today has no AES_KEY in its environment, so it cannot decrypt
-//   the AES-256-GCM `connection_url` column on its own. The two paths
-//   forward are (a) plumb AES_KEY into the worker config and decrypt locally,
-//   or (b) add a Probe RPC on the provisioner gRPC surface (the provisioner
-//   already holds AES_KEY for its CREATE-USER calls). Both are viable; both
-//   are larger PRs than this one.
-//
-//   This file's contract lets the reconciler/heartbeat ship today with a
-//   mockable interface. Production wiring sets the prober to nil (NoopProber)
-//   by default — fail-open, every probe returns nil ("looks healthy") and the
-//   heartbeat clears last_seen_at without alerting. A follow-up PR (see
-//   CHANGES.md NR rollout list) wires a real prober. Tests inject a mock.
+// Foundation copied from the W5-A heartbeat worktree so the real prober
+// (real_prober.go in this PR) can be wired against the same interface even
+// before W5-A's heartbeat job lands. If/when W5-A merges first, the duplicate
+// definition is removed in the rebase; if THIS lands first, W5-A rebases on
+// top with no interface diff. Either order works because both branches treat
+// this file as the contract.
 //
 // Resource types this interface supports (resource_type literal → action):
 //
@@ -24,7 +16,7 @@ package jobs
 //   redis             → PING
 //   mongodb           → adminCommand({ping: 1})
 //   storage           → HEAD against the bucket endpoint
-//   queue             → NATS AccountInfo()
+//   queue             → NATS /healthz monitoring HTTP probe
 //   webhook           → skip — customer-managed; brief explicitly excludes
 //                       webhooks because we don't run the receiver
 //
