@@ -90,6 +90,13 @@ type Config struct {
 	ObjectStoreBackend  string // OBJECT_STORE_BACKEND — "minio" (default) | "do-spaces"
 	BackupS3Bucket      string // BACKUP_S3_BUCKET — defaults to ObjectStoreBucket if empty
 	BackupS3PathPrefix  string // BACKUP_S3_PATH_PREFIX — defaults to "backups/"
+
+	// PlatformBackupS3Prefix is the inner prefix under
+	// BACKUP_S3_PATH_PREFIX for platform DB dumps. Distinct from the
+	// customer-DB backup prefix so a single bucket-list can answer "show me
+	// every platform dump in chronological order" without filtering customer
+	// data.
+	PlatformBackupS3Prefix string // PLATFORM_BACKUP_S3_PREFIX (default: "platform-backups/")
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -156,6 +163,11 @@ func Load() *Config {
 		ObjectStoreBackend: getenv("OBJECT_STORE_BACKEND", "minio"),
 		BackupS3Bucket:     os.Getenv("BACKUP_S3_BUCKET"),
 		BackupS3PathPrefix: getenv("BACKUP_S3_PATH_PREFIX", "backups/"),
+
+		// Platform-DB-specific sub-prefix. Trailing slash so concatenation
+		// with a YYYY-MM-DD path segment yields well-formed S3 keys without
+		// the producer needing to know whether the parent ends in a slash.
+		PlatformBackupS3Prefix: getenv("PLATFORM_BACKUP_S3_PREFIX", "platform-backups/"),
 	}
 
 	// Fall back to the shared object-store bucket when the operator hasn't
