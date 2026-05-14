@@ -179,6 +179,107 @@ func TestScheduler_DedupExists_Skips(t *testing.T) {
 	}
 }
 
+// TestScheduler_HobbyPlus_OnSlotInserts — FIX-H regression. Hobby Plus
+// (the $19/mo mid-tier) MUST be in the scheduled-backup set. Pre-fix the
+// scheduler hardcoded `tier IN ('hobby','pro','growth','team')` and any
+// hobby_plus / hobby_plus_yearly / pro_yearly customer received zero
+// scheduled backups despite paying for them.
+func TestScheduler_HobbyPlus_OnSlotInserts(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Pick a team UUID whose slot = 5; run scheduler at hour 5.
+	teamID := uuid.UUID{5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if hobbyDailySlot(teamID) != 5 {
+		t.Fatalf("test fixture wrong: hobbyDailySlot(teamID)=%d, want 5", hobbyDailySlot(teamID))
+	}
+	resID := "fffffff0-1111-2222-3333-444444444444"
+
+	mock.ExpectQuery(`SELECT r.id::text`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
+			AddRow(resID, "hobby_plus", teamID))
+	mock.ExpectQuery(`SELECT EXISTS`).
+		WithArgs(uuid.MustParse(resID)).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`INSERT INTO resource_backups`).
+		WithArgs(uuid.MustParse(resID), "hobby_plus").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := NewCustomerBackupSchedulerWorker(db)
+	w.now = func() time.Time { return time.Date(2026, 5, 14, 5, 0, 0, 0, time.UTC) }
+
+	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestScheduler_YearlyVariants_BackupHourly — pro_yearly and team_yearly
+// (and any other _yearly tier with hourly cadence) must back up every
+// hour just like their canonical monthly counterpart. Regression guard
+// for the FIX-H widened tier set.
+func TestScheduler_YearlyVariants_BackupHourly(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	resID := "fffffff0-1111-2222-3333-444444444444"
+
+	mock.ExpectQuery(`SELECT r.id::text, r.tier, r.team_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
+			AddRow(resID, "pro_yearly", teamID))
+	mock.ExpectQuery(`SELECT EXISTS`).
+		WithArgs(uuid.MustParse(resID)).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`INSERT INTO resource_backups`).
+		WithArgs(uuid.MustParse(resID), "pro_yearly").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := NewCustomerBackupSchedulerWorker(db)
+	// Hour 14 — pro_yearly should fire regardless (hourly cadence).
+	w.now = func() time.Time { return time.Date(2026, 5, 14, 14, 0, 0, 0, time.UTC) }
+
+	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestCanonicalTier — sanity: _yearly strips, others pass through.
+func TestCanonicalTier(t *testing.T) {
+	cases := map[string]string{
+		"hobby":              "hobby",
+		"hobby_yearly":       "hobby",
+		"hobby_plus":         "hobby_plus",
+		"hobby_plus_yearly":  "hobby_plus",
+		"pro":                "pro",
+		"pro_yearly":         "pro",
+		"team":               "team",
+		"team_yearly":        "team",
+		"growth":             "growth",
+		"growth_yearly":      "growth",
+		"anonymous":          "anonymous",
+		"":                   "",
+		"_yearly":            "_yearly", // not stripped — guard: too short
+	}
+	for in, want := range cases {
+		got := canonicalTier(in)
+		if got != want {
+			t.Errorf("canonicalTier(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestScheduler_DBSelectError_ReturnsError — bad SELECT bubbles up.
 func TestScheduler_DBSelectError_ReturnsError(t *testing.T) {
 	db, mock, err := sqlmock.New()
