@@ -227,6 +227,164 @@ func TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields(t *testing.
 	}
 }
 
+// TestEventEmail_FollowUp5_NewKindsRegistered pins the FOLLOWUP-5
+// (2026-05-14) finish-line of the Resend→Brevo migration: WeeklyDigest +
+// anonymous-tier ExpiryReminder were the last two callers of the legacy
+// EmailClient. Both now route via audit_log. Both kinds MUST be in
+// supportedAuditKinds AND have a builder, otherwise the BrevoForwarder
+// silently drops the row.
+//
+// FAILS on master (kinds aren't registered). PASSES post-FOLLOWUP-5.
+func TestEventEmail_FollowUp5_NewKindsRegistered(t *testing.T) {
+	cases := []struct {
+		kind     string
+		hint     string
+		exemplar map[string]string
+	}{
+		{
+			kind: auditKindDigestWeekly,
+			hint: "WeeklyDigestWorker writes this every Mon 08:00 UTC — see email.go::emitWeeklyDigestAudit",
+			exemplar: map[string]string{
+				"team_name":              "Acme",
+				"total_active_resources": "7",
+			},
+		},
+		{
+			kind: auditKindAnonExpiryWarning,
+			hint: "ExpiryReminderWorker writes this hourly — see expiry_reminder.go::emitAnonExpiryWarningAudit",
+			exemplar: map[string]string{
+				"resource_id":     "r-1",
+				"hours_remaining": "4",
+				"expires_at":      "2026-05-14T12:00:00Z",
+			},
+		},
+	}
+
+	supportedSet := map[string]bool{}
+	for _, k := range supportedAuditKinds {
+		supportedSet[k] = true
+	}
+
+	for _, tc := range cases {
+		if !supportedSet[tc.kind] {
+			t.Errorf("FOLLOWUP-5 migration: %q missing from supportedAuditKinds — %s", tc.kind, tc.hint)
+		}
+		builder, ok := eventEmailBuilders[tc.kind]
+		if !ok {
+			t.Errorf("FOLLOWUP-5 migration: %q has no eventEmailBuilders entry — %s", tc.kind, tc.hint)
+			continue
+		}
+		// Exercise the builder against a minimal valid auditRow.
+		var metadata []byte = nil
+		if len(tc.exemplar) > 0 {
+			// Build a metadata JSON object the builder can decode.
+			var buf []byte
+			buf = append(buf, '{')
+			first := true
+			for k, v := range tc.exemplar {
+				if !first {
+					buf = append(buf, ',')
+				}
+				first = false
+				buf = append(buf, '"')
+				buf = append(buf, k...)
+				buf = append(buf, '"', ':', '"')
+				buf = append(buf, v...)
+				buf = append(buf, '"')
+			}
+			buf = append(buf, '}')
+			metadata = buf
+		}
+		row := auditRow{
+			ID:         "audit-1",
+			TeamID:     "team-1",
+			Kind:       tc.kind,
+			Summary:    "test summary",
+			OwnerEmail: "u@example.com",
+			Metadata:   metadata,
+		}
+		params, ok := builder(row)
+		if !ok {
+			t.Errorf("FOLLOWUP-5: builder for %q returned ok=false with a valid email", tc.kind)
+			continue
+		}
+		if params["audit_kind"] != tc.kind {
+			t.Errorf("FOLLOWUP-5: builder for %q did NOT set audit_kind param — Brevo template body branches on this", tc.kind)
+		}
+	}
+}
+
+// TestEventEmail_BuildDigestWeeklyFlowsEmailAndBreakdown — pins the
+// digest.weekly builder reads email + breakdown out of the metadata so
+// the Brevo template body can render the per-resource-type table.
+func TestEventEmail_BuildDigestWeeklyFlowsEmailAndBreakdown(t *testing.T) {
+	row := auditRow{
+		ID:         "x",
+		TeamID:     "t",
+		Kind:       auditKindDigestWeekly,
+		OwnerEmail: "u@example.com",
+		Metadata: []byte(`{
+			"email":"u@example.com",
+			"team_name":"Acme",
+			"total_active_resources":12,
+			"resource_breakdown":"[{\"ResourceType\":\"postgres\",\"Count\":2}]"
+		}`),
+	}
+	params, ok := buildDigestWeekly(row)
+	if !ok {
+		t.Fatal("builder returned ok=false unexpectedly")
+	}
+	if params["team_name"] != "Acme" {
+		t.Errorf("team_name = %q; want Acme", params["team_name"])
+	}
+	if params["total_active_resources"] != "12" {
+		t.Errorf("total_active_resources = %q; want 12 (number stringified via fmt.Sprint)", params["total_active_resources"])
+	}
+	if params["resource_breakdown"] == "" {
+		t.Errorf("resource_breakdown should be the embedded JSON string; got empty")
+	}
+	if params["audit_kind"] != auditKindDigestWeekly {
+		t.Errorf("audit_kind = %q; want %q (template branches on this)", params["audit_kind"], auditKindDigestWeekly)
+	}
+}
+
+// TestEventEmail_BuildAnonExpiryWarningFlowsResourceContext — pins the
+// anon.expiry_warning builder reads resource_type from the column AND
+// flows hours_remaining + expires_at out of the metadata. The audit_kind
+// param is what lets template 6 render different CTA copy from the
+// resource.expiry_imminent (paid) variant.
+func TestEventEmail_BuildAnonExpiryWarningFlowsResourceContext(t *testing.T) {
+	row := auditRow{
+		ID:           "x",
+		TeamID:       "t",
+		Kind:         auditKindAnonExpiryWarning,
+		ResourceType: "postgres",
+		OwnerEmail:   "u@example.com",
+		Metadata: []byte(`{
+			"resource_id":"res-1",
+			"resource_type":"postgres",
+			"hours_remaining":3,
+			"expires_at":"2026-05-14T12:00:00Z"
+		}`),
+	}
+	params, ok := buildAnonExpiryWarning(row)
+	if !ok {
+		t.Fatal("builder returned ok=false unexpectedly")
+	}
+	if params["resource_type"] != "postgres" {
+		t.Errorf("resource_type = %q; want postgres", params["resource_type"])
+	}
+	if params["hours_remaining"] != "3" {
+		t.Errorf("hours_remaining = %q; want 3", params["hours_remaining"])
+	}
+	if params["resource_id"] != "res-1" {
+		t.Errorf("resource_id = %q; want res-1", params["resource_id"])
+	}
+	if params["audit_kind"] != auditKindAnonExpiryWarning {
+		t.Errorf("audit_kind = %q; want %q (template branches on anon vs paid CTA)", params["audit_kind"], auditKindAnonExpiryWarning)
+	}
+}
+
 // TestEventEmail_BuildDeployDeletionConfirmedFlowsContext — the
 // "deletion confirmed" email body references resource_id, pending_deletion_id,
 // and freed_at. Pin the builder reads them out of the metadata correctly.

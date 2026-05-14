@@ -13,7 +13,12 @@ type Config struct {
 	RedisURL          string // REDIS_URL — platform redis
 	ProvisionerAddr   string // PROVISIONER_ADDR — gRPC addr of provisioner service
 	ProvisionerSecret string // PROVISIONER_SECRET
-	ResendAPIKey      string // RESEND_API_KEY — for digest/trial emails
+
+	// FOLLOWUP-5 (2026-05-14): RESEND_API_KEY removed — the legacy Resend
+	// EmailClient (worker/internal/jobs/email.go) was deleted as part of
+	// finishing the Resend→Brevo migration. All lifecycle email is now
+	// routed via the BrevoForwarder (event_email_forwarder.go). If you
+	// still see RESEND_API_KEY in a k8s Secret, it's safe to remove.
 
 	// Event-email provider — see internal/email/.
 	//
@@ -130,7 +135,6 @@ func Load() *Config {
 		RedisURL:          getenv("REDIS_URL", "redis://localhost:6379"),
 		ProvisionerAddr:   os.Getenv("PROVISIONER_ADDR"),
 		ProvisionerSecret: os.Getenv("PROVISIONER_SECRET"),
-		ResendAPIKey:      os.Getenv("RESEND_API_KEY"),
 		EmailProvider:     os.Getenv("EMAIL_PROVIDER"),
 		BrevoAPIKey:       os.Getenv("BREVO_API_KEY"),
 		BrevoTemplateIDs:  parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
@@ -200,7 +204,6 @@ func Load() *Config {
 	slog.Info("worker.config.loaded",
 		"environment", cfg.Environment,
 		"provisioner_addr_set", cfg.ProvisionerAddr != "",
-		"resend_key_set", cfg.ResendAPIKey != "",
 		"email_provider", cfg.EmailProvider,
 		"brevo_key_set", cfg.BrevoAPIKey != "",
 		"brevo_template_count", len(cfg.BrevoTemplateIDs),

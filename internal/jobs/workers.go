@@ -143,8 +143,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		slog.Error("jobs.workers.river_migrate_failed", "error", err)
 	}
 
-	emailClient := NewEmailClient(cfg.ResendAPIKey)
-
+	// FOLLOWUP-5 (2026-05-14): the legacy Resend EmailClient was deleted in
+	// this migration — the four remaining lifecycle methods (SendTrial* dead
+	// code, SendWeeklyDigest + SendExpiryReminder live) were migrated to
+	// audit_log → BrevoForwarder. The Resend SDK is no longer imported.
+	//
 	// Event-email provider — provider-agnostic seam. The factory chooses the
 	// implementation from EMAIL_PROVIDER (Brevo today; SES/SendGrid possible
 	// later) and returns NoopProvider when nothing is configured (fail-open).
@@ -224,12 +227,17 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewExpireAnonymousWorker(db, provClient, minioClient), nrApp))
 	river.AddWorker(workers, WithObservability(NewExpireStacksWorker(db, cfg.KubeNamespaceApps+"-"), nrApp))
 	river.AddWorker(workers, WithObservability(NewRefreshGeoDBWorker(), nrApp))
-	// TrialExpiry / WeeklyDigest are registered via composite literal, so the
-	// generic type parameter can't be inferred from the constructor return —
-	// it must be supplied explicitly.
-	river.AddWorker(workers, WithObservability[TrialExpiryArgs](&TrialExpiryWorker{db: db, email: emailClient}, nrApp))
-	river.AddWorker(workers, WithObservability[WeeklyDigestArgs](&WeeklyDigestWorker{db: db, email: emailClient}, nrApp))
-	river.AddWorker(workers, WithObservability(NewExpiryReminderWorker(db, emailClient), nrApp))
+	// TrialExpiryWorker was deleted in FOLLOWUP-5 (2026-05-14) — per project
+	// memory rule `project_no_trial_pay_day_one.md`, the platform has NO
+	// trial period (anonymous is the only free tier; hobby/pro/team are paid
+	// from day one), so the worker scanned a column that's never populated.
+	// WeeklyDigest is registered via composite literal, so the generic type
+	// parameter can't be inferred from the constructor return — it must be
+	// supplied explicitly. The worker writes an audit_log row instead of
+	// calling Resend directly (FOLLOWUP-5 migration); the BrevoForwarder
+	// picks the row up and dispatches via Brevo.
+	river.AddWorker(workers, WithObservability(NewWeeklyDigestWorker(db), nrApp))
+	river.AddWorker(workers, WithObservability(NewExpiryReminderWorker(db), nrApp))
 	// Resource-expiry-imminent producer: every 10 minutes, scan for
 	// authenticated resources whose expires_at falls inside the next hour
 	// and write one resource.expiry_imminent audit_log row per resource per
@@ -310,11 +318,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// reminders_sent counter to fire the next 2h-spaced reminder. Six
 	// reminders total. Idempotent across ticks via the CAS guard. Email
 	// dispatch best-effort — see deployment_reminder.go.
-	river.AddWorker(workers, WithObservability(NewDeploymentReminderWorker(db, emailClient), nrApp))
+	river.AddWorker(workers, WithObservability(NewDeploymentReminderWorker(db, nil), nrApp))
 	// Deploy TTL expirer (Wave FIX-J) — every 60s, scan deployments whose
 	// expires_at has passed and soft-delete (status='expired'). Sends a
 	// one-shot "your deploy expired" email. See deployment_expirer.go.
-	river.AddWorker(workers, WithObservability(NewDeploymentExpirerWorker(db, emailClient), nrApp))
+	river.AddWorker(workers, WithObservability(NewDeploymentExpirerWorker(db, nil), nrApp))
 	// Customer-backup pipeline — three workers, two cron schedules.
 	//
 	//   scheduler (every hour)  — inserts pending resource_backups rows for
@@ -438,15 +446,9 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
-		river.NewPeriodicJob(
-			scheduleFunc(func(t time.Time) time.Time {
-				return t.Add(6 * time.Hour)
-			}),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return TrialExpiryArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
+		// TrialExpiry periodic job removed in FOLLOWUP-5 (2026-05-14) —
+		// see deletion note above on TrialExpiryWorker. No-trial policy is
+		// enforced by `project_no_trial_pay_day_one.md`.
 		river.NewPeriodicJob(
 			mondayAt8UTCSchedule{},
 			func() (river.JobArgs, *river.InsertOpts) {
