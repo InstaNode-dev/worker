@@ -15,8 +15,16 @@ package jobs
 //      keep the worker module's import graph small — actual teardown
 //      happens via the api's existing periodic reconciler picking up the
 //      'expired' status.
-//   3. Email the team's primary user ("your deploy expired"). Best-effort.
-//   4. Emit a deploy.expired audit_log row.
+//   3. Emit a deploy.expired audit_log row carrying the metadata the
+//      email template needs (app_id, expires_at, ttl_policy). The
+//      BrevoForwarder (event_email_forwarder.go) drains it on its next
+//      60s tick and POSTs to Brevo.
+//
+// Email-send migration (2026-05-14, FIX-I/J→Brevo migration):
+//   PREVIOUSLY: this worker called EmailClient.SendDeployExpired inline.
+//   In production RESEND_API_KEY was unset, so all sends went to
+//   NoopClient and customers never got the "your deploy was removed"
+//   notice. The audit row IS now the trigger.
 //
 // Idempotent across ticks: once status='expired' the row no longer matches
 // the candidate predicate, so it can't be processed twice.
@@ -47,21 +55,20 @@ type DeploymentExpirerArgs struct{}
 // Kind is the River job kind.
 func (DeploymentExpirerArgs) Kind() string { return "deployment_expirer" }
 
-// DeployExpirerEmailer is the email surface the expirer needs.
-type DeployExpirerEmailer interface {
-	SendDeployExpired(ctx context.Context, to, deployName string) error
-}
-
-// DeploymentExpirerWorker runs the periodic sweep.
+// DeploymentExpirerWorker runs the periodic sweep. Emails are dispatched
+// by event_email_forwarder.go off the audit_log row this worker writes
+// (migrated 2026-05-14, FIX-I/J→Brevo migration).
 type DeploymentExpirerWorker struct {
 	river.WorkerDefaults[DeploymentExpirerArgs]
-	db    *sql.DB
-	email DeployExpirerEmailer
+	db *sql.DB
 }
 
-// NewDeploymentExpirerWorker constructs the worker.
-func NewDeploymentExpirerWorker(db *sql.DB, email DeployExpirerEmailer) *DeploymentExpirerWorker {
-	return &DeploymentExpirerWorker{db: db, email: email}
+// NewDeploymentExpirerWorker constructs the worker. The email argument
+// is accepted (and ignored) to preserve the existing call-site signature
+// in workers.go while the Resend→Brevo migration ships; it will be
+// removed in a follow-up once all callers are updated.
+func NewDeploymentExpirerWorker(db *sql.DB, _ any) *DeploymentExpirerWorker {
+	return &DeploymentExpirerWorker{db: db}
 }
 
 // deployExpirerRow is the projection of deployments + users used by the expirer.
@@ -144,19 +151,11 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 			continue
 		}
 
-		// Step 2: audit emit BEFORE the email so the trail records the
-		// expiry even if email dispatch fails.
+		// Step 2: audit emit. The BrevoForwarder drains audit_log every
+		// 60s and dispatches the "your deploy was removed" email —
+		// migrated 2026-05-14 from inline EmailClient.SendDeployExpired.
 		emitDeployExpiredAudit(w.db, r)
 		metrics.DeployExpiredTotal.Inc()
-
-		// Step 3: email best-effort. SendDeployExpired is fire-and-forget —
-		// if it fails, the audit row is still there.
-		if w.email != nil && r.ownerEmail.Valid && r.ownerEmail.String != "" {
-			if sendErr := w.email.SendDeployExpired(ctx, r.ownerEmail.String, r.appID); sendErr != nil {
-				slog.Warn("jobs.deployment_expirer.email_failed",
-					"deploy_id", r.id, "to", r.ownerEmail.String, "error", sendErr)
-			}
-		}
 
 		slog.Info("jobs.deployment_expirer.expired",
 			"deploy_id", r.id, "team_id", r.teamID,
@@ -175,12 +174,17 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 	return nil
 }
 
-// emitDeployExpiredAudit writes the deploy.expired audit_log row.
+// emitDeployExpiredAudit writes the deploy.expired audit_log row. The
+// BrevoForwarder consumes this row to dispatch the "your deploy expired"
+// email — see buildDeployExpired in event_email_mapping.go. The metadata
+// MUST stay in sync with that builder.
+//
 // Best-effort, fire-and-forget per existing convention.
 func emitDeployExpiredAudit(db *sql.DB, r deployExpirerRow) {
 	meta, _ := json.Marshal(map[string]any{
 		"deploy_id":  r.id,
 		"team_id":    r.teamID,
+		"app_id":     r.appID,
 		"expires_at": r.expiresAt.UTC().Format(time.RFC3339),
 		"ttl_policy": r.ttlPolicy,
 	})

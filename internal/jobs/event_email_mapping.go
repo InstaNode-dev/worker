@@ -43,23 +43,43 @@ const (
 	// active_resource_count, email — see buildChurnRiskFlagged below.
 	auditKindChurnRiskFlagged       = "churn.risk_flagged"
 
-	// Deploy TTL audit kinds (Wave FIX-J). The forwarder doesn't actually
-	// send an email for these directly today — the worker's
-	// DeploymentReminderWorker and DeploymentExpirerWorker send their
-	// own emails inline (the audit row records the inflection point but
-	// is not the trigger). We still REGISTER the kinds here so the
-	// supportedAuditKinds <-> eventEmailBuilders consistency test
-	// (TestEventEmail_AllSupportedKindsHaveBuilder) doesn't catch us out
-	// when a future Brevo-driven path replaces the inline sends.
+	// Deploy TTL audit kinds (Wave FIX-J). Migrated 2026-05-14 from the
+	// legacy worker.email.* Resend path (which was silently NoopClient in
+	// production because RESEND_API_KEY is unset) to the BrevoForwarder.
+	// The DeploymentReminderWorker / DeploymentExpirerWorker now emit only
+	// the audit_log row; the forwarder picks it up on the next 60s tick
+	// and POSTs to Brevo using BREVO_TEMPLATE_IDS-configured templates.
 	//
-	// Today the builders return ok=false unconditionally — the forwarder
-	// logs and advances past the row, which is the documented behaviour
-	// for "audit row exists but the email channel for it is elsewhere".
+	// auditKindDeployTTLSet stays unmapped (no email — "user set a custom
+	// TTL" is a dashboard event, not a notification).
+	// auditKindTeamSettingsChanged stays unmapped (settings audit, not
+	// email-worthy).
 	auditKindDeployMadePermanent = "deploy.made_permanent"
 	auditKindDeployTTLSet        = "deploy.ttl_set"
 	auditKindDeployExpiringSoon  = "deploy.expiring_soon"
 	auditKindDeployExpired       = "deploy.expired"
 	auditKindTeamSettingsChanged = "team.settings_changed"
+
+	// Email-confirmed deletion lifecycle (Wave FIX-I, api migration 044).
+	// Producer: api/internal/handlers/deletion_confirm.go on every step of
+	// the two-step paid-tier delete flow (deploy + stack), PLUS the
+	// worker's pending_deletion_expirer for the TTL-expired branch.
+	//
+	// Email semantics (template choices in BREVO_TEMPLATE_IDS):
+	//   requested  — "click to confirm deletion" CTA (template 6).
+	//   confirmed  — "resource is being torn down" notice (template 6).
+	//   cancelled  — "good news, you cancelled the deletion" (template 3
+	//                — positive confirmation, closest match in current set).
+	//   expired    — "window elapsed, your resource is safe" (template 3
+	//                — also positive: resource stays, no destructive action).
+	//
+	// Only deploy.* registered for now (per brief scope: "DeployEmails to
+	// Brevo"). stack.deletion_* mirrors the same metadata shape and can be
+	// wired the same way if/when the stack flow needs email coverage.
+	auditKindDeployDeletionRequested = "deploy.deletion_requested"
+	auditKindDeployDeletionConfirmed = "deploy.deletion_confirmed"
+	auditKindDeployDeletionCancelled = "deploy.deletion_cancelled"
+	auditKindDeployDeletionExpired   = "deploy.deletion_expired"
 )
 
 // auditRow is the projection of audit_log + users used by the forwarder.
@@ -99,24 +119,25 @@ var supportedAuditKinds = []string{
 	auditKindAdminTierChanged,
 	auditKindAdminPromoIssued,
 	auditKindChurnRiskFlagged,
-}
-
-// Wave FIX-J: deploy.made_permanent / deploy.ttl_set / deploy.expiring_soon /
-// deploy.expired / team.settings_changed are emitted by the api (and by the
-// reminder/expirer workers in this module). They are INTENTIONALLY NOT
-// listed in supportedAuditKinds because the email-side-effect for each is
-// either (a) "no email" (the inflection point is a dashboard event), or
-// (b) handled inline by the reminder/expirer workers themselves — the
-// forwarder is the wrong channel for them. Listing them here would force
-// us to write no-op builders that fail the TestEventEmail_BuilderReturnsParams
-// "must return ok=true on a valid row" contract. We declare them as
-// constants below so the api side can reference them and the operator
-// runbook stays consistent.
-var _ = []string{
-	auditKindDeployMadePermanent,
-	auditKindDeployTTLSet,
+	// Wave FIX-J deploy TTL emails (migrated from Resend → Brevo 2026-05-14):
 	auditKindDeployExpiringSoon,
 	auditKindDeployExpired,
+	auditKindDeployMadePermanent,
+	// Wave FIX-I email-confirmed deletion lifecycle (migrated from inline
+	// api Resend send → audit-driven Brevo 2026-05-14):
+	auditKindDeployDeletionRequested,
+	auditKindDeployDeletionConfirmed,
+	auditKindDeployDeletionCancelled,
+	auditKindDeployDeletionExpired,
+}
+
+// auditKindDeployTTLSet and auditKindTeamSettingsChanged are emitted by the
+// api but INTENTIONALLY NOT mapped to an email — the inflection point is a
+// dashboard event, not a customer notification. Listing them as `_ = ...`
+// so they stay referenced (and don't trip `unused constant` linters), and
+// so a future contributor sees the rationale next to the active mappings.
+var _ = []string{
+	auditKindDeployTTLSet,
 	auditKindTeamSettingsChanged,
 }
 
@@ -134,6 +155,15 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	auditKindAdminTierChanged:       buildTierChangedByAdmin,
 	auditKindAdminPromoIssued:       buildPromoCodeReceived,
 	auditKindChurnRiskFlagged:       buildChurnRiskFlagged,
+	// Wave FIX-J deploy TTL emails (migrated 2026-05-14).
+	auditKindDeployExpiringSoon:  buildDeployExpiringSoon,
+	auditKindDeployExpired:       buildDeployExpired,
+	auditKindDeployMadePermanent: buildDeployMadePermanent,
+	// Wave FIX-I email-confirmed deletion (migrated 2026-05-14).
+	auditKindDeployDeletionRequested: buildDeployDeletionRequested,
+	auditKindDeployDeletionConfirmed: buildDeployDeletionConfirmed,
+	auditKindDeployDeletionCancelled: buildDeployDeletionCancelled,
+	auditKindDeployDeletionExpired:   buildDeployDeletionExpired,
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────
@@ -324,5 +354,119 @@ func buildChurnRiskFlagged(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "tier", "tier")
 	copyMetaStr(params, meta, "last_activity_days_ago", "last_activity_days_ago")
 	copyMetaStr(params, meta, "active_resource_count", "active_resource_count")
+	return params, true
+}
+
+// ── Wave FIX-J deploy TTL builders ────────────────────────────────────────
+//
+// Metadata shapes (set by deployment_reminder.go / deployment_expirer.go /
+// api/internal/handlers/deploy_ttl.go):
+//
+//   deploy.expiring_soon  — {deploy_id, team_id, reminder_index, hours_remaining, expires_at, app_id, deploy_url, make_permanent_url}
+//   deploy.expired        — {deploy_id, team_id, expires_at, ttl_policy, app_id}
+//   deploy.made_permanent — {deploy_id, team_id, source, previous_ttl_policy}
+//
+// The Brevo template body references {{ params.deploy_name }},
+// {{ params.deploy_url }}, {{ params.make_permanent_url }} so the same
+// RESOURCE_EXPIRING template can render copy that's specific to a deploy
+// vs a postgres/redis/mongo resource.
+
+func buildDeployExpiringSoon(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "deploy_id", "deploy_id")
+	copyMetaStr(params, meta, "app_id", "deploy_name")
+	copyMetaStr(params, meta, "deploy_url", "deploy_url")
+	copyMetaStr(params, meta, "make_permanent_url", "make_permanent_url")
+	copyMetaStr(params, meta, "hours_remaining", "hours_remaining")
+	copyMetaStr(params, meta, "expires_at", "expires_at")
+	copyMetaStr(params, meta, "reminder_index", "reminder_index")
+	return params, true
+}
+
+func buildDeployExpired(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "deploy_id", "deploy_id")
+	copyMetaStr(params, meta, "app_id", "deploy_name")
+	copyMetaStr(params, meta, "expires_at", "expires_at")
+	copyMetaStr(params, meta, "ttl_policy", "ttl_policy")
+	return params, true
+}
+
+func buildDeployMadePermanent(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "deploy_id", "deploy_id")
+	copyMetaStr(params, meta, "source", "source")
+	copyMetaStr(params, meta, "previous_ttl_policy", "previous_ttl_policy")
+	return params, true
+}
+
+// ── Wave FIX-I email-confirmed deletion builders ──────────────────────────
+//
+// Metadata shapes (set by api/internal/handlers/deletion_confirm.go and
+// worker/internal/jobs/pending_deletion_expirer.go):
+//
+//   deploy.deletion_requested — {team_id, resource_id, pending_deletion_id, expires_at, email_sent_to, resource_label}
+//   deploy.deletion_confirmed — {team_id, resource_id, pending_deletion_id, freed_at, age_seconds_in_pending}
+//   deploy.deletion_cancelled — {team_id, resource_id, pending_deletion_id}
+//   deploy.deletion_expired   — {team_id, resource_id, pending_deletion_id, age_seconds}
+
+func buildDeployDeletionRequested(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "resource_label", "resource_label")
+	copyMetaStr(params, meta, "pending_deletion_id", "pending_deletion_id")
+	copyMetaStr(params, meta, "expires_at", "expires_at")
+	return params, true
+}
+
+func buildDeployDeletionConfirmed(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "pending_deletion_id", "pending_deletion_id")
+	copyMetaStr(params, meta, "freed_at", "freed_at")
+	copyMetaStr(params, meta, "age_seconds_in_pending", "age_seconds_in_pending")
+	return params, true
+}
+
+func buildDeployDeletionCancelled(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "pending_deletion_id", "pending_deletion_id")
+	return params, true
+}
+
+func buildDeployDeletionExpired(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "pending_deletion_id", "pending_deletion_id")
+	copyMetaStr(params, meta, "age_seconds", "age_seconds")
 	return params, true
 }
