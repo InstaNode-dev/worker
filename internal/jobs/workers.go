@@ -177,6 +177,19 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}
 	}
 
+	// Customer-backup object store — same endpoint/credentials as the
+	// storage_bytes scanner, but a different BUCKET so pg_dump tarballs
+	// don't mix with /storage/new customer object data. Nil = fail open:
+	// the backup runner + restore runner log WARN and skip every tick.
+	var backupStore BackupObjectStore
+	if cfg.ObjectStoreEndpoint != "" {
+		if store, err := NewMinIOBackupStore(cfg.ObjectStoreEndpoint, cfg.ObjectStoreAccessKey, cfg.ObjectStoreSecretKey); err != nil {
+			slog.Warn("jobs.workers.backup_store_init_failed", "error", err)
+		} else {
+			backupStore = store
+		}
+	}
+
 	workers := river.NewWorkers()
 	// Each worker is wrapped in WithObservability so every job execution
 	// stamps tid + trace_id on ctx and (optionally) opens a New Relic
@@ -248,6 +261,22 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// INSTANT_API_INTERNAL_URL or WORKER_INTERNAL_JWT_SECRET is unset.
 	// See payment_grace_terminator.go.
 	river.AddWorker(workers, WithObservability(NewPaymentGraceTerminatorWorker(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil), nrApp))
+	// Customer-backup pipeline — three workers, two cron schedules.
+	//
+	//   scheduler (every hour)  — inserts pending resource_backups rows for
+	//                              tier-eligible postgres/vector resources.
+	//   runner    (every 30s)   — claims pending rows, pg_dump → S3, runs
+	//                              retention sweep at end of batch.
+	//   restore   (every 30s)   — claims pending resource_restores rows,
+	//                              S3 → pg_restore into the same resource.
+	//
+	// All three are no-ops when cfg.AESKey or cfg.ObjectStoreEndpoint is
+	// unset — fail-open so a dev environment that doesn't ship AES keys
+	// doesn't block worker boot. See each worker's Work() top for the
+	// exact WARN line emitted.
+	river.AddWorker(workers, WithObservability(NewCustomerBackupSchedulerWorker(db), nrApp))
+	river.AddWorker(workers, WithObservability(NewCustomerBackupRunner(db, backupStore, cfg.BackupS3Bucket, cfg.BackupS3PathPrefix, cfg.AESKey), nrApp))
+	river.AddWorker(workers, WithObservability(NewCustomerRestoreRunner(db, backupStore, cfg.BackupS3Bucket, cfg.AESKey), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -419,6 +448,45 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(paymentGraceTerminatorInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return PaymentGraceTerminatorArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Customer backup scheduler — every hour, sweeps active
+		// postgres/vector resources and INSERTs a 'pending' row for any
+		// tier that's due this hour (pro/team/growth every hour; hobby
+		// once per day at the team's daily slot). RunOnStart=true so a
+		// worker restart immediately covers any hour-bucket that fell
+		// inside the downtime; the in-job 50min dedupe lookback
+		// prevents double-inserts.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(1*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomerBackupSchedulerArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Customer backup runner — every 30 seconds, picks up pending
+		// rows (whether inserted by the scheduler above or by the api's
+		// POST /resources/:id/backup) and streams pg_dump → gzip → S3.
+		// RunOnStart=true so a restart drains any rows that were
+		// 'pending' during the downtime. Routed to the reconcile queue
+		// so a fan-out on the default queue (weekly_digest) can't
+		// starve customer-facing backup latency.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(30*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomerBackupRunnerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Customer restore runner — every 30 seconds, picks up pending
+		// resource_restores rows and pg_restores from S3 into the same
+		// resource. Smaller per-tick batch (5) than the backup runner
+		// because pg_restore is heavier and holds DB locks.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(30*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomerRestoreRunnerArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
