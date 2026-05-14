@@ -60,6 +60,32 @@ const (
 	auditKindDeployExpired       = "deploy.expired"
 	auditKindTeamSettingsChanged = "team.settings_changed"
 
+	// Weekly digest + anonymous-expiry warning (FOLLOWUP-5, 2026-05-14).
+	// Producer:
+	//   digest.weekly        — WeeklyDigestWorker (email.go), Mon 08:00 UTC
+	//   anon.expiry_warning  — ExpiryReminderWorker (expiry_reminder.go), hourly
+	//
+	// Both previously routed through the legacy Resend EmailClient
+	// (RESEND_API_KEY was unset → NoopClient → silent drop). Now the
+	// audit_log row IS the trigger; the BrevoForwarder picks the row up on
+	// its next 60s tick and POSTs to Brevo using BREVO_TEMPLATE_IDS[kind].
+	//
+	// Template reuse strategy (no new Brevo templates introduced):
+	//   digest.weekly       → template 2 (WELCOME). Both are "we're keeping
+	//                         in touch" warm emails; the substitution map
+	//                         lets the same template render either copy.
+	//   anon.expiry_warning → template 6 (RESOURCE_EXPIRING). Same template
+	//                         used by resource.expiry_imminent. The
+	//                         agent_action copy ("claim to keep" vs
+	//                         "upgrade to keep") is driven by the
+	//                         {{ params.audit_kind }} flag the template
+	//                         body branches on; if the operator later
+	//                         clones a dedicated anon variant, they only
+	//                         flip BREVO_TEMPLATE_IDS["anon.expiry_warning"]
+	//                         to the new id — no worker change needed.
+	auditKindDigestWeekly      = "digest.weekly"
+	auditKindAnonExpiryWarning = "anon.expiry_warning"
+
 	// Email-confirmed deletion lifecycle (Wave FIX-I, api migration 044).
 	// Producer: api/internal/handlers/deletion_confirm.go on every step of
 	// the two-step paid-tier delete flow (deploy + stack), PLUS the
@@ -136,6 +162,10 @@ var supportedAuditKinds = []string{
 	auditKindDeployDeletionConfirmed,
 	auditKindDeployDeletionCancelled,
 	auditKindDeployDeletionExpired,
+	// FOLLOWUP-5 migration (2026-05-14) — replaces the legacy Resend
+	// EmailClient.SendWeeklyDigest / SendExpiryReminder paths.
+	auditKindDigestWeekly,
+	auditKindAnonExpiryWarning,
 }
 
 // auditKindDeployTTLSet and auditKindTeamSettingsChanged are emitted by the
@@ -172,6 +202,9 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	auditKindDeployDeletionConfirmed: buildDeployDeletionConfirmed,
 	auditKindDeployDeletionCancelled: buildDeployDeletionCancelled,
 	auditKindDeployDeletionExpired:   buildDeployDeletionExpired,
+	// FOLLOWUP-5 migration (2026-05-14).
+	auditKindDigestWeekly:      buildDigestWeekly,
+	auditKindAnonExpiryWarning: buildAnonExpiryWarning,
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────
@@ -466,5 +499,54 @@ func buildDeployDeletionExpired(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "resource_id", "resource_id")
 	copyMetaStr(params, meta, "pending_deletion_id", "pending_deletion_id")
 	copyMetaStr(params, meta, "age_seconds", "age_seconds")
+	return params, true
+}
+
+// ── FOLLOWUP-5 builders (2026-05-14) ──────────────────────────────────────
+//
+// Metadata shapes (set by email.go::emitWeeklyDigestAudit and
+// expiry_reminder.go::emitAnonExpiryWarningAudit):
+//
+//   digest.weekly        — {email, team_name, total_active_resources,
+//                           resource_breakdown}
+//   anon.expiry_warning  — {resource_id, resource_type, hours_remaining,
+//                           expires_at, email}
+//
+// audit_kind is injected into params so a Brevo template body that
+// shares an underlying template id between multiple kinds (template 6
+// covers both resource.expiry_imminent AND anon.expiry_warning) can
+// branch on {{ params.audit_kind }} to render the right CTA copy.
+
+func buildDigestWeekly(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	params["audit_kind"] = row.Kind
+	copyMetaStr(params, meta, "team_name", "team_name")
+	copyMetaStr(params, meta, "total_active_resources", "total_active_resources")
+	copyMetaStr(params, meta, "resource_breakdown", "resource_breakdown")
+	return params, true
+}
+
+func buildAnonExpiryWarning(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	params["audit_kind"] = row.Kind
+	// resource_type lives in the column (and the column flows through the
+	// audit insert), so prefer the column over the metadata field — same
+	// pattern as buildResourceExpiring.
+	if row.ResourceType != "" {
+		params["resource_type"] = row.ResourceType
+	} else {
+		copyMetaStr(params, meta, "resource_type", "resource_type")
+	}
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "hours_remaining", "hours_remaining")
+	copyMetaStr(params, meta, "expires_at", "expires_at")
 	return params, true
 }
