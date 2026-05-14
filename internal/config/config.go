@@ -71,10 +71,10 @@ type Config struct {
 	WorkerInternalJWTSecret  string // WORKER_INTERNAL_JWT_SECRET — HS256 shared with api
 
 	// AES_KEY — 64-char hex key (32 bytes) used to decrypt
-	// resources.connection_url for the customer-backup runner. Mirrors the
-	// api's crypto.ParseAESKey/Decrypt usage. When unset the backup runner
-	// fails-open with a logged WARN per backup — backups can't run without
-	// the platform-shared key and we never want to silently dump plaintext.
+	// resources.connection_url for the customer-backup runner AND the real
+	// resource-heartbeat prober (real_prober.go). Mirrors the api's
+	// crypto.ParseAESKey/Decrypt usage. When unset both consumers fail-open
+	// with a logged WARN — neither dumps plaintext nor crashes the worker.
 	AESKey string
 
 	// Backup-specific object-store settings. Default to the OBJECT_STORE_*
@@ -159,6 +159,12 @@ func Load() *Config {
 		InstantAPIInternalURL:   os.Getenv("INSTANT_API_INTERNAL_URL"),
 		WorkerInternalJWTSecret: os.Getenv("WORKER_INTERNAL_JWT_SECRET"),
 
+		// AES_KEY is shared with the api for connection_url decryption.
+		// Consumed by both the customer-backup runner AND the real
+		// resource-heartbeat prober (real_prober.go). Optional at boot
+		// (fail-open: prober still runs against raw column, backup
+		// runner WARN-skips each tick) so the rollout of W5-B's k8s
+		// Secret patch doesn't hard-fail worker boot.
 		AESKey:             os.Getenv("AES_KEY"),
 		ObjectStoreBackend: getenv("OBJECT_STORE_BACKEND", "minio"),
 		BackupS3Bucket:     os.Getenv("BACKUP_S3_BUCKET"),
@@ -202,6 +208,7 @@ func Load() *Config {
 		"ses_key_set", cfg.SESAWSAccessKey != "",
 		"ses_from_set", cfg.SESFromEmail != "",
 		"ses_template_count", len(cfg.SESTemplateNames),
+		"aes_key_set", cfg.AESKey != "",
 	)
 	return cfg
 }
