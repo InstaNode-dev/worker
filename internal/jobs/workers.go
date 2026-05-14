@@ -262,22 +262,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// reactivation email via the configured provider. See
 	// churn_predictor.go for the activity-kind / dedupe rationale.
 	river.AddWorker(workers, WithObservability(NewChurnPredictorWorker(db), nrApp))
-	// Deploy-notify webhook dispatcher — drains deploy.* audit_log rows
-	// into per-team customer-configured webhook URLs. Forward-compat:
-	// no-op when no team has a DEPLOY_NOTIFY_WEBHOOK_URL vault entry.
-	// See deploy_notify_webhook.go for the SSRF / retry / cursor design.
+	// Deploy-notify webhook dispatcher (A2). Drains deploy.* audit_log rows
+	// into per-team customer-configured webhook URLs. No-op until customers
+	// register a DEPLOY_NOTIFY_WEBHOOK_URL vault entry.
 	river.AddWorker(workers, WithObservability(NewDeployNotifyWebhookWorker(db, rdb, nil), nrApp))
-	// Payment grace reminder — every 6h, emit payment.grace_reminder
-	// audit rows for teams in active dunning whose last_reminder_at is
-	// null or >6h ago. The event-email forwarder above drains those
-	// rows into the configured email provider's reminder template.
-	// See payment_grace_reminder.go.
+	// Payment grace reminder (A2). Every 6h, emits payment.grace_reminder
+	// for dunning teams whose last_reminder_at is null or >6h ago.
 	river.AddWorker(workers, WithObservability(NewPaymentGraceReminderWorker(db), nrApp))
-	// Payment grace terminator — every 1h, POST to the api's
-	// /internal/teams/:id/terminate for teams whose grace expired.
-	// Misconfig-tolerant: short-circuits with a WARN when
-	// INSTANT_API_INTERNAL_URL or WORKER_INTERNAL_JWT_SECRET is unset.
-	// See payment_grace_terminator.go.
+	// Payment grace terminator (A2). Every 1h, POSTs /internal/teams/:id/
+	// terminate for grace-expired teams. WARN-noops when the api URL or
+	// WORKER_INTERNAL_JWT_SECRET is unset.
 	river.AddWorker(workers, WithObservability(NewPaymentGraceTerminatorWorker(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil), nrApp))
 	// Customer-backup pipeline — three workers, two cron schedules.
 	//
@@ -353,6 +347,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		NewTeamDeletionExecutorWorker(db, provClient, s3Deleter, cfg.ObjectStoreBucket),
 		nrApp,
 	))
+	// Provisioner-reconciler (W5-A). Every 2min, recovers or abandons
+	// stuck pending resources. NoopProber default — real prober lands in
+	// L2 follow-up. See prober.go for rationale.
+	river.AddWorker(workers, WithObservability(NewProvisionerReconcilerWorker(db, rdb, nil), nrApp))
+	// Resource-heartbeat (W5-A). Hourly (dev: 1min) probe of every active
+	// resource. Sets degraded=true on probe failure, emits state-change
+	// audit rows. Same NoopProber default.
+	river.AddWorker(workers, WithObservability(NewResourceHeartbeatWorker(db, nil), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -496,10 +498,8 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
-		// Deploy-notify webhook dispatcher — every 30s, drain
-		// deploy.* audit_log rows to customer webhook URLs. On
-		// the reconcile queue so a backlog on the default queue
-		// (weekly_digest, etc.) cannot starve it.
+		// Deploy-notify webhook dispatcher (A2) — every 30s, drain
+		// deploy.* audit_log rows to customer webhook URLs.
 		river.NewPeriodicJob(
 			river.PeriodicInterval(deployNotifyWebhookInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
@@ -507,9 +507,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
-		// Payment grace reminder — every 6h. RunOnStart=false: a
-		// restart shouldn't immediately re-fire reminders that the
-		// previous instance just sent.
+		// Payment grace reminder (A2) — every 6h. RunOnStart=false.
 		river.NewPeriodicJob(
 			river.PeriodicInterval(paymentGraceReminderInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
@@ -517,9 +515,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
-		// Payment grace terminator — every 1h. RunOnStart=true so
-		// a worker restart immediately catches any rows whose clock
-		// expired while we were down.
+		// Payment grace terminator (A2) — every 1h. RunOnStart=true.
 		river.NewPeriodicJob(
 			river.PeriodicInterval(paymentGraceTerminatorInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
@@ -591,6 +587,23 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			dailyAt3UTCSchedule{},
 			func() (river.JobArgs, *river.InsertOpts) {
 				return TeamDeletionExecutorArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Provisioner-reconciler (W5-A) — every 2min, reconcile queue.
+		// RunOnStart=true.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(provisionerReconcilerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ProvisionerReconcilerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Resource-heartbeat (W5-A) — 1h prod / 1min dev. RunOnStart=false.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(resourceHeartbeatPeriodicInterval(cfg.Environment)),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ResourceHeartbeatArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
