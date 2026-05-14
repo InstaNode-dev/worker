@@ -2,12 +2,21 @@ package jobs_test
 
 // deployment_reminder_test.go — Wave FIX-J coverage for
 // DeploymentReminderWorker. Uses sqlmock to assert the candidate query
-// shape + the CAS UPDATE + the audit-INSERT side effects.
+// shape + the CAS UPDATE + the audit-INSERT side effect.
+//
+// Migration note (2026-05-14, FIX-I/J→Brevo): the worker no longer calls
+// EmailClient.SendDeployExpiring directly. The audit_log row IS the
+// trigger — the BrevoForwarder drains audit_log on its 60s tick and
+// dispatches the actual Brevo POST. The tests below assert the row is
+// written with the metadata fields the forwarder's buildDeployExpiringSoon
+// builder reads (deploy_url, make_permanent_url, app_id, hours_remaining).
 
 import (
 	"context"
 	"database/sql"
-	"sync"
+	"database/sql/driver"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,41 +25,8 @@ import (
 	"instant.dev/worker/internal/jobs"
 )
 
-// fakeDeployReminderEmailer records every SendDeployExpiring call.
-type fakeDeployReminderEmailer struct {
-	mu   sync.Mutex
-	sent []sentDeployReminder
-	err  error
-}
-
-type sentDeployReminder struct {
-	to               string
-	deployName       string
-	deployURL        string
-	hoursRemaining   int
-	makePermanentURL string
-}
-
-func (f *fakeDeployReminderEmailer) SendDeployExpiring(_ context.Context, to, name, url string, hours int, makePermURL string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.sent = append(f.sent, sentDeployReminder{
-		to: to, deployName: name, deployURL: url,
-		hoursRemaining: hours, makePermanentURL: makePermURL,
-	})
-	return f.err
-}
-
-func (f *fakeDeployReminderEmailer) calls() []sentDeployReminder {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]sentDeployReminder, len(f.sent))
-	copy(out, f.sent)
-	return out
-}
-
 // TestDeploymentReminderWorker_NoCandidates: empty candidate query → no
-// sends, no errors.
+// audit inserts, no errors.
 func TestDeploymentReminderWorker_NoCandidates(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -71,20 +47,26 @@ func TestDeploymentReminderWorker_NoCandidates(t *testing.T) {
 		AddRow("permanent", 0)
 	mock.ExpectQuery(`SELECT ttl_policy, count\(\*\)`).WillReturnRows(gaugeRows)
 
-	emailer := &fakeDeployReminderEmailer{}
-	w := jobs.NewDeploymentReminderWorker(db, emailer)
+	w := jobs.NewDeploymentReminderWorker(db, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.DeploymentReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := len(emailer.calls()); got != 0 {
-		t.Errorf("expected 0 sends, got %d", got)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
-// TestDeploymentReminderWorker_SendsAndCASAdvances: a single candidate
-// fires one email and one CAS UPDATE.
-func TestDeploymentReminderWorker_SendsAndCASAdvances(t *testing.T) {
-	db, mock, err := sqlmock.New()
+// TestDeploymentReminderWorker_WritesAuditWithFullMetadata is the
+// migration-pinning test: a single candidate fires one CAS UPDATE and
+// ONE audit_log INSERT carrying every field the BrevoForwarder's
+// buildDeployExpiringSoon builder needs (deploy_url, make_permanent_url,
+// app_id, hours_remaining). Asserts NO inline email dispatch happens —
+// that path was removed in the 2026-05-14 Resend→Brevo migration.
+//
+// This test MUST fail on master (which still calls SendDeployExpiring
+// inline) and pass after the migration ships. Proof the path migrated.
+func TestDeploymentReminderWorker_WritesAuditWithFullMetadata(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
@@ -114,34 +96,37 @@ func TestDeploymentReminderWorker_SendsAndCASAdvances(t *testing.T) {
 		WithArgs("deploy-1", 2, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	emailer := &fakeDeployReminderEmailer{}
-	w := jobs.NewDeploymentReminderWorker(db, emailer)
+	// Audit INSERT — the BrevoForwarder picks this up on its next tick.
+	// Use a custom matcher on the metadata arg so we can pin every
+	// field the email template body references.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(
+			sqlmock.AnyArg(), // team UUID
+			sqlmock.AnyArg(), // summary
+			deployExpiringSoonMetaMatcher{
+				deployID:       "deploy-1",
+				appID:          "appname",
+				makePermanentSubstr: "/api/v1/deployments/deploy-1/make-permanent",
+				deployURLSubstr:     "appname.deployment.instanode.dev",
+				reminderIndex:  3, // reminders_sent (2) + 1
+			},
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := jobs.NewDeploymentReminderWorker(db, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.DeploymentReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	calls := emailer.calls()
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 send, got %d (%+v)", len(calls), calls)
-	}
-	if calls[0].to != "owner@example.com" {
-		t.Errorf("send to = %q; want owner@example.com", calls[0].to)
-	}
-	if calls[0].deployName != "appname" {
-		t.Errorf("deployName = %q; want appname", calls[0].deployName)
-	}
-	if calls[0].hoursRemaining < 1 || calls[0].hoursRemaining > 5 {
-		t.Errorf("hoursRemaining = %d; want roughly 4", calls[0].hoursRemaining)
-	}
-	if calls[0].makePermanentURL == "" {
-		t.Error("makePermanentURL must be non-empty so the email CTA works")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
-// TestDeploymentReminderWorker_CASRaceLostSkipsSend: when the CAS returns
-// rowsAffected=0 (another tick won), the worker must NOT send the email.
-// This is the dedupe guarantee — never double-fire the same reminder.
-func TestDeploymentReminderWorker_CASRaceLostSkipsSend(t *testing.T) {
+// TestDeploymentReminderWorker_CASRaceLostNoAudit: when the CAS returns
+// rowsAffected=0 (another tick won), the worker must NOT write an audit
+// row. This is the dedupe guarantee — never double-fire the same reminder.
+func TestDeploymentReminderWorker_CASRaceLostNoAudit(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -171,13 +156,70 @@ func TestDeploymentReminderWorker_CASRaceLostSkipsSend(t *testing.T) {
 		WithArgs("deploy-race", 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	emailer := &fakeDeployReminderEmailer{}
-	w := jobs.NewDeploymentReminderWorker(db, emailer)
+	// NO INSERT INTO audit_log expected here.
+
+	w := jobs.NewDeploymentReminderWorker(db, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.DeploymentReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if got := len(emailer.calls()); got != 0 {
-		t.Errorf("CAS-lost path must NOT send: got %d calls", got)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
+}
+
+// deployExpiringSoonMetaMatcher is a sqlmock argument matcher that
+// inspects the JSON metadata payload to assert every field the
+// BrevoForwarder's buildDeployExpiringSoon builder reads is present.
+type deployExpiringSoonMetaMatcher struct {
+	deployID            string
+	appID               string
+	makePermanentSubstr string
+	deployURLSubstr     string
+	reminderIndex       int
+}
+
+// Match implements sqlmock.Argument. Treats the input as []byte (JSON
+// blob) and checks the required keys.
+func (m deployExpiringSoonMetaMatcher) Match(v driver.Value) bool {
+	var raw []byte
+	switch x := v.(type) {
+	case []byte:
+		raw = x
+	case string:
+		raw = []byte(x)
+	default:
+		return false
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return false
+	}
+	if asStr(doc["deploy_id"]) != m.deployID {
+		return false
+	}
+	if asStr(doc["app_id"]) != m.appID {
+		return false
+	}
+	if !strings.Contains(asStr(doc["make_permanent_url"]), m.makePermanentSubstr) {
+		return false
+	}
+	if !strings.Contains(asStr(doc["deploy_url"]), m.deployURLSubstr) {
+		return false
+	}
+	// reminder_index decodes as float64 from generic JSON unmarshal.
+	idx, ok := doc["reminder_index"].(float64)
+	if !ok || int(idx) != m.reminderIndex {
+		return false
+	}
+	return true
+}
+
+func asStr(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
