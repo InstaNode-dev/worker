@@ -374,22 +374,114 @@ func TestBackupObjectKey(t *testing.T) {
 	}
 }
 
-// TestRetentionDaysForTier — per-tier retention contract.
-func TestRetentionDaysForTier(t *testing.T) {
+// fakeBackupPlanRegistry is a minimal BackupPlanRegistry for tests. Maps
+// tier→days exactly, with a `tiers` list for the sweep iteration order.
+// Keeping the fake here (rather than embedding *commonplans.Registry) lets
+// the test pin retention contract to declared values rather than the
+// embedded default plans.yaml — if a future plans.yaml change accidentally
+// flips a tier, the test fails on the assertion, not on a moved goalpost.
+type fakeBackupPlanRegistry struct {
+	days  map[string]int
+	tiers []string
+}
+
+func (f *fakeBackupPlanRegistry) BackupRetentionDays(tier string) int {
+	if d, ok := f.days[tier]; ok {
+		return d
+	}
+	return 0
+}
+
+func (f *fakeBackupPlanRegistry) TierNames() []string { return f.tiers }
+
+// TestRetentionDaysFromRegistry — per-tier retention read straight from
+// the plans Registry (not a hardcoded switch). PROD-FIX-C regression:
+// hobby_plus must resolve to 14 days, anonymous/free to 0 (delete-now),
+// and the rest to their plans.yaml-declared values.
+func TestRetentionDaysFromRegistry(t *testing.T) {
+	reg := &fakeBackupPlanRegistry{days: map[string]int{
+		"anonymous":         0,
+		"free":              0,
+		"hobby":             7,
+		"hobby_yearly":      7,
+		"hobby_plus":        14, // The regression target — was 7 under hardcoded switch.
+		"hobby_plus_yearly": 14,
+		"pro":               30,
+		"pro_yearly":        30,
+		"growth":            30,
+		"team":              90,
+		"team_yearly":       90,
+	}}
 	cases := []struct {
 		tier string
 		want int
 	}{
+		{"anonymous", 0},
+		{"free", 0},
 		{"hobby", 7},
+		{"hobby_yearly", 7},
+		{"hobby_plus", 14},
+		{"hobby_plus_yearly", 14},
 		{"pro", 30},
+		{"pro_yearly", 30},
 		{"growth", 30},
 		{"team", 90},
-		{"anonymous", 7},
-		{"unknown", 7}, // defensive default
+		{"team_yearly", 90},
 	}
 	for _, c := range cases {
-		if got := retentionDaysForTier(c.tier); got != c.want {
+		if got := retentionDaysForTier(reg, c.tier); got != c.want {
 			t.Errorf("tier=%q: got %d, want %d", c.tier, got, c.want)
 		}
+	}
+}
+
+// TestRetentionDaysForTier_NilRegistryFallback — when boot is misconfigured
+// (registry nil), retentionDaysForTier returns the legacy 7-day default
+// instead of 0 (which would delete every backup). Belt-and-suspenders for
+// the deploy pipeline.
+func TestRetentionDaysForTier_NilRegistryFallback(t *testing.T) {
+	if got := retentionDaysForTier(nil, "pro"); got != 7 {
+		t.Errorf("nil registry: got %d, want 7 (legacy default)", got)
+	}
+	if got := retentionDaysForTier(nil, ""); got != 7 {
+		t.Errorf("nil registry + empty tier: got %d, want 7", got)
+	}
+}
+
+// TestRetentionDaysForTier_NegativeIsFallback — defensive: plans.yaml
+// uses -1 for "unlimited" on count fields, never for retention. If a
+// future hand-edit slips a -1 in, we WARN and use the 7-day fallback
+// rather than computing a future cutoff (which would skip every row).
+func TestRetentionDaysForTier_NegativeIsFallback(t *testing.T) {
+	reg := &fakeBackupPlanRegistry{days: map[string]int{"weird": -1}}
+	if got := retentionDaysForTier(reg, "weird"); got != 7 {
+		t.Errorf("negative registry value: got %d, want 7 (defensive fallback)", got)
+	}
+}
+
+// TestRetentionCutoff_ZeroDaysIsNow — retention=0 produces cutoff=now,
+// so the SQL `created_at < cutoff` predicate matches every row of that
+// tier. This is the right semantic for retention=0 ("we don't take
+// backups") — leaked rows from a prior tier get swept on next tick
+// instead of persisting forever.
+func TestRetentionCutoff_ZeroDaysIsNow(t *testing.T) {
+	reg := &fakeBackupPlanRegistry{days: map[string]int{"anonymous": 0}}
+	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+	cutoff := retentionCutoff(reg, "anonymous", now)
+	if !cutoff.Equal(now.UTC()) {
+		t.Errorf("retention=0: cutoff = %v, want %v (delete-now semantics)", cutoff, now.UTC())
+	}
+}
+
+// TestRetentionCutoff_PositiveDaysIsBackInTime — retention=N days means
+// cutoff is N*24h before now. Pro tier = 30d → cutoff exactly 30 days
+// back from the supplied now.
+func TestRetentionCutoff_PositiveDaysIsBackInTime(t *testing.T) {
+	reg := &fakeBackupPlanRegistry{days: map[string]int{"pro": 30}}
+	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+	want := now.Add(-30 * 24 * time.Hour)
+	got := retentionCutoff(reg, "pro", now)
+	if !got.Equal(want) {
+		t.Errorf("pro 30d: cutoff = %v, want %v", got, want)
 	}
 }
