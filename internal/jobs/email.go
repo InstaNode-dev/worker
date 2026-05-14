@@ -120,6 +120,82 @@ https://instanode.dev/app/billing
 	return c.send(ctx, to, subject, plain, html)
 }
 
+// SendDeployExpiring warns a user that a deployment is about to be auto-
+// expired (Wave FIX-J). hoursRemaining is the integer hours until expires_at.
+//
+// The email body MUST tell the user EXACTLY what to do — the only acceptable
+// next actions are (a) click the Make Permanent button to keep the deploy,
+// or (b) let it expire. Anything fuzzier turns this into another support
+// ticket. The make-permanent URL embeds the deployment id so the click is a
+// single round-trip; no extra navigation needed.
+func (c *EmailClient) SendDeployExpiring(ctx context.Context, to, deployName, deployURL string, hoursRemaining int, makePermanentURL string) error {
+	if hoursRemaining < 1 {
+		hoursRemaining = 1
+	}
+	subject := fmt.Sprintf("Your deployment %s expires in %dh — keep it or let it go", deployName, hoursRemaining)
+
+	plain := fmt.Sprintf(`Heads up — your instanode deployment "%s" auto-expires in about %d hour(s).
+
+Deploy URL: %s
+
+To keep it permanently (no more reminders, no auto-delete):
+%s
+
+If you just wanted to test it out, do nothing — we'll clean it up automatically.
+
+— The instanode.dev team
+`, deployName, hoursRemaining, deployURL, makePermanentURL)
+
+	safeName := htmlEscape(deployName)
+	safeURL := htmlEscape(deployURL)
+	safeMake := htmlEscape(makePermanentURL)
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
+  <h2>Your deployment %s expires in about %dh</h2>
+  <p>Deploy URL: <a href="%s">%s</a></p>
+  <p>To keep it permanently (no more reminders, no auto-delete):</p>
+  <p style="margin-top:24px;">
+    <a href="%s"
+       style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
+      Keep this deployment &rarr;
+    </a>
+  </p>
+  <p style="margin-top:24px;color:#666;">If you just wanted to test it out, do nothing — we'll clean it up automatically.</p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
+</body>
+</html>`, safeName, hoursRemaining, safeURL, safeURL, safeMake)
+
+	return c.send(ctx, to, subject, plain, html)
+}
+
+// SendDeployExpired notifies a user that their deployment was just removed.
+// Sent ONCE after the deployment_expirer soft-deletes the row. No CTA to
+// "restore" because the build artefact is gone — the user has to redeploy
+// from source if they actually wanted to keep it.
+func (c *EmailClient) SendDeployExpired(ctx context.Context, to, deployName string) error {
+	subject := fmt.Sprintf("Your deployment %s has expired", deployName)
+	plain := fmt.Sprintf(`Your instanode deployment "%s" reached its 24h TTL and was removed.
+
+If this was a real deployment, you can redeploy from source and call POST /api/v1/deployments/<id>/make-permanent to keep it permanently — or flip your team's default at https://instanode.dev/app/settings/team.
+
+— The instanode.dev team
+`, deployName)
+	safe := htmlEscape(deployName)
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
+  <h2>Your deployment %s has expired</h2>
+  <p>This deployment reached its 24h TTL and was removed.</p>
+  <p>If this was a real deployment, you can redeploy from source and call <code>POST /api/v1/deployments/&lt;id&gt;/make-permanent</code> to keep it permanently — or flip your team's default at <a href="https://instanode.dev/app/settings/team">instanode.dev/app/settings/team</a>.</p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
+</body>
+</html>`, safe)
+	return c.send(ctx, to, subject, plain, html)
+}
+
 func (c *EmailClient) SendTrialExpired(ctx context.Context, to string) error {
 	subject := "Your instant.dev trial has ended"
 	plain := "Your instant.dev trial has ended. Provisioned resources are suspended — your data is safe.\n\nReactivate your account for $12/mo to resume service.\n\nReactivate: https://instant.dev/billing/checkout\n\n— The instant.dev team\n"

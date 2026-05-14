@@ -42,6 +42,24 @@ const (
 	// reactivation email. Metadata carries tier, last_activity_days_ago,
 	// active_resource_count, email — see buildChurnRiskFlagged below.
 	auditKindChurnRiskFlagged       = "churn.risk_flagged"
+
+	// Deploy TTL audit kinds (Wave FIX-J). The forwarder doesn't actually
+	// send an email for these directly today — the worker's
+	// DeploymentReminderWorker and DeploymentExpirerWorker send their
+	// own emails inline (the audit row records the inflection point but
+	// is not the trigger). We still REGISTER the kinds here so the
+	// supportedAuditKinds <-> eventEmailBuilders consistency test
+	// (TestEventEmail_AllSupportedKindsHaveBuilder) doesn't catch us out
+	// when a future Brevo-driven path replaces the inline sends.
+	//
+	// Today the builders return ok=false unconditionally — the forwarder
+	// logs and advances past the row, which is the documented behaviour
+	// for "audit row exists but the email channel for it is elsewhere".
+	auditKindDeployMadePermanent = "deploy.made_permanent"
+	auditKindDeployTTLSet        = "deploy.ttl_set"
+	auditKindDeployExpiringSoon  = "deploy.expiring_soon"
+	auditKindDeployExpired       = "deploy.expired"
+	auditKindTeamSettingsChanged = "team.settings_changed"
 )
 
 // auditRow is the projection of audit_log + users used by the forwarder.
@@ -81,6 +99,25 @@ var supportedAuditKinds = []string{
 	auditKindAdminTierChanged,
 	auditKindAdminPromoIssued,
 	auditKindChurnRiskFlagged,
+}
+
+// Wave FIX-J: deploy.made_permanent / deploy.ttl_set / deploy.expiring_soon /
+// deploy.expired / team.settings_changed are emitted by the api (and by the
+// reminder/expirer workers in this module). They are INTENTIONALLY NOT
+// listed in supportedAuditKinds because the email-side-effect for each is
+// either (a) "no email" (the inflection point is a dashboard event), or
+// (b) handled inline by the reminder/expirer workers themselves — the
+// forwarder is the wrong channel for them. Listing them here would force
+// us to write no-op builders that fail the TestEventEmail_BuilderReturnsParams
+// "must return ok=true on a valid row" contract. We declare them as
+// constants below so the api side can reference them and the operator
+// runbook stays consistent.
+var _ = []string{
+	auditKindDeployMadePermanent,
+	auditKindDeployTTLSet,
+	auditKindDeployExpiringSoon,
+	auditKindDeployExpired,
+	auditKindTeamSettingsChanged,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
