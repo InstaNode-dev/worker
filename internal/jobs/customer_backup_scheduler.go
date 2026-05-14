@@ -63,6 +63,19 @@ func NewCustomerBackupSchedulerWorker(db *sql.DB) *CustomerBackupSchedulerWorker
 	return &CustomerBackupSchedulerWorker{db: db, now: time.Now}
 }
 
+// canonicalTier strips the "_yearly" suffix from a plan tier name so the
+// cadence gate can treat e.g. "hobby_yearly" the same as "hobby". Kept
+// local to this package so the scheduler doesn't need a hard dependency
+// on common/plans just for one string strip. Mirrors
+// instant.dev/common/plans.CanonicalTier.
+func canonicalTier(tier string) string {
+	const suffix = "_yearly"
+	if len(tier) > len(suffix) && tier[len(tier)-len(suffix):] == suffix {
+		return tier[:len(tier)-len(suffix)]
+	}
+	return tier
+}
+
 // hobbyDailySlot returns the hour-of-day [0,24) at which a given team should
 // receive its single daily hobby-tier backup. Deterministic per team UUID:
 // the high 4 bits of the first byte are used to spread teams across 24
@@ -89,12 +102,28 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 	// resource.tier — not team.plan_tier — because the resource is what
 	// carries the user-paid retention contract (mirrors ElevateResourceTiers
 	// on the api side).
+	//
+	// FIX-H (#56/#R6 B36) — the prior hardcoded set
+	// (hobby, pro, growth, team) silently excluded hobby_plus and every
+	// _yearly variant, so paid hobby_plus / hobby_plus_yearly / pro_yearly /
+	// growth_yearly / team_yearly customers received ZERO scheduled
+	// backups. The fix lists every tier whose plans.yaml row has
+	// backup_retention_days > 0. We keep the list inline rather than
+	// querying plans.Registry here because the scheduler doesn't yet
+	// take a Registry — adding a registry param would force a constructor
+	// change across cmd/, deferred to a separate refactor.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT r.id::text, r.tier, r.team_id
 		FROM resources r
 		WHERE r.status = 'active'
 		  AND r.resource_type IN ('postgres', 'vector')
-		  AND r.tier IN ('hobby', 'pro', 'growth', 'team')
+		  AND r.tier IN (
+		    'hobby', 'hobby_yearly',
+		    'hobby_plus', 'hobby_plus_yearly',
+		    'pro', 'pro_yearly',
+		    'growth', 'growth_yearly',
+		    'team', 'team_yearly'
+		  )
 	`)
 	if err != nil {
 		return fmt.Errorf("CustomerBackupSchedulerWorker: query failed: %w", err)
@@ -124,9 +153,16 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 	skippedDedup := 0
 	for _, c := range candidates {
 		// Cadence gate.
-		if c.tier == "hobby" {
+		//
+		// FIX-H — hobby and hobby_plus (and their _yearly variants) run
+		// at one daily slot per team. Pro / Growth / Team (and yearly
+		// counterparts) back up every hour. canonicalTier strips the
+		// _yearly suffix so hobby_yearly / hobby_plus_yearly share the
+		// daily-slot policy with their monthly canonical tier.
+		switch canonicalTier(c.tier) {
+		case "hobby", "hobby_plus":
 			if !c.teamID.Valid {
-				// Defensive: a tier='hobby' resource without a team_id is
+				// Defensive: a tier='hobby*' resource without a team_id is
 				// nonsensical (only anonymous rows have NULL team) but if
 				// it slips in we skip rather than panic-divide.
 				continue
@@ -136,7 +172,7 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 				continue
 			}
 		}
-		// pro / growth / team / hobby-on-slot all proceed.
+		// pro / growth / team (any variant) + hobby/hobby_plus-on-slot proceed.
 
 		rid, err := uuid.Parse(c.id)
 		if err != nil {

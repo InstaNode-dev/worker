@@ -133,9 +133,9 @@ func TestRunner_HappyPath(t *testing.T) {
 	mock.ExpectQuery(`SELECT b.id::text, b.resource_id::text, b.tier_at_backup`).
 		WithArgs(backupBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "resource_id", "tier_at_backup",
+			"id", "resource_id", "tier_at_backup", "backup_kind",
 			"token", "connection_url", "resource_type", "team_id",
-		}).AddRow(backupID, resID, "pro", token, encConn, "postgres", teamID))
+		}).AddRow(backupID, resID, "pro", "scheduled", token, encConn, "postgres", teamID))
 
 	// Atomic claim returns the id.
 	mock.ExpectQuery(`UPDATE resource_backups\s+SET status = 'running'`).
@@ -146,9 +146,9 @@ func TestRunner_HappyPath(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	// Finalize UPDATE — status=ok.
+	// Finalize UPDATE — status=ok. FIX-H #59: adds sha256 column.
 	mock.ExpectExec(`UPDATE resource_backups\s+SET status = 'ok'`).
-		WithArgs(backupID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(backupID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	// backup.succeeded audit row.
@@ -258,9 +258,9 @@ func TestRunner_PgDumpFails_MarksFailed(t *testing.T) {
 	mock.ExpectQuery(`SELECT b.id::text`).
 		WithArgs(backupBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "resource_id", "tier_at_backup",
+			"id", "resource_id", "tier_at_backup", "backup_kind",
 			"token", "connection_url", "resource_type", "team_id",
-		}).AddRow(backupID, resID, "pro", "tok", encConn, "postgres", teamID))
+		}).AddRow(backupID, resID, "pro", "scheduled", "tok", encConn, "postgres", teamID))
 
 	mock.ExpectQuery(`UPDATE resource_backups\s+SET status = 'running'`).
 		WithArgs(backupID).
@@ -322,9 +322,9 @@ func TestRunner_ClaimRace_SkipsSilently(t *testing.T) {
 	mock.ExpectQuery(`SELECT b.id::text`).
 		WithArgs(backupBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "resource_id", "tier_at_backup",
+			"id", "resource_id", "tier_at_backup", "backup_kind",
 			"token", "connection_url", "resource_type", "team_id",
-		}).AddRow(backupID, resID, "pro", "tok", encConn, "postgres", teamID))
+		}).AddRow(backupID, resID, "pro", "scheduled", "tok", encConn, "postgres", teamID))
 
 	// Claim returns no rows (sql.ErrNoRows path).
 	mock.ExpectQuery(`UPDATE resource_backups\s+SET status = 'running'`).

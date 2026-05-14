@@ -35,15 +35,23 @@
 package jobs
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
+	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,6 +59,8 @@ import (
 	"go.opentelemetry.io/otel"
 
 	"instant.dev/common/crypto"
+	"instant.dev/worker/internal/apiclient"
+	"instant.dev/worker/internal/circuit"
 )
 
 // CustomerBackupRunnerArgs holds no fields — periodic job.
@@ -129,6 +139,13 @@ type CustomerBackupRunnerWorker struct {
 	now     func() time.Time
 	timeout time.Duration
 	batchN  int
+
+	// apiBase / apiCli / jwtSecret — used by the FIX-H #65/#Q47 refund
+	// path. When apiBase or jwtSecret is empty the refund call is a
+	// no-op (logged) — same fail-open posture as the rest of the worker.
+	apiBase   string
+	apiCli    *apiclient.Client
+	jwtSecret string
 }
 
 // NewCustomerBackupRunner constructs a runner with production defaults.
@@ -152,6 +169,22 @@ func NewCustomerBackupRunner(db *sql.DB, store BackupObjectStore, bucket, prefix
 	}
 }
 
+// WithRefundClient wires the api endpoint + JWT secret used by the
+// FIX-H #65/#Q47 refund path. cmd/ should call this after construction
+// with the api base URL (e.g. http://instant-api.instant.svc.cluster.local:8080)
+// and the shared WORKER_INTERNAL_JWT_SECRET. Calling with empty strings
+// disables the refund (no-op + WARN); same posture as the rest of the
+// fail-open guards in this worker.
+func (w *CustomerBackupRunnerWorker) WithRefundClient(apiBase, jwtSecret string, httpCli *http.Client) *CustomerBackupRunnerWorker {
+	w.apiBase = strings.TrimRight(apiBase, "/")
+	w.jwtSecret = jwtSecret
+	if httpCli == nil {
+		httpCli = &http.Client{Timeout: 10 * time.Second}
+	}
+	w.apiCli = apiclient.New(httpCli)
+	return w
+}
+
 // Work runs a single sweep tick. Returns nil on partial failure (fail-open
 // per row); returns an error only on a DB-level failure that prevents any
 // progress (e.g. the SELECT query itself failed).
@@ -173,7 +206,7 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	// path only needs one ExecContext for the claim + one for the final
 	// status update.
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT b.id::text, b.resource_id::text, b.tier_at_backup,
+		SELECT b.id::text, b.resource_id::text, b.tier_at_backup, b.backup_kind,
 		       r.token::text, r.connection_url, r.resource_type, r.team_id
 		FROM resource_backups b
 		JOIN resources r ON r.id = b.resource_id
@@ -190,6 +223,7 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 		backupID     string
 		resourceID   string
 		tier         sql.NullString
+		kind         string // 'scheduled' | 'manual' — for refund routing
 		token        string
 		connURL      sql.NullString
 		resourceType string
@@ -199,7 +233,7 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	for rows.Next() {
 		var p pending
 		if scanErr := rows.Scan(
-			&p.backupID, &p.resourceID, &p.tier,
+			&p.backupID, &p.resourceID, &p.tier, &p.kind,
 			&p.token, &p.connURL, &p.resourceType, &p.teamID,
 		); scanErr != nil {
 			slog.Warn("jobs.customer_backup_runner.scan_failed", "error", scanErr)
@@ -255,6 +289,7 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	backupID     string
 	resourceID   string
 	tier         sql.NullString
+	kind         string
 	token        string
 	connURL      sql.NullString
 	resourceType string
@@ -317,17 +352,27 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 		return false
 	}
 
-	// Step 3 — stream pg_dump → gzip → S3 via io.Pipe.
+	// Step 3 — stream pg_dump → gzip → (sha256 + S3) via io.Pipe.
+	//
+	// FIX-H #59 — the gzip output is teed into a SHA-256 hasher so the
+	// final hex digest is available at finalize time. We hash the
+	// COMPRESSED bytes (not the raw pg_dump output) because the
+	// compressed object is what lives in S3 and what the restore
+	// handler / runner will re-read for verification. Hashing happens
+	// inline on the writer side — no second pass over the bytes.
 	objectKey := backupObjectKey(w.prefix, p.token, p.backupID)
 	pr, pw := io.Pipe()
+	hasher := sha256.New()
 
 	// Goroutine: pg_dump writes raw archive bytes into the gzip writer,
-	// which writes compressed bytes into the pipe writer. Closing the
-	// gzip writer flushes its final gzip footer, then we close pw to
-	// signal EOF to the S3 Upload reader side.
+	// which writes compressed bytes into a MultiWriter that fans out to
+	// the sha256 hasher AND the pipe writer (which the S3 Upload reads
+	// from). Closing the gzip writer flushes its final gzip footer,
+	// then we close pw to signal EOF to the S3 Upload reader side.
 	dumpDone := make(chan error, 1)
 	go func() {
-		gz := gzip.NewWriter(pw)
+		mw := io.MultiWriter(hasher, pw)
+		gz := gzip.NewWriter(mw)
 		runErr := w.pgDump.Run(ctx, plainConn, gz)
 		// Close gzip first to flush the trailer, then the pipe so the
 		// Upload side sees EOF (not just the partial gzip stream). If
@@ -344,6 +389,7 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 
 	size, upErr := w.store.Upload(ctx, w.bucket, objectKey, pr)
 	dumpErr := <-dumpDone
+	digestHex := finalizeDigest(hasher, dumpErr, upErr)
 
 	// Prefer the dump-side error when both fail (almost always the more
 	// actionable: "pg_dump: connection refused" vs "pipe: io: read/write
@@ -363,15 +409,18 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 		return false
 	}
 
-	// Step 4 — finalize.
+	// Step 4 — finalize. FIX-H #59: stamp sha256 alongside s3_key and
+	// size_bytes so the restore handler can verify integrity against a
+	// fresh re-read of the object.
 	if _, updErr := w.db.ExecContext(parentCtx, `
 		UPDATE resource_backups
 		   SET status = 'ok',
 		       finished_at = now(),
 		       s3_key = $2,
-		       size_bytes = $3
+		       size_bytes = $3,
+		       sha256 = NULLIF($4,'')
 		 WHERE id = $1
-	`, p.backupID, objectKey, size); updErr != nil {
+	`, p.backupID, objectKey, size, digestHex); updErr != nil {
 		slog.Error("jobs.customer_backup_runner.finalize_failed",
 			"backup_id", p.backupID,
 			"object_key", objectKey,
@@ -408,12 +457,18 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 // markFailed updates the row to 'failed', emits backup.failed audit, and
 // logs the error_summary. parentCtx is used for the DB write so a timed-
 // out backup still records its failure (the inner ctx is already dead).
+//
+// FIX-H #65/#Q47 — when the failed row was a MANUAL backup, we POST to
+// the api's internal refund endpoint so the team's daily counter is
+// credited. Scheduled backups don't burn the manual-counter so no
+// refund is needed.
 func (w *CustomerBackupRunnerWorker) markFailed(
 	ctx context.Context, backupID, errSummary string, start time.Time,
 	p struct {
 		backupID     string
 		resourceID   string
 		tier         sql.NullString
+		kind         string
 		token        string
 		connURL      sql.NullString
 		resourceType string
@@ -452,7 +507,35 @@ func (w *CustomerBackupRunnerWorker) markFailed(
 		"error_summary", errSummary,
 		"duration_ms", duration.Milliseconds(),
 	)
+
+	// FIX-H #65/#Q47 — refund the manual-backups-today counter when a
+	// MANUAL backup fails. Scheduled backups don't burn the counter so
+	// they don't need a refund. Best-effort: a refund failure (api down,
+	// breaker open) logs and moves on; the customer's counter stays
+	// burned for the rest of the UTC day, matching pre-fix behavior.
+	if p.kind == "manual" && p.teamID.Valid {
+		refundErr := w.refundManualBackupQuota(p.teamID.UUID, backupID)
+		if refundErr != nil {
+			slog.Warn("jobs.customer_backup_runner.refund_failed",
+				"backup_id", backupID,
+				"team_id", p.teamID.UUID,
+				"error", refundErr,
+			)
+		}
+	}
+
 	_ = ctx // (parentCtx) keep param to surface intent even though we use a fresh ctx
+}
+
+// finalizeDigest returns the hex-encoded SHA-256 of the gzipped pg_dump
+// stream IFF the dump + upload both succeeded. On failure we deliberately
+// return "" so the finalize UPDATE writes NULL into sha256 — recording a
+// digest for a partial / corrupt object would lie to the restore handler.
+func finalizeDigest(h hash.Hash, dumpErr, upErr error) string {
+	if dumpErr != nil || upErr != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // writeAudit emits an audit_log row. Errors are logged but not propagated —
@@ -579,4 +662,94 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 
 func (b *limitedBuffer) String() string {
 	return string(b.buf[:b.n])
+}
+
+// refundManualBackupQuota POSTs to the api's internal refund endpoint to
+// decrement the team's manual-backups-today counter after a manual
+// backup failed terminally. FIX-H #65/#Q47 BugBash B36.
+//
+// Returns nil on a 2xx response or when the refund is disabled (no
+// apiBase / no jwtSecret). The endpoint is idempotent: replays for the
+// same backup_id are no-ops on the api side, so a worker restart
+// mid-batch that re-processes the same row can't double-credit.
+//
+// Failure modes (logged but not retried):
+//   - circuit.ErrOpen: api is hosed; refund skipped. The customer
+//     loses one unit of daily headroom — same as pre-fix behavior.
+//   - network / 5xx: same as above. The next manual backup the team
+//     attempts will see the (unrefunded) counter.
+//   - 4xx: refund call shape is wrong (e.g. bad JWT). Skip; an operator
+//     will see the error in slog and fix the wiring.
+func (w *CustomerBackupRunnerWorker) refundManualBackupQuota(teamID uuid.UUID, backupID string) error {
+	if w.apiBase == "" || w.jwtSecret == "" || w.apiCli == nil {
+		slog.Warn("jobs.customer_backup_runner.refund_disabled",
+			"reason", "apiBase/jwtSecret/apiCli unset",
+			"team_id", teamID.String(),
+			"backup_id", backupID,
+		)
+		return nil
+	}
+
+	url := fmt.Sprintf("%s/internal/teams/%s/backup-quota/refund", w.apiBase, teamID.String())
+	bodyBytes, _ := json.Marshal(map[string]string{"backup_id": backupID})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("build refund request: %w", err)
+	}
+	tok, tokErr := signBackupRefundJWT(w.jwtSecret, teamID.String())
+	if tokErr != nil {
+		return fmt.Errorf("sign refund jwt: %w", tokErr)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "instanode-worker/backup-refund")
+
+	resp, doErr := w.apiCli.Do(req)
+	if doErr != nil {
+		if errors.Is(doErr, circuit.ErrOpen) {
+			return fmt.Errorf("api circuit open")
+		}
+		return fmt.Errorf("api request: %w", doErr)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("api status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// signBackupRefundJWT mints the HS256 token the api's
+// /internal/teams/:id/backup-quota/refund endpoint expects. Shape
+// matches verifyInternalBackupRefundJWT on the api side:
+//
+//	purpose  — "internal_backup_refund"
+//	team_id  — the team uuid the api will compare against the path :id
+//	iat      — required, within ±60s of api-side now
+func signBackupRefundJWT(secret, teamID string) (string, error) {
+	if secret == "" {
+		return "", errors.New("empty secret")
+	}
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	now := time.Now().UTC().Unix()
+	claims := map[string]any{
+		"purpose": "internal_backup_refund",
+		"team_id": teamID,
+		"iat":     now,
+		"exp":     now + 5*60,
+	}
+	claimsJSON, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("marshal claims: %w", err)
+	}
+	body := header + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(body))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return body + "." + sig, nil
 }
