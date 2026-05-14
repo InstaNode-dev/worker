@@ -69,6 +69,27 @@ type Config struct {
 	// each tick with a WARN.
 	InstantAPIInternalURL    string // INSTANT_API_INTERNAL_URL — base URL of api (cluster-local)
 	WorkerInternalJWTSecret  string // WORKER_INTERNAL_JWT_SECRET — HS256 shared with api
+
+	// AES_KEY — 64-char hex key (32 bytes) used to decrypt
+	// resources.connection_url for the customer-backup runner. Mirrors the
+	// api's crypto.ParseAESKey/Decrypt usage. When unset the backup runner
+	// fails-open with a logged WARN per backup — backups can't run without
+	// the platform-shared key and we never want to silently dump plaintext.
+	AESKey string
+
+	// Backup-specific object-store settings. Default to the OBJECT_STORE_*
+	// values above so a single-bucket dev cluster (MinIO) works out of the
+	// box; production overrides BACKUP_S3_BUCKET to a separate, 90-day-
+	// lifecycle-policied bucket so pg_dump tarballs never mix with the
+	// /storage/new customer object data.
+	//
+	// OBJECT_STORE_BACKEND selects intent only: "minio" today, "do-spaces"
+	// post-cutover. The actual SDK path is the same minio-go client either
+	// way (DO Spaces speaks the S3 API natively) — the env var lets ops flip
+	// behavior (e.g. retention windows, bucket names) without a code change.
+	ObjectStoreBackend  string // OBJECT_STORE_BACKEND — "minio" (default) | "do-spaces"
+	BackupS3Bucket      string // BACKUP_S3_BUCKET — defaults to ObjectStoreBucket if empty
+	BackupS3PathPrefix  string // BACKUP_S3_PATH_PREFIX — defaults to "backups/"
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -130,6 +151,17 @@ func Load() *Config {
 
 		InstantAPIInternalURL:   os.Getenv("INSTANT_API_INTERNAL_URL"),
 		WorkerInternalJWTSecret: os.Getenv("WORKER_INTERNAL_JWT_SECRET"),
+
+		AESKey:             os.Getenv("AES_KEY"),
+		ObjectStoreBackend: getenv("OBJECT_STORE_BACKEND", "minio"),
+		BackupS3Bucket:     os.Getenv("BACKUP_S3_BUCKET"),
+		BackupS3PathPrefix: getenv("BACKUP_S3_PATH_PREFIX", "backups/"),
+	}
+
+	// Fall back to the shared object-store bucket when the operator hasn't
+	// carved out a dedicated backup bucket yet.
+	if cfg.BackupS3Bucket == "" {
+		cfg.BackupS3Bucket = cfg.ObjectStoreBucket
 	}
 
 	// Fall back to legacy MINIO_* names so deployments that haven't
