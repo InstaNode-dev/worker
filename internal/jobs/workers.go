@@ -355,6 +355,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// resource. Sets degraded=true on probe failure, emits state-change
 	// audit rows. Same NoopProber default.
 	river.AddWorker(workers, WithObservability(NewResourceHeartbeatWorker(db, nil), nrApp))
+	// Uptime prober (W11). Per-minute liveness probe of every public
+	// component (api, provisioner, worker, deploys, marketing). Writes
+	// one uptime_samples row per component per tick. Consumed by the
+	// api's GET /api/v1/status. See uptime_prober.go for per-probe
+	// fail-mode rationale.
+	river.AddWorker(workers, WithObservability(NewUptimeProberWorker(db), nrApp))
+	// Uptime retention sweep — daily prune of uptime_samples > 90d.
+	river.AddWorker(workers, WithObservability(NewUptimeRetentionWorker(db), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -604,6 +612,29 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(resourceHeartbeatPeriodicInterval(cfg.Environment)),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return ResourceHeartbeatArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Uptime prober (W11) — every minute, writes one uptime_samples
+		// row per component. Routed to the reconcile queue so a default-
+		// queue backlog (weekly_digest fan-out) can't starve the status
+		// page during exactly the moment we want it to be honest.
+		// RunOnStart=true so a worker restart immediately writes a row
+		// for "we are up RIGHT NOW".
+		river.NewPeriodicJob(
+			river.PeriodicInterval(uptimeProberInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return UptimeProberArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Uptime retention sweep — daily prune of uptime_samples > 90d.
+		// RunOnStart=false: a restart shouldn't immediately scan; wait
+		// for the next 24h slot.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(24*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return UptimeRetentionArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
