@@ -298,6 +298,13 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// WORKER_INTERNAL_JWT_SECRET isn't set. See magic_link_reconciler.go
 	// for the per-row outcome contract and the 3-attempt cap.
 	river.AddWorker(workers, WithObservability(NewMagicLinkReconcilerWorker(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil), nrApp))
+	// Pending-deletion expirer (Wave FIX-I, api migration 044). Every
+	// 60s, flips pending_deletions rows past their TTL to status=
+	// 'expired' so the per-resource dedup index clears and the next
+	// DELETE on the same resource can mint a fresh email. Local SQL
+	// only — no api round-trip, so no JWT-signing needed. See
+	// pending_deletion_expirer.go.
+	river.AddWorker(workers, WithObservability(NewPendingDeletionExpirerWorker(db), nrApp))
 	// Customer-backup pipeline — three workers, two cron schedules.
 	//
 	//   scheduler (every hour)  — inserts pending resource_backups rows for
@@ -528,6 +535,18 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(magicLinkReconcilerInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return MagicLinkReconcilerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Pending-deletion expirer (Wave FIX-I, api migration 044) —
+		// every 60s. RunOnStart=true so a worker restart immediately
+		// vacates the dedup index for any rows that overshot their TTL
+		// while we were down. Same starvation-protection queue as the
+		// other reconcilers.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(pendingDeletionExpirerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PendingDeletionExpirerArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
