@@ -92,6 +92,24 @@ func (dailyAt3UTCSchedule) Next(t time.Time) time.Time {
 	return next
 }
 
+// dailyAt2UTCSchedule implements river.PeriodicSchedule for every day 02:00 UTC.
+// Used by PlatformDBBackupWorker. 02:00 UTC is one hour earlier than the
+// ChurnPredictor's 03:00 slot — both run during the same global off-peak
+// band but the backup gets first crack at the DB so a slow scan can't
+// be queued behind the churn sweep on the same single-pod worker.
+// Concurrency between pods is handled by the advisory lock inside the
+// worker, not by the cron offset.
+type dailyAt2UTCSchedule struct{}
+
+func (dailyAt2UTCSchedule) Next(t time.Time) time.Time {
+	t = t.UTC()
+	next := time.Date(t.Year(), t.Month(), t.Day(), 2, 0, 0, 0, time.UTC)
+	if !next.After(t) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
 // StartWorkers initialises and starts the River background worker pool.
 // It registers all job workers and schedules periodic jobs.
 //
@@ -277,6 +295,33 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewCustomerBackupSchedulerWorker(db), nrApp))
 	river.AddWorker(workers, WithObservability(NewCustomerBackupRunner(db, backupStore, cfg.BackupS3Bucket, cfg.BackupS3PathPrefix, cfg.AESKey), nrApp))
 	river.AddWorker(workers, WithObservability(NewCustomerRestoreRunner(db, backupStore, cfg.BackupS3Bucket, cfg.AESKey), nrApp))
+
+	// Platform-DB backup — nightly 02:00 UTC pg_dump of the platform DB to
+	// S3 (DO Spaces today). Closes the "if instant_platform is lost, the
+	// platform is unrecoverable" gap. See platform_db_backup.go for the
+	// retention / locking / audit contract. If OBJECT_STORE_* is unset the
+	// worker is constructed in disabled mode and logs at WARN each tick;
+	// see Work's S3==nil branch.
+	var backupS3 s3Client
+	if cfg.ObjectStoreEndpoint != "" {
+		c, err := NewBackupS3Client(cfg.ObjectStoreEndpoint, cfg.ObjectStoreAccessKey, cfg.ObjectStoreSecretKey)
+		if err != nil {
+			slog.Warn("jobs.workers.backup_s3_init_failed",
+				"error", err,
+				"note", "platform_db_backup will run in disabled mode until OBJECT_STORE_* env vars resolve",
+			)
+		} else {
+			backupS3 = c
+		}
+	}
+	river.AddWorker(workers, WithObservability(NewPlatformDBBackupWorker(PlatformDBBackupConfig{
+		DB:          db,
+		DatabaseURL: cfg.DatabaseURL,
+		S3:          backupS3,
+		Bucket:      cfg.BackupS3Bucket,
+		OuterPrefix: cfg.BackupS3PathPrefix,
+		InnerPrefix: cfg.PlatformBackupS3Prefix,
+	}), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -489,6 +534,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 				return CustomerRestoreRunnerArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Platform-DB backup — runs daily at 02:00 UTC. RunOnStart=false:
+		// a worker restart should not trigger an immediate dump (the
+		// previous successful run is still within the NR "< 26h" KPI
+		// window) — wait for the next scheduled 02:00 slot. The advisory
+		// lock inside the worker guards against a multi-pod cluster
+		// running concurrent dumps if all pods happen to wake on the
+		// same second.
+		river.NewPeriodicJob(
+			dailyAt2UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PlatformDBBackupArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
 		),
 	}
 
