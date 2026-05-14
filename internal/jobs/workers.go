@@ -231,6 +231,23 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// reactivation email via the configured provider. See
 	// churn_predictor.go for the activity-kind / dedupe rationale.
 	river.AddWorker(workers, WithObservability(NewChurnPredictorWorker(db), nrApp))
+	// Deploy-notify webhook dispatcher — drains deploy.* audit_log rows
+	// into per-team customer-configured webhook URLs. Forward-compat:
+	// no-op when no team has a DEPLOY_NOTIFY_WEBHOOK_URL vault entry.
+	// See deploy_notify_webhook.go for the SSRF / retry / cursor design.
+	river.AddWorker(workers, WithObservability(NewDeployNotifyWebhookWorker(db, rdb, nil), nrApp))
+	// Payment grace reminder — every 6h, emit payment.grace_reminder
+	// audit rows for teams in active dunning whose last_reminder_at is
+	// null or >6h ago. The event-email forwarder above drains those
+	// rows into the configured email provider's reminder template.
+	// See payment_grace_reminder.go.
+	river.AddWorker(workers, WithObservability(NewPaymentGraceReminderWorker(db), nrApp))
+	// Payment grace terminator — every 1h, POST to the api's
+	// /internal/teams/:id/terminate for teams whose grace expired.
+	// Misconfig-tolerant: short-circuits with a WARN when
+	// INSTANT_API_INTERNAL_URL or WORKER_INTERNAL_JWT_SECRET is unset.
+	// See payment_grace_terminator.go.
+	river.AddWorker(workers, WithObservability(NewPaymentGraceTerminatorWorker(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -373,6 +390,37 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 				return ChurnPredictorArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Deploy-notify webhook dispatcher — every 30s, drain
+		// deploy.* audit_log rows to customer webhook URLs. On
+		// the reconcile queue so a backlog on the default queue
+		// (weekly_digest, etc.) cannot starve it.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(deployNotifyWebhookInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeployNotifyWebhookArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Payment grace reminder — every 6h. RunOnStart=false: a
+		// restart shouldn't immediately re-fire reminders that the
+		// previous instance just sent.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(paymentGraceReminderInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PaymentGraceReminderArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Payment grace terminator — every 1h. RunOnStart=true so
+		// a worker restart immediately catches any rows whose clock
+		// expired while we were down.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(paymentGraceTerminatorInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PaymentGraceTerminatorArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 	}
 

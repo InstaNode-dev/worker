@@ -61,6 +61,14 @@ type Config struct {
 	MinioRootPassword string
 	MinioBucketName   string
 	KubeNamespaceApps string // KUBE_NAMESPACE_APPS — stack namespace prefix (default: "instant-apps")
+
+	// Internal worker → api authenticated callbacks. The
+	// PaymentGraceTerminatorWorker uses these to POST
+	// /internal/teams/:id/terminate against the api repo. Both must be
+	// set for the terminator to act — otherwise the job short-circuits
+	// each tick with a WARN.
+	InstantAPIInternalURL    string // INSTANT_API_INTERNAL_URL — base URL of api (cluster-local)
+	WorkerInternalJWTSecret  string // WORKER_INTERNAL_JWT_SECRET — HS256 shared with api
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -119,6 +127,9 @@ func Load() *Config {
 		MinioRootPassword: os.Getenv("MINIO_ROOT_PASSWORD"),
 		MinioBucketName:   getenv("MINIO_BUCKET_NAME", "instant-shared"),
 		KubeNamespaceApps: getenv("KUBE_NAMESPACE_APPS", "instant-apps"),
+
+		InstantAPIInternalURL:   os.Getenv("INSTANT_API_INTERNAL_URL"),
+		WorkerInternalJWTSecret: os.Getenv("WORKER_INTERNAL_JWT_SECRET"),
 	}
 
 	// Fall back to legacy MINIO_* names so deployments that haven't
