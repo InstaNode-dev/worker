@@ -323,6 +323,37 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		InnerPrefix: cfg.PlatformBackupS3Prefix,
 	}), nrApp))
 
+	// Team deletion executor — daily 03:00 UTC. Completes the GDPR
+	// right-to-be-forgotten lifecycle for any team that called
+	// DELETE /api/v1/team more than 30 days ago. Runs AFTER the
+	// platform-db-backup job at 02:00 UTC so today's tombstoned data is
+	// still in tonight's backup before destruction. minioScanner is reused
+	// as the S3 backup deleter — both the bytes-scanner and the deleter
+	// need the same minioObjectLister surface against the shared bucket,
+	// so we hand a deletion-flavoured wrapper into the executor. When the
+	// scanner is nil (CI / docker-compose, no OBJECT_STORE_* env vars) the
+	// executor skips S3 destruction and continues with the rest of the
+	// pipeline. See team_deletion_executor.go for the per-step contract.
+	var s3Deleter S3BackupDeleter
+	if minioScanner != nil {
+		// minioStorageScanner.client implements the minio-go RemoveObjects
+		// + ListObjects surface defined by S3BackupDeleter. We expose it
+		// via a tiny adapter rather than asserting on a private field so
+		// the executor never depends on the scanner's internals. The
+		// scanner is held as the MinIOStorageScanner interface for the
+		// bytes-scanning worker; the deleter adapter needs the concrete
+		// *minioStorageScanner so we narrow with a type assertion that
+		// is always true in production (the only constructor returns
+		// the concrete type).
+		if concrete, ok := minioScanner.(*minioStorageScanner); ok {
+			s3Deleter = newMinIOBackupDeleter(concrete)
+		}
+	}
+	river.AddWorker(workers, WithObservability(
+		NewTeamDeletionExecutorWorker(db, provClient, s3Deleter, cfg.ObjectStoreBucket),
+		nrApp,
+	))
+
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
 			river.PeriodicInterval(1*time.Hour),
@@ -546,6 +577,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			dailyAt2UTCSchedule{},
 			func() (river.JobArgs, *river.InsertOpts) {
 				return PlatformDBBackupArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Team deletion executor — runs daily at 03:00 UTC, after the
+		// platform-DB backup at 02:00 UTC (so today's tombstoned data
+		// IS captured in tonight's backup before destruction).
+		// RunOnStart=false: a worker restart should NOT immediately tear
+		// down customer data — wait for the next 03:00 slot so the run
+		// happens during quiet hours and the operator has a chance to
+		// notice anything anomalous in the logs first.
+		river.NewPeriodicJob(
+			dailyAt3UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				return TeamDeletionExecutorArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
