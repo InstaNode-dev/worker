@@ -289,6 +289,15 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// fail-open posture as PaymentGraceTerminator. See
 	// github_deploy_dispatcher.go for the per-step contract.
 	river.AddWorker(workers, WithObservability(NewGitHubDeployDispatcher(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret), nrApp))
+	// Magic-link reconciler (post 2026-05-14 RESEND_API_KEY=CHANGE_ME
+	// outage). Every 60s, drains magic_links rows stuck at
+	// email_send_status IN ('pending', 'send_failed') inside the 15-min
+	// TTL window and POSTs each row id to the api's
+	// /internal/email/resend-magic-link. Fail-open: WARNs and
+	// short-circuits when INSTANT_API_INTERNAL_URL or
+	// WORKER_INTERNAL_JWT_SECRET isn't set. See magic_link_reconciler.go
+	// for the per-row outcome contract and the 3-attempt cap.
+	river.AddWorker(workers, WithObservability(NewMagicLinkReconcilerWorker(db, cfg.InstantAPIInternalURL, cfg.WorkerInternalJWTSecret, nil), nrApp))
 	// Customer-backup pipeline — three workers, two cron schedules.
 	//
 	//   scheduler (every hour)  — inserts pending resource_backups rows for
@@ -505,6 +514,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(githubDispatcherInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return GitHubDeployDispatcherArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Magic-link reconciler — every 60s. RunOnStart=true so a worker
+		// restart immediately drains rows whose first send failed while
+		// the worker was down (we have a 15-min TTL window to retry, so
+		// the cost of a full sweep at boot is small). Routed to the
+		// reconcile queue so a weekly_digest fan-out on the default
+		// queue can't starve magic-link reliability — auth being slow is
+		// the most visible reliability surface this platform has.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(magicLinkReconcilerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return MagicLinkReconcilerArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
