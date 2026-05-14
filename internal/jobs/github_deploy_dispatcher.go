@@ -46,6 +46,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/riverqueue/river"
+	"instant.dev/worker/internal/apiclient"
+	"instant.dev/worker/internal/circuit"
 )
 
 const (
@@ -87,10 +89,17 @@ func (GitHubDeployDispatcherArgs) Kind() string { return "github_deploy_dispatch
 
 // GitHubDeployDispatcher drains pending_github_deploys rows and triggers a
 // redeploy on the linked api deployment.
+//
+// apiCli is the circuit-breaker-wrapped HTTP client used for postRedeploy
+// calls. Both httpClient (for the GitHub tarball fetch) and apiCli (for
+// the api redeploy POST) share the same Timeout; only the api side is
+// breaker-gated because that's the dependency that can go down and trap
+// the worker in a retry storm.
 type GitHubDeployDispatcher struct {
 	river.WorkerDefaults[GitHubDeployDispatcherArgs]
 	db          *sql.DB
 	httpClient  *http.Client
+	apiCli      *apiclient.Client
 	apiBaseURL  string // api/internal/handlers — POST /deploy/:appID/redeploy lives here
 	internalJWT string // worker's signed bearer for the api's internal endpoints
 }
@@ -102,11 +111,13 @@ type GitHubDeployDispatcher struct {
 // each tick so a CI / docker-compose environment that doesn't set them
 // keeps running.
 func NewGitHubDeployDispatcher(db *sql.DB, apiBaseURL, internalJWT string) *GitHubDeployDispatcher {
+	httpClient := &http.Client{Timeout: githubTarballTimeout}
 	return &GitHubDeployDispatcher{
 		db:          db,
 		apiBaseURL:  apiBaseURL,
 		internalJWT: internalJWT,
-		httpClient:  &http.Client{Timeout: githubTarballTimeout},
+		httpClient:  httpClient,
+		apiCli:      apiclient.New(httpClient),
 	}
 }
 
@@ -282,7 +293,9 @@ func (w *GitHubDeployDispatcher) fetchTarball(ctx context.Context, url string) (
 }
 
 // postRedeploy POSTs the tarball to /deploy/:appID/redeploy with the
-// worker's internal JWT.
+// worker's internal JWT. Wrapped by the worker→api circuit breaker via
+// apiCli — when the api is hosed the breaker short-circuits and the
+// caller's "leave row queued; next tick re-tries" branch fires.
 func (w *GitHubDeployDispatcher) postRedeploy(ctx context.Context, appIDSlug string, tarball []byte) error {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -304,8 +317,25 @@ func (w *GitHubDeployDispatcher) postRedeploy(ctx context.Context, appIDSlug str
 	req.Header.Set("Authorization", "Bearer "+w.internalJWT)
 	req.Header.Set("User-Agent", "instanode-worker/github-dispatcher")
 
-	resp, err := w.httpClient.Do(req)
+	cli := w.apiCli
+	if cli == nil {
+		// Test paths that build the dispatcher as a struct literal still
+		// get the raw http.Client — but log a structured WARN so a
+		// production miswire doesn't silently bypass the breaker.
+		slog.Warn("github_deploy_dispatcher.no_apiclient",
+			"note", "constructing apiclient inline — production should use NewGitHubDeployDispatcher",
+		)
+		cli = apiclient.New(w.httpClient)
+		w.apiCli = cli
+	}
+	resp, err := cli.Do(req)
 	if err != nil {
+		if errors.Is(err, circuit.ErrOpen) {
+			slog.Warn("github_deploy_dispatcher.api_circuit_open",
+				"app_id", appIDSlug,
+				"note", "leaving row queued; next tick will retry",
+			)
+		}
 		return err
 	}
 	defer resp.Body.Close()
