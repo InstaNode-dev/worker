@@ -226,13 +226,29 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 		// (loops_event_mapping.go::buildResourceExpiring). The
 		// resource_id field is also the dedupe key the next sweep's
 		// NOT IN subquery joins on, so it must be a parseable uuid.
+		//
+		// 2026-05-15: token_prefix / upgrade_url / resource_url were
+		// added so the Go-rendered email body (renderAnonExpiryEmail,
+		// shared with the anon expiry path) has the values it needs
+		// to fill the Type/Token/Expires panel and the upgrade /
+		// resource-detail CTAs. The previous Brevo dashboard template
+		// referenced these but the worker wasn't emitting them, so the
+		// rendered email had empty cells. token_prefix is the first 8
+		// chars of the resource token (uuid.UUID is always 36 chars
+		// so the min() is defensive — protects against future schema
+		// changes where token isn't a uuid).
+		tokenStr := r.token.String()
+		tokenPrefix := tokenStr[:min(8, len(tokenStr))]
 		meta := map[string]any{
 			"resource_id":     r.resourceID.String(),
 			"resource_type":   r.resourceType,
 			"expires_at":      r.expiresAt.UTC().Format(time.RFC3339),
 			"hours_remaining": hoursRemaining,
 			"email":           r.ownerEmail.String,
-			"token":           r.token.String(),
+			"token":           tokenStr,
+			"token_prefix":    tokenPrefix,
+			"upgrade_url":     "https://instanode.dev/app/billing?upgrade=hobby&source=resource_expiry_imminent",
+			"resource_url":    "https://instanode.dev/app/resources/" + r.resourceID.String(),
 		}
 		metaBytes, mErr := json.Marshal(meta)
 		if mErr != nil {
