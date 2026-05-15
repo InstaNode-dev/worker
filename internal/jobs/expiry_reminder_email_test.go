@@ -148,6 +148,71 @@ func TestEventEmailBodyRenderers_RegistersAnonExpiryWarning(t *testing.T) {
 	}
 }
 
+// TestEventEmailBodyRenderers_CoversBothExpiryKinds locks in the
+// 2026-05-15 follow-up fix: the broken Brevo dashboard template_id=6
+// was wired to BOTH anon.expiry_warning AND resource.expiry_imminent.
+// The first fix only registered the renderer for anon — the
+// authenticated paid path still routed through the broken template
+// and the user received the broken email at 04:12 UTC.
+//
+// This test FAILS on the post-first-fix master (only one kind
+// registered) and PASSES after the second fix registers both kinds.
+// Fail-fast in CI if anyone adds a third expiry kind and forgets to
+// register a renderer.
+func TestEventEmailBodyRenderers_CoversBothExpiryKinds(t *testing.T) {
+	for _, kind := range []string{"anon.expiry_warning", "resource.expiry_imminent"} {
+		if _, ok := eventEmailBodyRenderers[kind]; !ok {
+			t.Errorf("eventEmailBodyRenderers missing renderer for %q — email would route through Brevo template_id and lose all the new params", kind)
+		}
+	}
+}
+
+// TestBuildResourceExpiring_EmitsAllRendererParams asserts the paid
+// expiry builder emits every key the shared renderer reads. Caught the
+// production bug where buildResourceExpiring emitted only three keys
+// (resource_type / expires_at / hours_remaining) and the renderer's
+// Type/Token/Expires panel rendered empty cells.
+func TestBuildResourceExpiring_EmitsAllRendererParams(t *testing.T) {
+	row := auditRow{
+		ID:           "x",
+		TeamID:       "t",
+		Kind:         auditKindResourceExpiryImminent,
+		ResourceType: "postgres",
+		OwnerEmail:   "test@example.com",
+		Metadata: []byte(`{
+			"hours_remaining":"4",
+			"expires_at":"2026-05-16T00:00:00Z",
+			"resource_id":"abc-123",
+			"token_prefix":"abc12345",
+			"upgrade_url":"https://instanode.dev/app/billing?upgrade=hobby",
+			"resource_url":"https://instanode.dev/app/resources/abc-123"
+		}`),
+	}
+	params, ok := buildResourceExpiring(row)
+	if !ok {
+		t.Fatal("buildResourceExpiring returned ok=false unexpectedly")
+	}
+	for _, k := range []string{
+		"resource_type",
+		"hours_remaining",
+		"expires_at",
+		"reminder_index",
+		"token_prefix",
+		"upgrade_url",
+		"resource_url",
+	} {
+		if params[k] == "" {
+			t.Errorf("buildResourceExpiring must emit non-empty %q; got params=%v", k, params)
+		}
+	}
+	// reminder_index must pin to "1" (paid path is single-fire — no
+	// stage cadence) so the subject reads "Heads up", not "Reminder"
+	// or "Final reminder".
+	if params["reminder_index"] != "1" {
+		t.Errorf("reminder_index = %q; want \"1\" (paid path is single-fire)", params["reminder_index"])
+	}
+}
+
 // TestRenderAnonExpiryEmail_NeverSaysSixHoursWhenItsNot is a guard
 // against the regression that prompted this whole change: the old
 // template hardcoded "6 hours" in the subject regardless of the actual

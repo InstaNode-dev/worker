@@ -200,11 +200,21 @@ type eventEmailBodyRenderer func(params map[string]string) (subject, html, text 
 //
 // Currently registered (2026-05-15):
 //
-//   anon.expiry_warning — replaces a broken Brevo dashboard template
+//   anon.expiry_warning      — replaces a broken Brevo dashboard template
 //     (hardcoded "6 hours" subject, empty body fields).
 //     Renderer: renderAnonExpiryEmail in expiry_reminder_email.go.
+//
+//   resource.expiry_imminent — same broken template (template_id=6) was
+//     also wired for the paid/authenticated expiry path. Both audit kinds
+//     fired for the same recipient on 2026-05-15 04:12 UTC and the
+//     authenticated email was the broken one. Reuses renderAnonExpiryEmail
+//     because the payload shape is identical (resource_type, hours_remaining,
+//     expires_at, token_prefix, upgrade_url, resource_url) — see the
+//     buildResourceExpiring/expire_imminent.go changes that emit the
+//     matching params.
 var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
-	auditKindAnonExpiryWarning: renderAnonExpiryEmail,
+	auditKindAnonExpiryWarning:      renderAnonExpiryEmail,
+	auditKindResourceExpiryImminent: renderAnonExpiryEmail,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
@@ -334,11 +344,27 @@ func buildResourceExpiring(row auditRow) (map[string]string, bool) {
 	}
 	meta := decodeMeta(row.Metadata)
 	params := baseParams(row)
+	params["audit_kind"] = row.Kind
 	if row.ResourceType != "" {
 		params["resource_type"] = row.ResourceType
 	}
 	copyMetaStr(params, meta, "expires_at", "expires_at")
 	copyMetaStr(params, meta, "hours_remaining", "hours_remaining")
+	// 2026-05-15 — the paid expiry path now shares the Go renderer
+	// (renderAnonExpiryEmail) with the anon path. There is no multi-stage
+	// reminder cadence for paid/authenticated resources (single-fire), but
+	// the renderer reads reminder_index to decide between "Heads up" /
+	// "Reminder" / "Final reminder" subject prefixes — pin to "1" so paid
+	// emails read as "Heads up — your instanode <type> expires in Nh".
+	// Also surface resource_id / token_prefix / upgrade_url / resource_url
+	// so the body's Type/Token/Expires panel and CTA links render correctly
+	// (the previous Brevo dashboard template referenced these but the
+	// worker wasn't sending them — rendering empty cells in production).
+	params["reminder_index"] = "1"
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "token_prefix", "token_prefix")
+	copyMetaStr(params, meta, "upgrade_url", "upgrade_url")
+	copyMetaStr(params, meta, "resource_url", "resource_url")
 	return params, true
 }
 
