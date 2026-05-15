@@ -159,6 +159,8 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		Brevo: email.BrevoConfig{
 			APIKey:      cfg.BrevoAPIKey,
 			TemplateIDs: cfg.BrevoTemplateIDs,
+			SenderEmail: cfg.BrevoSenderEmail,
+			SenderName:  cfg.BrevoSenderName,
 		},
 		SES: email.SESConfig{
 			AWSRegion:     cfg.SESAWSRegion,

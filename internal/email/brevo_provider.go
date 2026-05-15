@@ -76,7 +76,31 @@ const (
 type BrevoConfig struct {
 	APIKey      string
 	TemplateIDs map[string]int
+
+	// SenderEmail / SenderName are the "From:" identity used by the
+	// raw-render path (EventEmail.HTMLBody non-empty). The dashboard-
+	// template path ignores these because Brevo's template editor has
+	// its own sender field. Both come from env at boot:
+	//   BREVO_SENDER_EMAIL — defaults to noreply@instanode.dev
+	//   BREVO_SENDER_NAME  — defaults to "instanode"
+	//
+	// They live in code-controlled config (not the Brevo dashboard) so a
+	// rendered email cannot silently inherit a personal email left in
+	// the dashboard sender field. The defaults are intentionally
+	// production-safe — a worker that boots with the secret absent
+	// still sends from noreply@instanode.dev, not someone's gmail.
+	SenderEmail string
+	SenderName  string
 }
+
+// Default sender identity used when BREVO_SENDER_EMAIL / BREVO_SENDER_NAME
+// are absent from BrevoConfig. Kept here (not in config.Load) so a test
+// or in-process caller that constructs BrevoConfig directly gets the
+// same safe defaults the production code path uses.
+const (
+	defaultBrevoSenderEmail = "noreply@instanode.dev"
+	defaultBrevoSenderName  = "instanode"
+)
 
 // BrevoProvider is the live implementation. Constructed once at boot via
 // NewBrevoProvider and reused across every forwarder tick. http.Client
@@ -88,6 +112,13 @@ type BrevoProvider struct {
 	// url is overridable so tests can point at an httptest.Server. Always
 	// brevoSendURL in production.
 	url string
+
+	// senderEmail / senderName are the From identity for the raw-render
+	// path (EventEmail.HTMLBody non-empty). The template path leaves
+	// these unused — Brevo's template carries its own sender. Both are
+	// populated by NewBrevoProvider from BrevoConfig (with defaults).
+	senderEmail string
+	senderName  string
 }
 
 // NewBrevoProvider validates BrevoConfig and returns the live provider.
@@ -106,11 +137,21 @@ func NewBrevoProvider(cfg BrevoConfig) (*BrevoProvider, error) {
 	if tmpls == nil {
 		tmpls = map[string]int{}
 	}
+	senderEmail := cfg.SenderEmail
+	if senderEmail == "" {
+		senderEmail = defaultBrevoSenderEmail
+	}
+	senderName := cfg.SenderName
+	if senderName == "" {
+		senderName = defaultBrevoSenderName
+	}
 	return &BrevoProvider{
-		apiKey:    cfg.APIKey,
-		templates: tmpls,
-		httpc:     &http.Client{Timeout: brevoHTTPTimeout},
-		url:       brevoSendURL,
+		apiKey:      cfg.APIKey,
+		templates:   tmpls,
+		httpc:       &http.Client{Timeout: brevoHTTPTimeout},
+		url:         brevoSendURL,
+		senderEmail: senderEmail,
+		senderName:  senderName,
 	}, nil
 }
 
@@ -134,10 +175,62 @@ type brevoSendRequest struct {
 	Params     map[string]string `json:"params,omitempty"`
 }
 
-// SendEvent implements EmailProvider.SendEvent. Maps EventEmail.Kind to a
-// Brevo templateId via p.templates, builds the JSON body, POSTs, and
-// classifies the response per the table at the top of this file.
+// brevoSender mirrors the Brevo `sender` object used by the raw-HTML
+// path. Brevo accepts {"email": "...", "name": "..."}; the template path
+// doesn't send this object because the template carries its own sender.
+type brevoSender struct {
+	Email string `json:"email"`
+	Name  string `json:"name,omitempty"`
+}
+
+// brevoRawSendRequest is the wire payload for the raw-HTML path. Used
+// when EventEmail.HTMLBody is non-empty — we send subject + htmlContent +
+// textContent + sender directly and DO NOT include templateId. This
+// bypasses the Brevo dashboard template entirely so the email body is
+// fully controlled by Go code at deploy time.
+type brevoRawSendRequest struct {
+	To          []brevoRecipient `json:"to"`
+	Sender      brevoSender      `json:"sender"`
+	Subject     string           `json:"subject"`
+	HTMLContent string           `json:"htmlContent"`
+	TextContent string           `json:"textContent,omitempty"`
+}
+
+// SendEvent implements EmailProvider.SendEvent. Two paths:
+//
+//  1. Raw-render path (preferred for new kinds) — when EventEmail.HTMLBody
+//     is non-empty, we send Subject + HTMLBody + TextBody + Sender directly.
+//     The template id is NOT consulted; p.templates can lack an entry for
+//     this Kind without producing SkippedNoTemplate. This is the path used
+//     for "anon.expiry_warning" so the email body is controlled entirely
+//     by worker code (no out-of-band Brevo dashboard edit required).
+//
+//  2. Template path (legacy / dashboard-controlled) — when HTMLBody is
+//     empty, look up EventEmail.Kind in p.templates and POST with
+//     templateId + params. Kinds with no entry produce SkippedNoTemplate.
+//
+// Both paths classify the HTTP response identically per the table at the
+// top of this file.
 func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
+	if evt.Recipient == "" {
+		// Defensive — the forwarder filters orphan rows before reaching
+		// here, but a future caller path might not. Permanent because
+		// the row will never sprout an email retroactively. Checked
+		// before the template lookup so a raw-render event with empty
+		// recipient short-circuits the same way.
+		return &SendError{
+			Class:   SendClassPermanent,
+			Message: "brevo: empty recipient",
+		}
+	}
+
+	// Raw-render path takes precedence — explicit HTML body means the
+	// caller already rendered the email and wants us to send those bytes
+	// verbatim. We do NOT consult p.templates in this branch.
+	if evt.HTMLBody != "" {
+		return p.sendRaw(ctx, evt)
+	}
+
 	tmplID, ok := p.templates[evt.Kind]
 	if !ok {
 		// Operator hasn't mapped this kind to a Brevo template yet —
@@ -146,16 +239,6 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 		return &SendError{
 			Class:   SendClassSkippedNoTemplate,
 			Message: fmt.Sprintf("brevo: no template configured for kind %q", evt.Kind),
-		}
-	}
-
-	if evt.Recipient == "" {
-		// Defensive — the forwarder filters orphan rows before reaching
-		// here, but a future caller path might not. Permanent because
-		// the row will never sprout an email retroactively.
-		return &SendError{
-			Class:   SendClassPermanent,
-			Message: "brevo: empty recipient",
 		}
 	}
 
@@ -193,12 +276,88 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 		req.Header.Set(headerIdempotency, evt.IdempotencyKey)
 	}
 
+	return p.doRequest(ctx, evt, body, brevoSendPathTemplate, tmplID)
+}
+
+// brevoSendPath enumerates which SendEvent branch we took, used only for
+// log labels so an operator can tell "we sent via template id 6" from
+// "we sent the rendered HTML" at a glance.
+type brevoSendPath string
+
+const (
+	brevoSendPathTemplate brevoSendPath = "template"
+	brevoSendPathRaw      brevoSendPath = "raw_html"
+)
+
+// sendRaw is the raw-HTML send path. The caller (typically a per-kind
+// builder) has already rendered the subject + html + plain-text body in
+// Go; we POST them verbatim with the configured sender identity. The
+// dashboard-template path is bypassed entirely — Brevo just relays the
+// bytes. This is how anon.expiry_warning escapes the broken dashboard
+// template that hardcoded "6 hours" and rendered empty fields.
+func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
+	if evt.Subject == "" {
+		// Subject is mandatory in the raw path — a Brevo POST with an
+		// empty subject string still delivers, but the recipient sees
+		// "(no subject)" which is its own bug. Permanent so we advance
+		// past the row; the caller is supposed to render a subject.
+		slog.Error("email.brevo.raw_missing_subject",
+			"kind", evt.Kind,
+			"recipient", evt.Recipient,
+		)
+		return &SendError{
+			Class:   SendClassPermanent,
+			Message: "brevo: raw send missing subject",
+		}
+	}
+	body, err := json.Marshal(brevoRawSendRequest{
+		To:          []brevoRecipient{{Email: evt.Recipient, Name: evt.RecipientName}},
+		Sender:      brevoSender{Email: p.senderEmail, Name: p.senderName},
+		Subject:     evt.Subject,
+		HTMLContent: evt.HTMLBody,
+		TextContent: evt.TextBody,
+	})
+	if err != nil {
+		slog.Error("email.brevo.raw_marshal_failed",
+			"kind", evt.Kind,
+			"recipient", evt.Recipient,
+			"error", err,
+		)
+		return &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: raw marshal"}
+	}
+	return p.doRequest(ctx, evt, body, brevoSendPathRaw, 0)
+}
+
+// doRequest is the shared HTTP send + response classify path used by
+// both template and raw branches. Identical wire-level behavior — the
+// only difference is the log label and the absence of a template id in
+// the raw path.
+func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []byte, path brevoSendPath, tmplID int) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(body))
+	if err != nil {
+		// Request construction failure is almost certainly a malformed URL —
+		// a programming bug. Transient so the operator sees it on every tick
+		// until they fix it, instead of advancing past silently.
+		slog.Error("email.brevo.request_build_failed",
+			"kind", evt.Kind,
+			"path", string(path),
+			"error", err,
+		)
+		return &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: build request"}
+	}
+	req.Header.Set(headerAPIKey, p.apiKey)
+	req.Header.Set(headerContentType, contentTypeJSON)
+	if evt.IdempotencyKey != "" {
+		req.Header.Set(headerIdempotency, evt.IdempotencyKey)
+	}
+
 	resp, err := p.httpc.Do(req)
 	if err != nil {
 		// Network error, timeout, dns failure. Transient by definition.
 		slog.Warn("email.brevo.http_failed",
 			"kind", evt.Kind,
 			"recipient", evt.Recipient,
+			"path", string(path),
 			"error", err,
 		)
 		return &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: http"}
@@ -212,6 +371,7 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 			"kind", evt.Kind,
 			"recipient", evt.Recipient,
 			"status", resp.StatusCode,
+			"path", string(path),
 			"template_id", tmplID,
 		)
 		return nil
@@ -225,6 +385,7 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 			"kind", evt.Kind,
 			"recipient", evt.Recipient,
 			"status", resp.StatusCode,
+			"path", string(path),
 			"body", string(respBody),
 		)
 		return &SendError{
@@ -238,6 +399,7 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 			"kind", evt.Kind,
 			"recipient", evt.Recipient,
 			"status", resp.StatusCode,
+			"path", string(path),
 			"body", string(respBody),
 		)
 		return &SendError{

@@ -33,6 +33,14 @@ type Config struct {
 	EmailProvider    string         // EMAIL_PROVIDER
 	BrevoAPIKey      string         // BREVO_API_KEY
 	BrevoTemplateIDs map[string]int // BREVO_TEMPLATE_IDS (JSON object: audit_log.kind → numeric template id)
+	// Sender identity for the raw-HTML send path (EventEmail.HTMLBody non-empty).
+	// Defaults are applied inside email.NewBrevoProvider — env unset is safe.
+	//   BREVO_SENDER_EMAIL — defaults to noreply@instanode.dev
+	//   BREVO_SENDER_NAME  — defaults to "instanode"
+	// These exist as code-controlled config so a rendered email cannot inherit
+	// a personal address left in the Brevo dashboard sender field.
+	BrevoSenderEmail string // BREVO_SENDER_EMAIL
+	BrevoSenderName  string // BREVO_SENDER_NAME
 
 	// SES_* env vars — populated only when EMAIL_PROVIDER=ses. SES_AWS_*
 	// names are scoped (not bare AWS_*) so they can't be confused with
@@ -138,6 +146,8 @@ func Load() *Config {
 		EmailProvider:     os.Getenv("EMAIL_PROVIDER"),
 		BrevoAPIKey:       os.Getenv("BREVO_API_KEY"),
 		BrevoTemplateIDs:  parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
+		BrevoSenderEmail:  os.Getenv("BREVO_SENDER_EMAIL"),
+		BrevoSenderName:   os.Getenv("BREVO_SENDER_NAME"),
 		SESAWSRegion:      os.Getenv("SES_AWS_REGION"),
 		SESAWSAccessKey:   os.Getenv("SES_AWS_ACCESS_KEY_ID"),
 		SESAWSSecretKey:   os.Getenv("SES_AWS_SECRET_ACCESS_KEY"),
