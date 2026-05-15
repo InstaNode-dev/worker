@@ -193,28 +193,56 @@ var _ = []string{
 // image and one deploy.
 type eventEmailBodyRenderer func(params map[string]string) (subject, html, text string)
 
-// eventEmailBodyRenderers maps an audit_log.kind to an optional Go
-// renderer. Kinds absent from this map use the legacy dashboard-template
-// path (templateId + params). Adding a kind here = remove its
-// dashboard-template dependency.
+// eventEmailBodyRenderers maps an audit_log.kind to a Go renderer.
 //
-// Currently registered (2026-05-15):
+// AS OF 2026-05-15 (THIRD REGRESSION FIX): EVERY email-sending audit
+// kind is registered here. NO kind falls through to the legacy
+// dashboard-template path anymore. The Brevo template path in
+// brevo_provider.go is left intact as dead fallback code only — the
+// registry-iterating test TestEveryEmailKindHasAGoRenderer asserts that
+// every kind in eventEmailBuilders has an entry here, so a 19th kind
+// added without a renderer fails CI rather than shipping a broken email.
 //
-//   anon.expiry_warning      — replaces a broken Brevo dashboard template
-//     (hardcoded "6 hours" subject, empty body fields).
-//     Renderer: renderAnonExpiryEmail in expiry_reminder_email.go.
+// Why this map had to grow from 2 → 18: the dashboard-template path was
+// the root cause of three consecutive production regressions. Multiple
+// distinct kinds (near_quota_wall, the deploy/deletion lifecycle kinds,
+// digest.weekly, ...) were all wired — via BREVO_TEMPLATE_IDS — to the
+// SAME Brevo template id 6, whose body hardcodes "Your resource expires
+// in 6 hours" with empty Type/Token/Expires placeholders. A
+// near_quota_wall email therefore arrived as a broken expiry email
+// (production log: kind=near_quota_wall path=template template_id=6).
+// The first two fixes patched only anon.expiry_warning and
+// resource.expiry_imminent. This entry covers ALL the rest.
 //
-//   resource.expiry_imminent — same broken template (template_id=6) was
-//     also wired for the paid/authenticated expiry path. Both audit kinds
-//     fired for the same recipient on 2026-05-15 04:12 UTC and the
-//     authenticated email was the broken one. Reuses renderAnonExpiryEmail
-//     because the payload shape is identical (resource_type, hours_remaining,
-//     expires_at, token_prefix, upgrade_url, resource_url) — see the
-//     buildResourceExpiring/expire_imminent.go changes that emit the
-//     matching params.
+//   anon.expiry_warning / resource.expiry_imminent — renderAnonExpiryEmail
+//     (expiry_reminder_email.go). Identical payload shape.
+//   every other kind — a dedicated renderer in lifecycle_emails.go.
 var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
+	// Expiry kinds — shared renderer (identical payload shape).
 	auditKindAnonExpiryWarning:      renderAnonExpiryEmail,
 	auditKindResourceExpiryImminent: renderAnonExpiryEmail,
+	// Onboarding + subscription lifecycle.
+	auditKindOnboardingClaimed:      renderOnboardingClaimed,
+	auditKindSubscriptionUpgraded:   renderTierUpgraded,
+	auditKindSubscriptionDowngraded: renderTierDowngraded,
+	auditKindSubscriptionCanceled:   renderSubscriptionCanceled,
+	// Quota nudge — the kind that triggered the third regression.
+	auditKindNearQuotaWall: renderNearQuotaWall,
+	// Experiment / admin / churn.
+	auditKindExperimentConversion: renderExperimentConversion,
+	auditKindAdminTierChanged:     renderAdminTierChanged,
+	auditKindAdminPromoIssued:     renderPromoCodeReceived,
+	auditKindChurnRiskFlagged:     renderChurnRiskFlagged,
+	// Deploy TTL lifecycle.
+	auditKindDeployExpiringSoon:  renderDeployExpiringSoon,
+	auditKindDeployExpired:       renderDeployExpired,
+	auditKindDeployMadePermanent: renderDeployMadePermanent,
+	// Deploy deletion lifecycle.
+	auditKindDeployDeletionConfirmed: renderDeployDeletionConfirmed,
+	auditKindDeployDeletionCancelled: renderDeployDeletionCancelled,
+	auditKindDeployDeletionExpired:   renderDeployDeletionExpired,
+	// Weekly digest.
+	auditKindDigestWeekly: renderDigestWeekly,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
