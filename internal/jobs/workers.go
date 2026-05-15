@@ -15,6 +15,7 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
+	commonv1 "instant.dev/proto/common/v1"
 	"instant.dev/worker/internal/config"
 	"instant.dev/worker/internal/email"
 	"instant.dev/worker/internal/provisioner"
@@ -64,6 +65,27 @@ func (w *Workers) Stop() {
 type scheduleFunc func(time.Time) time.Time
 
 func (f scheduleFunc) Next(t time.Time) time.Time { return f(t) }
+
+// entitlementRegraderAdapter bridges *provisioner.Client onto the
+// entitlementRegrader interface the EntitlementReconcilerWorker depends on.
+// The provisioner client returns provisioner.RegradeResult; the jobs package
+// defines its own regradeOutcome so the worker's unit tests don't have to
+// import the provisioner package. This adapter does the field-for-field copy.
+type entitlementRegraderAdapter struct {
+	client *provisioner.Client
+}
+
+func (a entitlementRegraderAdapter) RegradeResource(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType, tier, requestID string) (regradeOutcome, error) {
+	res, err := a.client.RegradeResource(ctx, token, providerResourceID, resType, tier, requestID)
+	if err != nil {
+		return regradeOutcome{}, err
+	}
+	return regradeOutcome{
+		Applied:          res.Applied,
+		AppliedConnLimit: res.AppliedConnLimit,
+		SkipReason:       res.SkipReason,
+	}, nil
+}
 
 // mondayAt8UTCSchedule implements river.PeriodicSchedule for every Monday 08:00 UTC.
 type mondayAt8UTCSchedule struct{}
@@ -422,6 +444,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewUptimeProberWorker(db), nrApp))
 	// Uptime retention sweep — daily prune of uptime_samples > 90d.
 	river.AddWorker(workers, WithObservability(NewUptimeRetentionWorker(db), nrApp))
+	// Entitlement reconciler — detects "upgrade drift" (a postgres resource
+	// whose tier was bumped on plan upgrade but whose actual connection cap
+	// was never re-applied) and fixes it via the provisioner RegradeResource
+	// RPC. The regrader is nil when PROVISIONER_ADDR is unset — the worker
+	// then WARN-noops each tick (fail-open). See entitlement_reconciler.go.
+	var entitlementRegrader entitlementRegrader
+	if provClient != nil {
+		entitlementRegrader = entitlementRegraderAdapter{client: provClient}
+	}
+	river.AddWorker(workers, WithObservability(NewEntitlementReconcilerWorker(db, planRegistry, entitlementRegrader), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -749,6 +781,19 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 				return UptimeRetentionArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Entitlement reconciler — cadence from ENTITLEMENT_RECONCILE_INTERVAL
+		// (Go duration string; default 5m). Detects + fixes upgrade drift on
+		// postgres connection caps. Routed to the reconcile queue so a
+		// default-queue fan-out can't starve it. RunOnStart=true so a worker
+		// restart immediately re-checks any resources that were upgraded
+		// while the worker was down.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(EntitlementReconcileInterval()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return EntitlementReconcilerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 	}
 
