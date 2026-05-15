@@ -38,7 +38,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_REPO: ghcr.io/mastermanas805/instant-worker
+  IMAGE_REPO: ghcr.io/instanode-dev/instant-worker
   K8S_NAMESPACE: instant-infra
   K8S_DEPLOYMENT: instant-worker
   K8S_CONTAINER: worker
