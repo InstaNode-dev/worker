@@ -62,6 +62,39 @@ func (c *Client) StorageBytes(ctx context.Context, token, providerResourceID str
 	return resp.StorageBytes, nil
 }
 
+// RegradeResult is the worker-facing projection of provisionerv1.RegradeResponse.
+type RegradeResult struct {
+	Applied          bool
+	AppliedConnLimit int32
+	SkipReason       string
+}
+
+// RegradeResource re-applies the entitled connection cap for a resource at the
+// given tier. Used by the entitlement reconciler to fix "upgrade drift" — a
+// resource whose tier was bumped on plan upgrade but whose actual Postgres
+// connection cap was never re-applied to the database.
+//
+// requestID is an idempotency token the provisioner echoes/uses for dedup.
+func (c *Client) RegradeResource(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType, tier, requestID string) (RegradeResult, error) {
+	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), 30*time.Second)
+	defer cancel()
+	resp, err := c.grpc.RegradeResource(ctx, &provisionerv1.RegradeRequest{
+		Token:              token,
+		ProviderResourceId: providerResourceID,
+		ResourceType:       resType,
+		Tier:               tier,
+		RequestId:          requestID,
+	})
+	if err != nil {
+		return RegradeResult{}, fmt.Errorf("provisioner.RegradeResource: %w", err)
+	}
+	return RegradeResult{
+		Applied:          resp.Applied,
+		AppliedConnLimit: resp.AppliedConnLimit,
+		SkipReason:       resp.SkipReason,
+	}, nil
+}
+
 // DeprovisionResource removes a provisioned resource.
 func (c *Client) DeprovisionResource(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType) error {
 	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), 30*time.Second)
