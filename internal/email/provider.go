@@ -61,12 +61,36 @@ type EmailProvider interface {
 //     stringified so providers don't need to negotiate JSON types.
 //   - IdempotencyKey is "audit-<row-id>" — providers that support dedupe
 //     headers MUST set this to that header.
+//
+//   - Subject / HTMLBody / TextBody are the "raw render" path. When the
+//     caller (the per-kind builder, in practice) renders the email body
+//     itself in Go and stuffs the HTML + plain-text + subject into these
+//     fields, the provider MUST send those bytes verbatim instead of
+//     looking up a dashboard-configured template by Kind. All three are
+//     optional and default-empty; the provider takes the raw path only
+//     when HTMLBody is non-empty.
+//
+//     Rationale: the dashboard-template path was a footgun for kinds
+//     where the template body referenced params that the worker wasn't
+//     yet sending — the email rendered with empty fields and a hardcoded
+//     subject. By rendering in code we keep one source of truth and one
+//     deploy cycle (no out-of-band Brevo-dashboard edits required).
+//     Existing kinds that work fine via template id keep working
+//     unchanged: leave Subject / HTMLBody / TextBody empty and the
+//     provider falls back to the legacy template-id path.
 type EventEmail struct {
 	Kind           string
 	Recipient      string
 	RecipientName  string
 	Params         map[string]string
 	IdempotencyKey string
+
+	// Raw-render path — see comment above. Optional. If HTMLBody is
+	// non-empty the provider sends Subject + HTMLBody + TextBody
+	// directly and does NOT look up a template id by Kind.
+	Subject  string
+	HTMLBody string
+	TextBody string
 }
 
 // SendClass categorises a SendError so the forwarder can decide whether

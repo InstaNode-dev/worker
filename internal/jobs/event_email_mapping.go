@@ -178,6 +178,35 @@ var _ = []string{
 	auditKindTeamSettingsChanged,
 }
 
+// eventEmailBodyRenderer turns a per-row params map into the (subject,
+// HTML body, plain-text body) triple that the BrevoProvider sends
+// verbatim via the raw-HTML path. Kinds registered in
+// eventEmailBodyRenderers below take this path instead of the
+// dashboard-template lookup.
+//
+// Why bother: a dashboard-controlled template body lets a Brevo operator
+// drift out of sync with the params the worker emits — the production
+// bug that triggered this refactor was a template that hardcoded "6
+// hours" in the subject and referenced fields the worker didn't send,
+// rendering empty Type / Token / Expires cells in the body. By rendering
+// in Go, both the params and the body ship together in one worker
+// image and one deploy.
+type eventEmailBodyRenderer func(params map[string]string) (subject, html, text string)
+
+// eventEmailBodyRenderers maps an audit_log.kind to an optional Go
+// renderer. Kinds absent from this map use the legacy dashboard-template
+// path (templateId + params). Adding a kind here = remove its
+// dashboard-template dependency.
+//
+// Currently registered (2026-05-15):
+//
+//   anon.expiry_warning — replaces a broken Brevo dashboard template
+//     (hardcoded "6 hours" subject, empty body fields).
+//     Renderer: renderAnonExpiryEmail in expiry_reminder_email.go.
+var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
+	auditKindAnonExpiryWarning: renderAnonExpiryEmail,
+}
+
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
 // the Params for an EventEmail. Keep this in sync with supportedAuditKinds
 // — the test TestEventEmail_AllSupportedKindsHaveBuilder enforces that.

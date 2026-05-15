@@ -269,3 +269,141 @@ func TestBrevoProvider_NoIdempotencyKey_OmitsHeader(t *testing.T) {
 		t.Errorf("X-Mailin-Custom = %q on empty IdempotencyKey; want '' (header omitted)", rr.idempotency)
 	}
 }
+
+// TestBrevoProvider_RawHTMLPath_UsesSubjectHTMLSender exercises the
+// raw-HTML send path: when EventEmail.HTMLBody is non-empty the provider
+// MUST send {sender, subject, htmlContent, textContent} and NOT include
+// a templateId. The dashboard-template path is bypassed entirely. This
+// is the fix for the "anon.expiry_warning" broken dashboard template.
+func TestBrevoProvider_RawHTMLPath_UsesSubjectHTMLSender(t *testing.T) {
+	srv, rr := fakeBrevo(t, http.StatusOK)
+	// Deliberately empty template map — raw path must NOT consult it.
+	p, err := NewBrevoProvider(BrevoConfig{
+		APIKey:      "test-key",
+		TemplateIDs: map[string]int{}, // empty on purpose
+		SenderEmail: "noreply@instanode.dev",
+		SenderName:  "instanode",
+	})
+	if err != nil {
+		t.Fatalf("NewBrevoProvider: %v", err)
+	}
+	p.url = srv.URL
+
+	err = p.SendEvent(context.Background(), EventEmail{
+		Kind:           "anon.expiry_warning",
+		Recipient:      "u@example.com",
+		RecipientName:  "U",
+		IdempotencyKey: "audit-xyz",
+		Subject:        "Heads up — your instanode postgres expires in 12h",
+		HTMLBody:       "<p>hello</p>",
+		TextBody:       "hello",
+		// Params is set but the raw path should NOT use it as a template
+		// substitution map (the body is already rendered).
+		Params: map[string]string{"hours_remaining": "12"},
+	})
+	if err != nil {
+		t.Fatalf("SendEvent (raw) returned %v; want nil", err)
+	}
+	if rr.method != http.MethodPost {
+		t.Errorf("method = %s; want POST", rr.method)
+	}
+	if rr.idempotency != "audit-xyz" {
+		t.Errorf("X-Mailin-Custom = %q; want audit-xyz", rr.idempotency)
+	}
+
+	// Parse the body into a generic map — the raw payload should have
+	// htmlContent, subject, sender; it should NOT have templateId.
+	var got map[string]interface{}
+	if err := json.Unmarshal(rr.body, &got); err != nil {
+		t.Fatalf("unmarshal body: %v; raw=%q", err, rr.body)
+	}
+	if _, hasTemplateID := got["templateId"]; hasTemplateID {
+		t.Errorf("raw path sent templateId; want omitted (raw render must not consult templates). body=%s", string(rr.body))
+	}
+	if subj, _ := got["subject"].(string); subj != "Heads up — your instanode postgres expires in 12h" {
+		t.Errorf("subject = %q; want subject from EventEmail.Subject", subj)
+	}
+	if hc, _ := got["htmlContent"].(string); hc != "<p>hello</p>" {
+		t.Errorf("htmlContent = %q; want '<p>hello</p>'", hc)
+	}
+	if tc, _ := got["textContent"].(string); tc != "hello" {
+		t.Errorf("textContent = %q; want 'hello'", tc)
+	}
+	sender, _ := got["sender"].(map[string]interface{})
+	if sender == nil {
+		t.Fatalf("sender object missing from raw payload: %s", string(rr.body))
+	}
+	if e, _ := sender["email"].(string); e != "noreply@instanode.dev" {
+		t.Errorf("sender.email = %q; want noreply@instanode.dev (raw path must not inherit dashboard sender)", e)
+	}
+	if n, _ := sender["name"].(string); n != "instanode" {
+		t.Errorf("sender.name = %q; want instanode", n)
+	}
+}
+
+// TestBrevoProvider_RawHTMLPath_DefaultSender — when BREVO_SENDER_EMAIL
+// is unset (empty BrevoConfig.SenderEmail), the raw path MUST still send
+// from noreply@instanode.dev, never from an empty string. The whole
+// point of the env-var defaults is that a misconfigured worker cannot
+// silently inherit a personal email from the Brevo dashboard.
+func TestBrevoProvider_RawHTMLPath_DefaultSender(t *testing.T) {
+	srv, rr := fakeBrevo(t, http.StatusOK)
+	p, err := NewBrevoProvider(BrevoConfig{APIKey: "k"}) // no SenderEmail / SenderName
+	if err != nil {
+		t.Fatalf("NewBrevoProvider: %v", err)
+	}
+	p.url = srv.URL
+	if err := p.SendEvent(context.Background(), EventEmail{
+		Kind:      "anon.expiry_warning",
+		Recipient: "u@example.com",
+		Subject:   "S",
+		HTMLBody:  "<p>x</p>",
+	}); err != nil {
+		t.Fatalf("SendEvent: %v", err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(rr.body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sender, _ := got["sender"].(map[string]interface{})
+	if e, _ := sender["email"].(string); e != "noreply@instanode.dev" {
+		t.Errorf("default sender.email = %q; want noreply@instanode.dev (env unset must NOT yield empty sender)", e)
+	}
+}
+
+// TestBrevoProvider_RawHTMLPath_EmptySubject_ReturnsPermanent — a raw send
+// with an HTML body but no Subject is a programmer bug (the renderer
+// should always produce one). We must advance the cursor, not loop.
+func TestBrevoProvider_RawHTMLPath_EmptySubject_ReturnsPermanent(t *testing.T) {
+	srv, _ := fakeBrevo(t, http.StatusOK)
+	p := newTestProvider(t, srv, nil)
+	err := p.SendEvent(context.Background(), EventEmail{
+		Kind:      "anon.expiry_warning",
+		Recipient: "u@example.com",
+		Subject:   "", // bug — should never happen
+		HTMLBody:  "<p>x</p>",
+	})
+	var se *SendError
+	if !errors.As(err, &se) || se.Class != SendClassPermanent {
+		t.Errorf("empty subject in raw path → %v; want SendClassPermanent (advance cursor on programmer bug)", err)
+	}
+}
+
+// TestBrevoProvider_RawHTMLPath_BypassesMissingTemplate — when HTMLBody is
+// set, the provider must NOT fall through to SkippedNoTemplate even if
+// the kind has no template id in the map. The raw path is independent
+// of the template map entirely.
+func TestBrevoProvider_RawHTMLPath_BypassesMissingTemplate(t *testing.T) {
+	srv, _ := fakeBrevo(t, http.StatusOK)
+	// Map only knows about a different kind — the kind we send is unmapped.
+	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 99})
+	err := p.SendEvent(context.Background(), EventEmail{
+		Kind:      "anon.expiry_warning", // not in map
+		Recipient: "u@example.com",
+		Subject:   "S",
+		HTMLBody:  "<p>x</p>",
+	})
+	if err != nil {
+		t.Errorf("raw send with unmapped kind = %v; want nil (raw bypasses template map)", err)
+	}
+}

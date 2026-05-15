@@ -389,6 +389,22 @@ batchLoop:
 			Params:         params,
 			IdempotencyKey: eventEmailIdempotencyPrefix + row.ID,
 		}
+		// Per-kind Go-rendered body decoration. When the kind has a
+		// registered renderer the forwarder fills Subject/HTMLBody/TextBody
+		// and the provider takes the raw-HTML path (no dashboard template
+		// lookup). Kinds without a renderer fall through unchanged —
+		// they continue to use the Brevo template id mapping.
+		//
+		// Registered today (2026-05-15):
+		//   anon.expiry_warning — fixes the broken dashboard template
+		//     (hardcoded "6 hours" subject, empty Type/Token/Expires
+		//     fields). See expiry_reminder_email.go.
+		if renderer, ok := eventEmailBodyRenderers[row.Kind]; ok {
+			subject, htmlBody, textBody := renderer(params)
+			evt.Subject = subject
+			evt.HTMLBody = htmlBody
+			evt.TextBody = textBody
+		}
 		sendErr := w.provider.SendEvent(ctx, evt)
 		class := email.ClassOf(sendErr)
 		switch {
