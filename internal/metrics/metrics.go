@@ -77,4 +77,28 @@ var (
 		Name: "instant_deploy_reminders_sent_total",
 		Help: "Deploy expiry reminder emails dispatched successfully.",
 	})
+
+	// EntitlementDriftDetectedTotal counts postgres resources the
+	// entitlement reconciler found with a connection cap that no longer
+	// matches their team's plan tier (applied_conn_limit IS NULL or != entitled).
+	EntitlementDriftDetectedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_entitlement_drift_detected_total",
+		Help: "Postgres resources found drifted from their plan's entitled connection cap.",
+	})
+
+	// EntitlementRegradedTotal counts resources successfully re-graded —
+	// the provisioner returned applied=true and the row's applied_conn_limit
+	// was updated to the entitled value.
+	EntitlementRegradedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_entitlement_regraded_total",
+		Help: "Drifted resources successfully re-graded by the entitlement reconciler.",
+	})
+
+	// EntitlementRegradeFailedTotal counts resources the reconciler tried to
+	// re-grade but could not — a gRPC error or a provisioner-side skip
+	// (applied=false). The row is left for the next sweep.
+	EntitlementRegradeFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_entitlement_regrade_failed_total",
+		Help: "Drifted resources the reconciler failed to re-grade (gRPC error or provisioner skip).",
+	})
 )
