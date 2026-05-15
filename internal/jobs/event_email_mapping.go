@@ -548,5 +548,16 @@ func buildAnonExpiryWarning(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "resource_id", "resource_id")
 	copyMetaStr(params, meta, "hours_remaining", "hours_remaining")
 	copyMetaStr(params, meta, "expires_at", "expires_at")
+	// 2026-05-15 multi-stage rework: the worker now writes reminder_index
+	// (1/2/3), stage_label, token_prefix, upgrade_url, and resource_url.
+	// Template body should read {{ params.hours_remaining }} (NOT hardcode
+	// a number), branch on reminder_index for the subject line ("First /
+	// Second / Final reminder"), and surface upgrade_url + resource_url as
+	// CTAs. token_prefix identifies the resource without leaking the secret.
+	copyMetaStr(params, meta, "reminder_index", "reminder_index")
+	copyMetaStr(params, meta, "stage_label", "stage_label")
+	copyMetaStr(params, meta, "token_prefix", "token_prefix")
+	copyMetaStr(params, meta, "upgrade_url", "upgrade_url")
+	copyMetaStr(params, meta, "resource_url", "resource_url")
 	return params, true
 }
