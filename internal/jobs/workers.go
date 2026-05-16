@@ -271,7 +271,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// Resend) and dedupe surface (audit_log subquery vs resources column)
 	// are independent. See expire_imminent.go for the full SCOPE NOTE.
 	river.AddWorker(workers, WithObservability(NewExpireImminentWorker(db), nrApp))
-	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorker(db, planRegistry), nrApp))
+	// Build the infra revoker for storage-quota suspend/unsuspend.
+	// All three credentials are optional — when absent the revoker is nil
+	// and only the status row is flipped (fail-open per CLAUDE.md #1).
+	var storageRevoker ResourceInfraRevoker
+	if cfg.CustomerDatabaseURL != "" || cfg.MongoAdminURI != "" || cfg.CustomerRedisURL != "" {
+		storageRevoker = NewDirectResourceRevoker(cfg.CustomerDatabaseURL, cfg.MongoAdminURI, cfg.CustomerRedisURL)
+	}
+	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorker(db, planRegistry, storageRevoker), nrApp))
 	river.AddWorker(workers, WithObservability(NewUpdateStorageBytesWorker(db, provClient, minioScanner), nrApp))
 	// Quota-wall nudge — Track U1. Periodic scan that writes a single
 	// near_quota_wall audit row per team per 24h when any axis (storage,
