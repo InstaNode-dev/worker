@@ -80,8 +80,8 @@ type Config struct {
 	// /internal/teams/:id/terminate against the api repo. Both must be
 	// set for the terminator to act — otherwise the job short-circuits
 	// each tick with a WARN.
-	InstantAPIInternalURL    string // INSTANT_API_INTERNAL_URL — base URL of api (cluster-local)
-	WorkerInternalJWTSecret  string // WORKER_INTERNAL_JWT_SECRET — HS256 shared with api
+	InstantAPIInternalURL   string // INSTANT_API_INTERNAL_URL — base URL of api (cluster-local)
+	WorkerInternalJWTSecret string // WORKER_INTERNAL_JWT_SECRET — HS256 shared with api
 
 	// AES_KEY — 64-char hex key (32 bytes) used to decrypt
 	// resources.connection_url for the customer-backup runner AND the real
@@ -110,6 +110,24 @@ type Config struct {
 	// every platform dump in chronological order" without filtering customer
 	// data.
 	PlatformBackupS3Prefix string // PLATFORM_BACKUP_S3_PREFIX (default: "platform-backups/")
+
+	// Storage-quota enforcement: infra revoke/grant on suspend/unsuspend (P0-3/P0-4 fix).
+	// These mirror the api's config for the same operations — the worker
+	// needs direct access to customer infrastructure to revoke connections
+	// (ACL SETUSER off / REVOKE CONNECT / revokeRolesFromUser) when a
+	// resource exceeds its storage quota and to re-grant on auto-unsuspend.
+	//
+	// All three are optional — when absent the worker skips the infra-revoke
+	// step (fail-open) and only flips the status row. The row flip still
+	// gates the user's provisioning API calls; the infra revoke terminates
+	// live TCP connections.
+	//
+	// CUSTOMER_DATABASE_URL — admin DSN for shared Postgres cluster.
+	// MONGO_ADMIN_URI       — admin URI for shared MongoDB cluster.
+	// CUSTOMER_REDIS_URL    — admin Redis URL for shared Redis cluster.
+	CustomerDatabaseURL string // CUSTOMER_DATABASE_URL
+	MongoAdminURI       string // MONGO_ADMIN_URI
+	CustomerRedisURL    string // CUSTOMER_REDIS_URL
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -188,6 +206,13 @@ func Load() *Config {
 		// with a YYYY-MM-DD path segment yields well-formed S3 keys without
 		// the producer needing to know whether the parent ends in a slash.
 		PlatformBackupS3Prefix: getenv("PLATFORM_BACKUP_S3_PREFIX", "platform-backups/"),
+
+		// Storage-quota suspend/unsuspend infra credentials (P0-3/P0-4 fix).
+		// All three are optional — when absent the infra-revoke step is
+		// skipped (fail-open) and only the status row is updated.
+		CustomerDatabaseURL: os.Getenv("CUSTOMER_DATABASE_URL"),
+		MongoAdminURI:       os.Getenv("MONGO_ADMIN_URI"),
+		CustomerRedisURL:    os.Getenv("CUSTOMER_REDIS_URL"),
 	}
 
 	// Fall back to the shared object-store bucket when the operator hasn't
@@ -222,6 +247,9 @@ func Load() *Config {
 		"ses_from_set", cfg.SESFromEmail != "",
 		"ses_template_count", len(cfg.SESTemplateNames),
 		"aes_key_set", cfg.AESKey != "",
+		"customer_db_set", cfg.CustomerDatabaseURL != "",
+		"mongo_admin_set", cfg.MongoAdminURI != "",
+		"customer_redis_set", cfg.CustomerRedisURL != "",
 	)
 	return cfg
 }
@@ -229,7 +257,7 @@ func Load() *Config {
 // parseBrevoTemplateIDs decodes the BREVO_TEMPLATE_IDS env var. The expected
 // shape is a JSON object mapping audit_log.kind → numeric Brevo template id:
 //
-//   BREVO_TEMPLATE_IDS='{"subscription.upgraded": 12, "near_quota_wall": 7}'
+//	BREVO_TEMPLATE_IDS='{"subscription.upgraded": 12, "near_quota_wall": 7}'
 //
 // Empty string returns an empty map (Brevo will then SkipNoTemplate on every
 // send — operator opted into "API key set, no templates yet"). A malformed
@@ -255,7 +283,7 @@ func parseBrevoTemplateIDs(raw string) map[string]int {
 // shape is a JSON object mapping audit_log.kind → SES template name (string,
 // not numeric — SES references templates by name unlike Brevo):
 //
-//   SES_TEMPLATE_NAMES='{"subscription.upgraded": "tier-upgraded-v1", "near_quota_wall": "quota-wall-nudge-v1"}'
+//	SES_TEMPLATE_NAMES='{"subscription.upgraded": "tier-upgraded-v1", "near_quota_wall": "quota-wall-nudge-v1"}'
 //
 // Empty string returns an empty map (SES will then SkipNoTemplate on every
 // send — operator opted into "AWS creds set, no templates yet"). A malformed
