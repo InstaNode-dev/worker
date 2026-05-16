@@ -154,6 +154,11 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 // Queue/NATS now provisions dedicated pods (k8s backend) so it needs deprovisioning
 // just like postgres/redis/mongo. Webhook + storage stay UNSPECIFIED — they don't
 // have a per-resource pod (webhook is API-receiver only; storage is bucket-isolated).
+//
+// "vector": pgvector resources share the Postgres backend (db_<token>/usr_<token>).
+// Mapping to RESOURCE_TYPE_POSTGRES lets the provisioner DROP DATABASE / DROP USER
+// on TTL expiry — same cleanup path as a plain postgres resource. Without this mapping,
+// expired vector resources would leave orphaned Postgres databases and users forever.
 func expireResourceTypeToProto(resourceType string) commonv1.ResourceType {
 	switch resourceType {
 	case "postgres":
@@ -164,6 +169,9 @@ func expireResourceTypeToProto(resourceType string) commonv1.ResourceType {
 		return commonv1.ResourceType_RESOURCE_TYPE_MONGODB
 	case "queue":
 		return commonv1.ResourceType_RESOURCE_TYPE_QUEUE
+	case "vector":
+		// pgvector-on-Postgres: underlying DB/user cleanup is identical to postgres.
+		return commonv1.ResourceType_RESOURCE_TYPE_POSTGRES
 	default:
 		return commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED
 	}
