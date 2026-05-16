@@ -388,14 +388,9 @@ func TestRedisA4_SweepCallsRegradeWithRedisType(t *testing.T) {
 	}
 }
 
-// TestRedisA4_SharedBackendResource_NotInSweep verifies that the SQL query
-// filters out resources without the 'instant-customer-' prefix. This is
-// enforced at the DB query level (LIKE 'instant-customer-%') so this test
-// confirms that the sqlmock only returns k8s-prefixed rows.
-//
-// A shared-backend Redis resource (provider_resource_id NULL or unrelated)
-// cannot appear in the sweep because the WHERE clause excludes it. This test
-// seeds ONLY a k8s row and asserts the regrader is called exactly once.
+// TestRedisA4_OnlyK8sResourcesSwept verifies that a k8s-backed Redis resource
+// (prid = "instant-customer-<tok>") is swept and produces exactly one
+// RegradeResource call, passing the prid as-is (prefix present, use directly).
 func TestRedisA4_OnlyK8sResourcesSwept(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -405,8 +400,6 @@ func TestRedisA4_OnlyK8sResourcesSwept(t *testing.T) {
 
 	id1 := uuid.New()
 
-	// Only a k8s-backed Redis resource in the result set (the WHERE clause
-	// in the real DB filters shared resources; sqlmock simulates that outcome).
 	redisRows := sqlmock.NewRows(redisSweepCols).
 		AddRow(id1, "tok-pro", "instant-customer-tok-pro", "pro", "pro")
 
@@ -423,6 +416,116 @@ func TestRedisA4_OnlyK8sResourcesSwept(t *testing.T) {
 	if got := int(stub.calls.Load()); got != 1 {
 		t.Errorf("RegradeResource called %d times, want 1 (only k8s pod)", got)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestRedisA4_NullPRID_SweptViaToken is the regression guard for the A4 rekey fix.
+//
+// Bug: the original sweep filtered on provider_resource_id LIKE 'instant-customer-%'.
+// In prod, 100% of Redis resources have provider_resource_id = NULL, so redis_checked
+// was always 0. Fix: remove the LIKE filter; pass the token as the ns identifier so
+// the provisioner constructs "instant-customer-<token>" itself.
+//
+// This test seeds a Redis row with provider_resource_id = NULL (the modal prod case)
+// and asserts:
+//  1. The row IS swept (regrader called once, not zero).
+//  2. The identifier passed to RegradeResource is the bare token (not NULL / "<nil>").
+//     The provisioner will prepend "instant-customer-" server-side.
+func TestRedisA4_NullPRID_SweptViaToken(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	const tok = "d986dbc6-59bd-4459-9db9-2d66751f78f5" // mirrors the prod token in the bug report
+
+	// NULL provider_resource_id — the modal prod case.
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, tok, nil, "pro", "pro")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)
+
+	type capturedCall struct {
+		token string
+		prid  string
+	}
+	var captured capturedCall
+	capturingRegrader := &funcRegrader{fn: func(_ context.Context, token, prid string, _ commonv1.ResourceType, _, _ string) (regradeOutcome, error) {
+		captured = capturedCall{token: token, prid: prid}
+		return regradeOutcome{Applied: true, AppliedConnLimit: 512}, nil
+	}}
+
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, capturingRegrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	// The regrader must have been called exactly once — not zero (the old bug).
+	if captured.token == "" {
+		t.Fatal("NULL prid redis resource was NOT swept — redis_checked:0 bug is back")
+	}
+
+	// Token should be the resource token.
+	if captured.token != tok {
+		t.Errorf("captured token=%q, want %q", captured.token, tok)
+	}
+
+	// The identifier passed to RegradeResource should be the bare token
+	// (not empty string, not "<nil>"). The provisioner constructs the namespace.
+	if captured.prid != tok {
+		t.Errorf("captured prid=%q, want bare token %q — provisioner derives namespace from it",
+			captured.prid, tok)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestRedisA4_PrefixedPRID_PassedAsIs verifies that a row whose prid already
+// carries the "instant-customer-" prefix (legacy rows with prid set) is passed
+// through unchanged — the prefix is not doubled.
+func TestRedisA4_PrefixedPRID_PassedAsIs(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	const tok = "abc123"
+	const prid = "instant-customer-abc123"
+
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, tok, prid, "hobby", "hobby")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)
+
+	var capturedPRID string
+	capturingRegrader := &funcRegrader{fn: func(_ context.Context, _, p string, _ commonv1.ResourceType, _, _ string) (regradeOutcome, error) {
+		capturedPRID = p
+		return regradeOutcome{Applied: true, AppliedConnLimit: 50}, nil
+	}}
+
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, capturingRegrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	if capturedPRID != prid {
+		t.Errorf("prid=%q, want %q — prefix must not be doubled", capturedPRID, prid)
+	}
+
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
