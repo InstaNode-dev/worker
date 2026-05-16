@@ -473,12 +473,31 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// WrapFetcherWithBreaker adds the worker-local circuit breaker so a Razorpay
 	// outage aborts the tick cleanly instead of burning 100 × 10s timeouts.
 	//
-	// TODO(P1-Wave4): wire a real subscriptionFetcher that calls the Razorpay
-	// SDK directly once github.com/razorpay/razorpay-go is added to the
-	// worker's go.mod. For now noopSubFetcher short-circuits each tick with a
-	// WARN, which is safe and gives the monitoring pipeline the job's heartbeat.
+	// Wire the real Razorpay SDK fetcher when RAZORPAY_KEY_ID + RAZORPAY_KEY_SECRET
+	// are set. Falls back to noopSubFetcher when credentials are absent so the
+	// worker starts cleanly in dev/test environments without Razorpay configured.
+	// WrapFetcherWithBreaker adds the circuit breaker on top of either path so a
+	// Razorpay outage aborts the tick cleanly instead of burning 100 × 10s timeouts.
 	billingBreakerInst := NewBillingReconcilerCircuitBreaker()
-	var billingFetcher subscriptionFetcher = noopSubFetcher{}
+	var billingFetcher subscriptionFetcher
+	if realFetcher, err := NewRazorpaySubFetcher(); err != nil {
+		slog.Error("billing.reconciler.fetcher_init_failed",
+			"error", err,
+			"fallback", "noopSubFetcher",
+		)
+		billingFetcher = noopSubFetcher{}
+	} else if realFetcher != nil {
+		slog.Info("billing.reconciler.fetcher_configured",
+			"fetcher", "razorpaySubFetcher",
+			"note", "real Razorpay SDK fetcher active",
+		)
+		billingFetcher = realFetcher
+	} else {
+		slog.Warn("billing.reconciler.fetcher_not_configured",
+			"note", "RAZORPAY_KEY_ID/SECRET unset — reconciler is a no-op each tick",
+		)
+		billingFetcher = noopSubFetcher{}
+	}
 	billingFetcher = WrapFetcherWithBreaker(billingFetcher, billingBreakerInst)
 	river.AddWorker(workers, WithObservability(NewBillingReconcilerWorker(db, billingFetcher, nil), nrApp))
 

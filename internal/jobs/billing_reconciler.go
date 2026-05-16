@@ -50,6 +50,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	razorpay "github.com/razorpay/razorpay-go"
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
 
@@ -311,6 +312,127 @@ var errSubFetcherNotConfigured = errors.New("billing_reconciler: Razorpay not co
 
 func (noopSubFetcher) FetchSubscriptionForReconciler(_ context.Context, _ string) (*reconcilerSubscriptionDetails, error) {
 	return nil, errSubFetcherNotConfigured
+}
+
+// ── razorpaySubFetcher — real Razorpay SDK implementation ─────────────────────
+
+// razorpaySubFetcher implements subscriptionFetcher using the Razorpay Go SDK.
+// It mirrors the logic in api/internal/razorpaybilling/portal.go:FetchSubscriptionDetails
+// but extracts only the three fields the reconciler needs: Status, PlanID, and PaidCount.
+//
+// Auth is read from RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET at construction time,
+// same as the api pod reads them from the same k8s Secret.
+//
+// The client field is an interface so tests can inject an http.RoundTripper via
+// httptest.NewServer without hitting the real Razorpay API.
+type razorpaySubFetcher struct {
+	client razorpaySDKClient
+}
+
+// razorpaySDKClient is the subset of razorpay.Client the fetcher needs.
+// Narrow interface for easy test substitution.
+type razorpaySDKClient interface {
+	FetchSubscription(subID string, queryParams map[string]interface{}, extraHeaders map[string]string) (map[string]interface{}, error)
+}
+
+// razorpayClientAdapter wraps razorpay.Client to satisfy razorpaySDKClient.
+type razorpayClientAdapter struct{ c *razorpay.Client }
+
+func (a *razorpayClientAdapter) FetchSubscription(subID string, queryParams map[string]interface{}, extraHeaders map[string]string) (map[string]interface{}, error) {
+	return a.c.Subscription.Fetch(subID, queryParams, extraHeaders)
+}
+
+// NewRazorpaySubFetcher constructs a razorpaySubFetcher that reads credentials
+// from the environment. Returns (nil, nil) when RAZORPAY_KEY_ID is unset so
+// callers can fall back to noopSubFetcher without an error.
+//
+// The returned fetcher is NOT wrapped with the circuit breaker — the caller
+// (StartWorkers / WrapFetcherWithBreaker) adds that layer.
+func NewRazorpaySubFetcher() (*razorpaySubFetcher, error) {
+	keyID := os.Getenv("RAZORPAY_KEY_ID")
+	keySecret := os.Getenv("RAZORPAY_KEY_SECRET")
+	if keyID == "" || keySecret == "" {
+		return nil, nil // unconfigured — use noop
+	}
+	c := razorpay.NewClient(keyID, keySecret)
+	return &razorpaySubFetcher{client: &razorpayClientAdapter{c: c}}, nil
+}
+
+// newRazorpaySubFetcherFromClient constructs a fetcher from a pre-built client.
+// Used in tests to inject an httptest.NewServer-backed client.
+func newRazorpaySubFetcherFromClient(c razorpaySDKClient) *razorpaySubFetcher {
+	return &razorpaySubFetcher{client: c}
+}
+
+// FetchSubscriptionForReconciler calls Razorpay GET /v1/subscriptions/{id} and
+// maps the response into reconcilerSubscriptionDetails.
+//
+// Field mapping:
+//
+//	status      → details.Status     (Razorpay string: "active", "halted", "cancelled", …)
+//	plan_id     → details.PlanID     (string, nested inside "plan" object OR at top-level)
+//	paid_count  → details.PaidCount  (integer — total successful charge cycles)
+//
+// The context deadline is respected; the underlying HTTP client uses the context.
+// Returns a non-nil error on Razorpay API failure; the caller (Work) logs and
+// continues to the next team.
+func (f *razorpaySubFetcher) FetchSubscriptionForReconciler(ctx context.Context, subscriptionID string) (*reconcilerSubscriptionDetails, error) {
+	// The Razorpay SDK does not accept a context on individual calls; honour
+	// the caller's deadline by checking it before the blocking network call.
+	// If the context is already cancelled, bail early.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	raw, err := f.client.FetchSubscription(subscriptionID, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("razorpaySubFetcher.Fetch: %w", err)
+	}
+
+	details := &reconcilerSubscriptionDetails{}
+
+	// status is the Razorpay subscription lifecycle status.
+	if s, ok := raw["status"].(string); ok {
+		details.Status = strings.ToLower(strings.TrimSpace(s))
+	}
+
+	// plan_id: Razorpay may return it at "plan_id" (top-level, webhook format)
+	// or nested under "plan" → "id" (fetch-subscription format). Handle both.
+	if planID, ok := raw["plan_id"].(string); ok && planID != "" {
+		details.PlanID = planID
+	} else if planObj, ok := raw["plan"].(map[string]interface{}); ok {
+		if id, ok := planObj["id"].(string); ok {
+			details.PlanID = id
+		}
+	}
+
+	// paid_count: total number of successful charge cycles on this subscription.
+	// Razorpay returns it as a JSON number; toInt64 handles float64/int/string.
+	details.PaidCount = razorpayToInt64(raw["paid_count"])
+
+	return details, nil
+}
+
+// razorpayToInt64 converts a Razorpay API value (JSON-decoded as interface{})
+// to int64. Mirrors the toInt64 helper in api/internal/razorpaybilling/portal.go;
+// duplicated here to avoid importing across Go module boundaries.
+func razorpayToInt64(v interface{}) int64 {
+	switch t := v.(type) {
+	case float64:
+		return int64(t)
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	case string:
+		var n int64
+		_, _ = fmt.Sscanf(t, "%d", &n)
+		return n
+	default:
+		return 0
+	}
 }
 
 // ── circuitSubFetcher — wraps a fetcher behind a circuit breaker ──────────────

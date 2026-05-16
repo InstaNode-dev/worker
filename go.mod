@@ -16,10 +16,12 @@ require (
 	github.com/minio/minio-go/v7 v7.0.90
 	github.com/newrelic/go-agent/v3 v3.43.3
 	github.com/prometheus/client_golang v1.21.0
+	github.com/razorpay/razorpay-go v1.4.0
 	github.com/redis/go-redis/v9 v9.6.1
 	github.com/riverqueue/river v0.11.4
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.11.4
 	github.com/riverqueue/river/rivertype v0.11.4
+	github.com/stretchr/testify v1.11.1
 	go.mongodb.org/mongo-driver v1.17.9
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.63.0
 	go.opentelemetry.io/otel v1.39.0
@@ -102,7 +104,6 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tinylib/msgp v1.2.5 // indirect
 	github.com/tklauser/go-sysconf v0.3.15 // indirect
 	github.com/tklauser/numcpus v0.10.0 // indirect
