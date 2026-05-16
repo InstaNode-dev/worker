@@ -159,6 +159,28 @@ func (c *k8sDeployStatusClient) GetDeployment(ctx context.Context, namespace, na
 // This mirrors api/internal/providers/compute/k8s/client.go:newClientset but
 // duplicated here so the worker module does not depend on the api module.
 func NewK8sDeployStatusClient() (deployStatusK8sProvider, error) {
+	cs, err := newDeployK8sClientset()
+	if err != nil {
+		return nil, err
+	}
+	return &k8sDeployStatusClient{cs: cs}, nil
+}
+
+// NewK8sDeployStatusClientWithAutopsy is the same as NewK8sDeployStatusClient
+// but also returns a deployAutopsyK8sProvider backed by the same underlying
+// kubernetes.Clientset. Call this in StartWorkers so both the status reconciler
+// and the autopsy capturer share a single TCP connection pool to the k8s API.
+func NewK8sDeployStatusClientWithAutopsy() (deployStatusK8sProvider, deployAutopsyK8sProvider, error) {
+	cs, err := newDeployK8sClientset()
+	if err != nil {
+		return nil, nil, err
+	}
+	return &k8sDeployStatusClient{cs: cs}, NewK8sAutopsyClient(cs), nil
+}
+
+// newDeployK8sClientset builds a kubernetes.Clientset from in-cluster config,
+// falling back to the default kubeconfig for local dev.
+func newDeployK8sClientset() (*kubernetes.Clientset, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		cfg, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
@@ -170,15 +192,16 @@ func NewK8sDeployStatusClient() (deployStatusK8sProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("k8s NewForConfig: %w", err)
 	}
-	return &k8sDeployStatusClient{cs: cs}, nil
+	return cs, nil
 }
 
 // DeployStatusReconciler is the River worker that sweeps non-terminal
 // deployments and rolls status forward from live k8s state.
 type DeployStatusReconciler struct {
 	river.WorkerDefaults[DeployStatusReconcileArgs]
-	db  *sql.DB
-	k8s deployStatusK8sProvider // may be nil — the worker then warn-logs each run
+	db         *sql.DB
+	k8s        deployStatusK8sProvider      // may be nil — the worker then warn-logs each run
+	autopsyK8s deployAutopsyK8sProvider     // may be nil — autopsy rows will use Unknown reason
 }
 
 // NewDeployStatusReconciler constructs the worker.
@@ -186,11 +209,23 @@ type DeployStatusReconciler struct {
 // Pass nil for k8sProvider in environments where the worker can't talk to
 // the cluster API. Work() will short-circuit each run with a warn log so
 // the rest of the periodic job lineup keeps functioning.
+//
+// Pass nil for autopsyK8s when the extended autopsy interface is not available;
+// the reconciler will still write Unknown-reason autopsy rows on failure transitions
+// so the api always surfaces a "failure" object on failed deployments.
 func NewDeployStatusReconciler(db *sql.DB, k8sProvider deployStatusK8sProvider) *DeployStatusReconciler {
 	return &DeployStatusReconciler{
 		db:  db,
 		k8s: k8sProvider,
 	}
+}
+
+// WithAutopsyK8s wires the extended k8s client used for failure autopsy capture.
+// Called by StartWorkers after constructing the reconciler when the cluster is
+// reachable. Not called in CI / docker-compose where k8s is absent.
+func (r *DeployStatusReconciler) WithAutopsyK8s(autopsyK8s deployAutopsyK8sProvider) *DeployStatusReconciler {
+	r.autopsyK8s = autopsyK8s
+	return r
 }
 
 // activeDeployment is the projection the reconciler reads — only the columns
@@ -279,6 +314,26 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 			"id", d.id, "provider_id", d.providerID,
 			"from", d.status, "to", newStatus)
 		transitions++
+
+		// Phase 0 — Failure Autopsy: capture a deployment_events row whenever
+		// a deployment transitions INTO the "failed" state. The api's
+		// GET /deploy/:id handler reads this row and surfaces it as the
+		// optional "failure" object in the response.
+		//
+		// We capture on EVERY transition into "failed" (not just the first)
+		// because the reconciler may see building→failed if k8s fires a
+		// ReplicaFailure condition before the pod emits its first log.
+		// The upsert is idempotent, so re-capturing overwrites the row with
+		// the latest pod state rather than accumulating duplicates.
+		//
+		// This runs synchronously in the sweep loop because the log-tail call
+		// has its own 10s timeout (k8sGetTimeout is reused per sub-call).
+		// The worst case is one 10s stall per failed pod, which is acceptable
+		// given the 30s reconcile interval and the small number of failed pods
+		// in a healthy cluster.
+		if newStatus == deployStatusFailed {
+			captureDeploymentAutopsy(ctx, w.db, d.id, d.providerID, w.autopsyK8s)
+		}
 	}
 
 	slog.Info("jobs.deploy_status_reconcile.completed",

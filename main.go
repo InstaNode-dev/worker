@@ -86,27 +86,31 @@ func main() {
 		planRegistry = commonplans.Default()
 	}
 
-	// Build the k8s client used by DeployStatusReconciler. Fails open: if
-	// neither in-cluster config nor kubeconfig is reachable (CI, docker-compose,
-	// bare-metal dev box), we pass nil and the reconciler warn-logs each tick
-	// while every other periodic job keeps running. See
+	// Build the k8s client used by DeployStatusReconciler and the new
+	// failure-autopsy capturer. Both share the same underlying
+	// kubernetes.Clientset so we get a single TCP connection pool.
+	// Fails open: if neither in-cluster config nor kubeconfig is reachable
+	// (CI, docker-compose, bare-metal dev box), we pass nil and the reconciler
+	// warn-logs each tick while every other periodic job keeps running. See
 	// worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
-	deployStatusK8s, k8sErr := jobs.NewK8sDeployStatusClient()
+	deployStatusK8s, deployAutopsyK8s, k8sErr := jobs.NewK8sDeployStatusClientWithAutopsy()
 	if k8sErr != nil {
 		slog.Warn("worker.deploy_status_k8s_client_init_failed",
 			"error", k8sErr,
 			"note", "DeployStatusReconciler will log warnings each tick; other periodic jobs unaffected")
 		deployStatusK8s = nil
+		deployAutopsyK8s = nil
 	} else {
 		slog.Info("worker.deploy_status_k8s_client_ready")
 	}
+	_ = deployAutopsyK8s // passed to StartWorkers below
 
 	// Build the BackupPlanRegistry adapter from the same *commonplans.Registry.
 	// CustomerBackupRunner reads tier→retention_days from plans.yaml via this
 	// adapter; passing nil falls back to a legacy 7-day default with a WARN.
 	backupPlans := jobs.NewBackupPlanRegistry(planRegistry)
 
-	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, backupPlans, deployStatusK8s, nrApp)
+	workers := jobs.StartWorkers(ctx, database, rdb, cfg, provClient, planRegistry, backupPlans, deployStatusK8s, deployAutopsyK8s, nrApp)
 	defer workers.Stop()
 
 	// Exit immediately if River failed to start so Kubernetes restarts the pod.
