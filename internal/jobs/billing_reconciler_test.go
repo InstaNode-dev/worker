@@ -87,6 +87,7 @@ func TestBillingReconciler_StatusActionClassMapping(t *testing.T) {
 	want := map[string]string{
 		"active":        "active",
 		"authenticated": "active",
+		"created":       "no_action",
 		"pending":       "no_action",
 		"halted":        "grace",
 		"paused":        "grace",

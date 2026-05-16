@@ -115,7 +115,8 @@ const (
 // razorpayStatusClass is the status→action decision table from design doc §2.
 var razorpayStatusClass = map[string]rzpStatusClass{
 	"active":        rzpStatusClassActive,
-	"authenticated": rzpStatusClassActive, // card authorised; first charge pending
+	"authenticated": rzpStatusClassActive,   // card authorised; first charge pending
+	"created":       rzpStatusClassNoAction, // subscription created, not yet authenticated — pre-payment, no tier change
 	"pending":       rzpStatusClassNoAction,
 	"halted":        rzpStatusClassGrace,
 	"paused":        rzpStatusClassGrace,
