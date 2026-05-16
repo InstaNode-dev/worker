@@ -140,6 +140,12 @@ func (dailyAt2UTCSchedule) Next(t time.Time) time.Time {
 // namespaces. Pass nil when the worker can't reach a cluster — the
 // reconciler logs at WARN each run and other periodic jobs keep functioning.
 // See worker/internal/jobs/deploy_status_reconcile.go for the SCOPE NOTE.
+//
+// deployAutopsyK8s is the extended k8s client used for Phase 0 failure autopsy
+// capture (pod lastState, namespace events, log tail). Pass nil when the cluster
+// is unreachable — the reconciler writes Unknown-reason autopsy rows so the api
+// always surfaces a "failure" object on failed deployments.
+//
 // backupPlanRegistry is the BackupPlanRegistry surface used by
 // CustomerBackupRunner. main.go wraps its *commonplans.Registry via
 // NewBackupPlanRegistry; this lets StartWorkers stay free of a direct
@@ -148,7 +154,7 @@ func (dailyAt2UTCSchedule) Next(t time.Time) time.Time {
 //
 // Pass nil to fall back to the legacy hardcoded 7-day retention default
 // — retentionDaysForTier WARNs in that case.
-func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, backupPlans BackupPlanRegistry, deployStatusK8s deployStatusK8sProvider, nrApp *newrelic.Application) *Workers {
+func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, backupPlans BackupPlanRegistry, deployStatusK8s deployStatusK8sProvider, deployAutopsyK8s deployAutopsyK8sProvider, nrApp *newrelic.Application) *Workers {
 	// rdb is used by LoopsEventForwarderWorker (cursor storage). Other
 	// workers access redis indirectly via the platform DB.
 
@@ -304,7 +310,12 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// status forward from live k8s Deployment state every 30s. deployStatusK8s
 	// may be nil (kubeconfig unreachable in CI / docker-compose); the worker
 	// then short-circuits with a WARN each tick. See deploy_status_reconcile.go.
-	river.AddWorker(workers, WithObservability(NewDeployStatusReconciler(db, deployStatusK8s), nrApp))
+	// deployAutopsyK8s (Phase 0) is wired via WithAutopsyK8s so failure
+	// transitions trigger an autopsy capture on the same reconcile tick.
+	// Pass nil for deployAutopsyK8s → Unknown-reason autopsy rows (fail-open).
+	statusReconciler := NewDeployStatusReconciler(db, deployStatusK8s).
+		WithAutopsyK8s(deployAutopsyK8s)
+	river.AddWorker(workers, WithObservability(statusReconciler, nrApp))
 	// Event-email forwarder — drains audit_log rows into the configured
 	// provider every 60s for lifecycle email triggering. The provider is
 	// always non-nil (NoopProvider when EMAIL_PROVIDER is unset). See
