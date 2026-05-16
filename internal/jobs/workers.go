@@ -461,6 +461,45 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		entitlementRegrader = entitlementRegraderAdapter{client: provClient}
 	}
 	river.AddWorker(workers, WithObservability(NewEntitlementReconcilerWorker(db, planRegistry, entitlementRegrader), nrApp))
+	// Billing reconciler (P1 Wave-3 Cluster-B Slice 4). Every 15 minutes,
+	// compares Razorpay's live subscription state against teams.plan_tier and
+	// corrects divergence in both directions (upgrade catch-up AND grace/downgrade
+	// catch-up). The safety net for missed webhooks during pod-restart windows.
+	//
+	// The fetcher is noopSubFetcher when RAZORPAY_KEY_ID is unset — the
+	// reconciler logs a WARN per tick and is otherwise a no-op, matching the
+	// fail-open posture of every other optional-dependency worker here.
+	//
+	// WrapFetcherWithBreaker adds the worker-local circuit breaker so a Razorpay
+	// outage aborts the tick cleanly instead of burning 100 × 10s timeouts.
+	//
+	// Wire the real Razorpay SDK fetcher when RAZORPAY_KEY_ID + RAZORPAY_KEY_SECRET
+	// are set. Falls back to noopSubFetcher when credentials are absent so the
+	// worker starts cleanly in dev/test environments without Razorpay configured.
+	// WrapFetcherWithBreaker adds the circuit breaker on top of either path so a
+	// Razorpay outage aborts the tick cleanly instead of burning 100 × 10s timeouts.
+	billingBreakerInst := NewBillingReconcilerCircuitBreaker()
+	var billingFetcher subscriptionFetcher
+	if realFetcher, err := NewRazorpaySubFetcher(); err != nil {
+		slog.Error("billing.reconciler.fetcher_init_failed",
+			"error", err,
+			"fallback", "noopSubFetcher",
+		)
+		billingFetcher = noopSubFetcher{}
+	} else if realFetcher != nil {
+		slog.Info("billing.reconciler.fetcher_configured",
+			"fetcher", "razorpaySubFetcher",
+			"note", "real Razorpay SDK fetcher active",
+		)
+		billingFetcher = realFetcher
+	} else {
+		slog.Warn("billing.reconciler.fetcher_not_configured",
+			"note", "RAZORPAY_KEY_ID/SECRET unset — reconciler is a no-op each tick",
+		)
+		billingFetcher = noopSubFetcher{}
+	}
+	billingFetcher = WrapFetcherWithBreaker(billingFetcher, billingBreakerInst)
+	river.AddWorker(workers, WithObservability(NewBillingReconcilerWorker(db, billingFetcher, nil), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -799,6 +838,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(EntitlementReconcileInterval()),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return EntitlementReconcilerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Billing reconciler (P1 Wave-3 Cluster-B Slice 4) — every 15 min
+		// (override via BILLING_RECONCILE_INTERVAL). RunOnStart=true so a
+		// worker restart immediately sweeps for any gaps that opened during
+		// the downtime. Routed to the reconcile queue so a default-queue
+		// fan-out (weekly_digest) cannot starve the billing safety net.
+		//
+		// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(BillingReconcileInterval()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return BillingReconcilerArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
