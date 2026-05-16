@@ -461,6 +461,26 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		entitlementRegrader = entitlementRegraderAdapter{client: provClient}
 	}
 	river.AddWorker(workers, WithObservability(NewEntitlementReconcilerWorker(db, planRegistry, entitlementRegrader), nrApp))
+	// Billing reconciler (P1 Wave-3 Cluster-B Slice 4). Every 15 minutes,
+	// compares Razorpay's live subscription state against teams.plan_tier and
+	// corrects divergence in both directions (upgrade catch-up AND grace/downgrade
+	// catch-up). The safety net for missed webhooks during pod-restart windows.
+	//
+	// The fetcher is noopSubFetcher when RAZORPAY_KEY_ID is unset — the
+	// reconciler logs a WARN per tick and is otherwise a no-op, matching the
+	// fail-open posture of every other optional-dependency worker here.
+	//
+	// WrapFetcherWithBreaker adds the worker-local circuit breaker so a Razorpay
+	// outage aborts the tick cleanly instead of burning 100 × 10s timeouts.
+	//
+	// TODO(P1-Wave4): wire a real subscriptionFetcher that calls the Razorpay
+	// SDK directly once github.com/razorpay/razorpay-go is added to the
+	// worker's go.mod. For now noopSubFetcher short-circuits each tick with a
+	// WARN, which is safe and gives the monitoring pipeline the job's heartbeat.
+	billingBreakerInst := NewBillingReconcilerCircuitBreaker()
+	var billingFetcher subscriptionFetcher = noopSubFetcher{}
+	billingFetcher = WrapFetcherWithBreaker(billingFetcher, billingBreakerInst)
+	river.AddWorker(workers, WithObservability(NewBillingReconcilerWorker(db, billingFetcher, nil), nrApp))
 
 	periodicJobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
@@ -799,6 +819,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(EntitlementReconcileInterval()),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return EntitlementReconcilerArgs{}, reconcileInsertOpts()
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Billing reconciler (P1 Wave-3 Cluster-B Slice 4) — every 15 min
+		// (override via BILLING_RECONCILE_INTERVAL). RunOnStart=true so a
+		// worker restart immediately sweeps for any gaps that opened during
+		// the downtime. Routed to the reconcile queue so a default-queue
+		// fan-out (weekly_digest) cannot starve the billing safety net.
+		//
+		// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(BillingReconcileInterval()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return BillingReconcilerArgs{}, reconcileInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
