@@ -102,6 +102,49 @@ var (
 		Help: "Drifted resources the reconciler failed to re-grade (gRPC error or provisioner skip).",
 	})
 
+	// ── entitlement_reconciler — Redis maxmemory metrics ─────────────────────
+	//
+	// A4 backfill: the reconciler now also sweeps dedicated k8s Redis pods to
+	// ensure their maxmemory matches the tier cap from plans.yaml. Separate
+	// counters from the Postgres metrics so NR dashboards can track the two
+	// paths independently.
+	//
+	// NR alert: redis_regrade_failed > 0 for any 5-minute window → investigate.
+
+	// RedisMaxmemoryCheckedTotal counts dedicated Redis pods inspected by the
+	// A4 backfill reconciler each sweep. Includes both already-correct pods
+	// (Applied=false, SkipReason="already correct") and pods that were updated.
+	RedisMaxmemoryCheckedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_maxmemory_checked_total",
+		Help: "Dedicated Redis pods inspected by the A4 maxmemory reconciler.",
+	})
+
+	// RedisMaxmemoryAppliedTotal counts pods where CONFIG SET maxmemory was
+	// applied (Applied=true from the provisioner). These are the ~9 pre-existing
+	// pods that had no cap before the A4 fix; the count should converge to 0
+	// within a few sweeps once all pods are corrected.
+	RedisMaxmemoryAppliedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_maxmemory_applied_total",
+		Help: "Dedicated Redis pods with maxmemory successfully updated by the A4 reconciler.",
+	})
+
+	// RedisMaxmemorySkippedTotal counts pods where the provisioner reported
+	// Applied=false. Covers both already-correct pods and soft-skips (legacy
+	// pods without the redis-auth Secret). Does NOT include gRPC errors
+	// (those go to RedisMaxmemoryFailedTotal).
+	RedisMaxmemorySkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_maxmemory_skipped_total",
+		Help: "Dedicated Redis pods skipped by the A4 reconciler (already correct or legacy pod).",
+	})
+
+	// RedisMaxmemoryFailedTotal counts sweep iterations where the provisioner
+	// RegradeResource call returned an error (gRPC transport failure, not a
+	// soft skip). The row is left for the next sweep (fail-soft).
+	RedisMaxmemoryFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_maxmemory_failed_total",
+		Help: "Dedicated Redis pods the A4 reconciler failed to regrade (gRPC error, retried next sweep).",
+	})
+
 	// ── billing_reconciler metrics ────────────────────────────────────────────
 	//
 	// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.

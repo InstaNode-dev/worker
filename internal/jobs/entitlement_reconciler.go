@@ -4,10 +4,11 @@ package jobs
 //
 // Background: when a customer upgrades their plan, the api updates
 // resources.tier (and teams.plan_tier), but the resource's *actual* Postgres
-// connection cap is NOT re-applied to the database — the higher entitlement
-// is recorded but never enforced. This job detects that drift and fixes it.
+// connection cap or Redis maxmemory is NOT re-applied to the infrastructure —
+// the higher entitlement is recorded but never enforced. This job detects that
+// drift and fixes it.
 //
-// Each sweep:
+// Postgres sweep:
 //
 //   * SELECT active, non-expired postgres resources joined to their team's
 //     plan_tier, projecting the row's last-applied connection cap
@@ -23,6 +24,25 @@ package jobs
 //       - applied=true  → UPDATE resources SET applied_conn_limit = <resp value>.
 //       - applied=false (provisioner skip) or a gRPC error → log + leave the
 //         row for the next sweep.
+//
+// Redis maxmemory sweep (A4 backfill):
+//
+//   * SELECT active, non-expired redis resources that are k8s-backed
+//     (provider_resource_id LIKE 'instant-customer-%') joined to their team's
+//     plan_tier.
+//   * Skip ephemeral tiers (anonymous / free) — unchanged from Postgres.
+//   * Resolve the entitled maxmemory cap from plans.Registry.StorageLimitMB(tier, "redis").
+//     Values of -1 (unlimited) are passed as 0 to the provisioner, which sets
+//     maxmemory=0 (Redis "no cap") — safe for team tiers with dedicated infra.
+//   * Call provisioner gRPC RegradeResource with RESOURCE_TYPE_REDIS.
+//     The provisioner does CONFIG GET maxmemory first; if already correct it
+//     returns {applied:false, skip_reason:"already correct"} so this is idempotent
+//     and safe to re-run every sweep without customer-visible side effects.
+//   * Fail-soft: one bad pod must not abort the sweep. Errors are logged and
+//     the row is left for the next tick.
+//   * No DB column is used to track applied maxmemory — the provisioner's
+//     idempotent CONFIG GET / CONFIG SET is the convergence signal. This avoids
+//     a migration on the api/ repo while keeping the worker stateless for Redis.
 //
 // Fail-open / resilience: one bad resource must NOT abort the sweep — every
 // per-resource step is wrapped. A SELECT failure returns an error so River
@@ -192,7 +212,21 @@ func shouldRegrade(plans PlanRegistry, planTier string, appliedConnLimit sql.Nul
 	return false, entitled
 }
 
-// Work executes one sweep.
+// redisEntitlementCandidate is the projection for one Redis sweep row.
+// Unlike the Postgres candidate, there is no applied_maxmemory_mb DB column
+// (no migration needed — the reconciler is stateless for Redis; the
+// provisioner's idempotent CONFIG GET / CONFIG SET is the convergence signal).
+type redisEntitlementCandidate struct {
+	id                 uuid.UUID
+	token              string
+	providerResourceID string // always non-empty: only k8s-backed rows are selected
+	resourceTier       string // resources.tier — informational
+	planTier           string // teams.plan_tier — the entitled tier
+}
+
+// Work executes one sweep: Postgres connection-cap regrade + Redis maxmemory
+// backfill (A4). Both paths are fail-soft per resource; a SELECT failure
+// returns an error so River retries the full tick.
 func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[EntitlementReconcilerArgs]) error {
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.entitlement_reconciler")
 	defer span.End()
@@ -206,10 +240,6 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		return nil
 	}
 
-	// Sweep: active, non-expired postgres resources joined to their team's
-	// plan tier. The ORDER BY id keeps the per-tick window stable across
-	// consecutive ticks while a backlog drains.
-	//
 	// teamFilter ($2) scopes the sweep: empty = every team (prod default);
 	// a comma-separated UUID list = only those teams. The `$2 = '' OR …`
 	// predicate is a parameterised no-op when the filter is empty.
@@ -217,7 +247,13 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 	if teamFilter != "" {
 		slog.Info("jobs.entitlement_reconciler.scoped", "team_filter", teamFilter)
 	}
-	rows, err := w.db.QueryContext(ctx, `
+
+	// ── Postgres: connection-cap drift detection and remediation ────────────
+	//
+	// The ORDER BY id keeps the per-tick window stable across consecutive ticks
+	// while a backlog drains. applied_conn_limit IS NULL = never re-graded since
+	// migration 047 added the column.
+	pgRows, err := w.db.QueryContext(ctx, `
 		SELECT r.id, r.token, r.provider_resource_id, r.tier, r.applied_conn_limit, t.plan_tier
 		  FROM resources r
 		  JOIN teams t ON t.id = r.team_id
@@ -229,33 +265,33 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		 LIMIT $1
 	`, entitlementReconcilerBatchLimit, teamFilter)
 	if err != nil {
-		return fmt.Errorf("EntitlementReconcilerWorker: query failed: %w", err)
+		return fmt.Errorf("EntitlementReconcilerWorker: postgres query failed: %w", err)
 	}
-	defer rows.Close()
+	defer pgRows.Close()
 
-	var candidates []entitlementCandidate
-	for rows.Next() {
+	var pgCandidates []entitlementCandidate
+	for pgRows.Next() {
 		var c entitlementCandidate
-		if scanErr := rows.Scan(
+		if scanErr := pgRows.Scan(
 			&c.id, &c.token, &c.providerResourceID,
 			&c.resourceTier, &c.appliedConnLimit, &c.planTier,
 		); scanErr != nil {
-			slog.Warn("jobs.entitlement_reconciler.scan_failed", "error", scanErr)
+			slog.Warn("jobs.entitlement_reconciler.postgres.scan_failed", "error", scanErr)
 			continue
 		}
-		candidates = append(candidates, c)
+		pgCandidates = append(pgCandidates, c)
 	}
-	if rowsErr := rows.Err(); rowsErr != nil {
-		return fmt.Errorf("EntitlementReconcilerWorker: rows error: %w", rowsErr)
+	if rowsErr := pgRows.Err(); rowsErr != nil {
+		return fmt.Errorf("EntitlementReconcilerWorker: postgres rows error: %w", rowsErr)
 	}
-	rows.Close()
+	pgRows.Close()
 
-	var scanned, drifted, regraded, failed, skippedTier int
-	for _, c := range candidates {
-		scanned++
+	var pgScanned, pgDrifted, pgRegraded, pgFailed, pgSkippedTier int
+	for _, c := range pgCandidates {
+		pgScanned++
 
 		if entitlementEphemeralTiers[c.planTier] {
-			skippedTier++
+			pgSkippedTier++
 			continue
 		}
 
@@ -263,7 +299,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		if !needsRegrade {
 			continue
 		}
-		drifted++
+		pgDrifted++
 		metrics.EntitlementDriftDetectedTotal.Inc()
 
 		oldLimit := "null"
@@ -281,9 +317,9 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		cancel()
 
 		if regErr != nil {
-			failed++
+			pgFailed++
 			metrics.EntitlementRegradeFailedTotal.Inc()
-			slog.Error("jobs.entitlement_reconciler.regrade_failed",
+			slog.Error("jobs.entitlement_reconciler.postgres.regrade_failed",
 				"resource_id", c.id.String(),
 				"plan_tier", c.planTier,
 				"old_limit", oldLimit,
@@ -294,9 +330,9 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		}
 
 		if !out.Applied {
-			failed++
+			pgFailed++
 			metrics.EntitlementRegradeFailedTotal.Inc()
-			slog.Warn("jobs.entitlement_reconciler.regrade_skipped",
+			slog.Warn("jobs.entitlement_reconciler.postgres.regrade_skipped",
 				"resource_id", c.id.String(),
 				"plan_tier", c.planTier,
 				"old_limit", oldLimit,
@@ -314,9 +350,9 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			`UPDATE resources SET applied_conn_limit = $1 WHERE id = $2`,
 			out.AppliedConnLimit, c.id,
 		); uErr != nil {
-			failed++
+			pgFailed++
 			metrics.EntitlementRegradeFailedTotal.Inc()
-			slog.Error("jobs.entitlement_reconciler.persist_failed",
+			slog.Error("jobs.entitlement_reconciler.postgres.persist_failed",
 				"resource_id", c.id.String(),
 				"plan_tier", c.planTier,
 				"applied_conn_limit", out.AppliedConnLimit,
@@ -325,9 +361,9 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			continue
 		}
 
-		regraded++
+		pgRegraded++
 		metrics.EntitlementRegradedTotal.Inc()
-		slog.Info("jobs.entitlement_reconciler.regraded",
+		slog.Info("jobs.entitlement_reconciler.postgres.regraded",
 			"resource_id", c.id.String(),
 			"plan_tier", c.planTier,
 			"old_limit", oldLimit,
@@ -336,12 +372,126 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		)
 	}
 
+	// ── Redis: maxmemory backfill (A4) ───────────────────────────────────────
+	//
+	// Sweep dedicated k8s Redis pods: provider_resource_id prefix
+	// 'instant-customer-%' identifies k8s-backed resources. Shared-backend
+	// Redis resources (provider_resource_id NULL or no k8s prefix) are
+	// intentionally excluded — the shared redis-provision pod has a pod-wide
+	// maxmemory that must never be adjusted per-tenant.
+	//
+	// There is no applied_maxmemory_mb column (no migration); the provisioner's
+	// Regrade is idempotent (CONFIG GET → compare → CONFIG SET only if different)
+	// so calling it every sweep is safe and correct. The ~9 pre-existing uncapped
+	// pods converge on the first sweep; subsequent sweeps are all CONFIG GET
+	// no-ops ("already correct").
+	redisRows, redisErr := w.db.QueryContext(ctx, `
+		SELECT r.id, r.token, r.provider_resource_id, r.tier, t.plan_tier
+		  FROM resources r
+		  JOIN teams t ON t.id = r.team_id
+		 WHERE r.resource_type = 'redis'
+		   AND r.status = 'active'
+		   AND r.provider_resource_id LIKE 'instant-customer-%'
+		   AND (r.expires_at IS NULL OR r.expires_at > now())
+		   AND ($2 = '' OR t.id::text = ANY(string_to_array($2, ',')))
+		 ORDER BY r.id
+		 LIMIT $1
+	`, entitlementReconcilerBatchLimit, teamFilter)
+	if redisErr != nil {
+		// Redis sweep failure is non-fatal for the Postgres path — log and continue.
+		// The Postgres results are already accumulated above. Return an error so
+		// River retries the whole tick, which will re-run both sweeps.
+		return fmt.Errorf("EntitlementReconcilerWorker: redis query failed: %w", redisErr)
+	}
+	defer redisRows.Close()
+
+	var redisCandidates []redisEntitlementCandidate
+	for redisRows.Next() {
+		var c redisEntitlementCandidate
+		if scanErr := redisRows.Scan(
+			&c.id, &c.token, &c.providerResourceID,
+			&c.resourceTier, &c.planTier,
+		); scanErr != nil {
+			slog.Warn("jobs.entitlement_reconciler.redis.scan_failed", "error", scanErr)
+			continue
+		}
+		redisCandidates = append(redisCandidates, c)
+	}
+	if rowsErr := redisRows.Err(); rowsErr != nil {
+		return fmt.Errorf("EntitlementReconcilerWorker: redis rows error: %w", rowsErr)
+	}
+	redisRows.Close()
+
+	var redisChecked, redisApplied, redisSkipped, redisFailed, redisSkippedTier int
+	for _, c := range redisCandidates {
+		redisChecked++
+		metrics.RedisMaxmemoryCheckedTotal.Inc()
+
+		if entitlementEphemeralTiers[c.planTier] {
+			// Anonymous and free tier dedicated Redis would be unusual, but skip
+			// gracefully for correctness — they are not re-graded.
+			redisSkippedTier++
+			continue
+		}
+
+		// Per-resource regrade — call the provisioner which does an idempotent
+		// CONFIG GET / CONFIG SET. requestID is the resource UUID for stable
+		// idempotency.
+		regradeCtx, cancel := context.WithTimeout(ctx, entitlementReconcilerRegradeTimeout)
+		out, regErr := w.regrader.RegradeResource(
+			regradeCtx, c.token, c.providerResourceID,
+			commonv1.ResourceType_RESOURCE_TYPE_REDIS, c.planTier, c.id.String(),
+		)
+		cancel()
+
+		if regErr != nil {
+			redisFailed++
+			metrics.RedisMaxmemoryFailedTotal.Inc()
+			slog.Error("jobs.entitlement_reconciler.redis.regrade_failed",
+				"resource_id", c.id.String(),
+				"token", c.token,
+				"plan_tier", c.planTier,
+				"provider_resource_id", c.providerResourceID,
+				"error", regErr,
+			)
+			continue // leave for next sweep
+		}
+
+		if out.Applied {
+			redisApplied++
+			metrics.RedisMaxmemoryAppliedTotal.Inc()
+			slog.Info("jobs.entitlement_reconciler.redis.maxmemory_applied",
+				"resource_id", c.id.String(),
+				"token", c.token,
+				"plan_tier", c.planTier,
+				"applied_maxmemory_mb", out.AppliedConnLimit, // AppliedConnLimit repurposed for MB
+				"provider_resource_id", c.providerResourceID,
+			)
+		} else {
+			redisSkipped++
+			metrics.RedisMaxmemorySkippedTotal.Inc()
+			slog.Debug("jobs.entitlement_reconciler.redis.maxmemory_skipped",
+				"resource_id", c.id.String(),
+				"token", c.token,
+				"plan_tier", c.planTier,
+				"skip_reason", out.SkipReason,
+			)
+		}
+	}
+
 	slog.Info("jobs.entitlement_reconciler.completed",
-		"scanned", scanned,
-		"drifted", drifted,
-		"regraded", regraded,
-		"failed", failed,
-		"skipped_ephemeral_tier", skippedTier,
+		// Postgres metrics (backward-compatible log keys)
+		"postgres_scanned", pgScanned,
+		"postgres_drifted", pgDrifted,
+		"postgres_regraded", pgRegraded,
+		"postgres_failed", pgFailed,
+		"postgres_skipped_ephemeral", pgSkippedTier,
+		// Redis A4 metrics
+		"redis_checked", redisChecked,
+		"redis_applied", redisApplied,
+		"redis_skipped", redisSkipped,
+		"redis_failed", redisFailed,
+		"redis_skipped_ephemeral", redisSkippedTier,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return nil
