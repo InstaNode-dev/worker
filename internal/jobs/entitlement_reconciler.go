@@ -151,10 +151,17 @@ func NewEntitlementReconcilerWorker(db *sql.DB, plans PlanRegistry, regrader ent
 // alongside the rest of the StartWorkers wiring.
 
 // entitlementCandidate is the projection one sweep row yields.
+//
+// providerResourceID is sql.NullString because resources.provider_resource_id
+// (migration 002) is a nullable TEXT column with no default — many legacy and
+// pool-claimed rows have it NULL. Scanning a NULL into a plain string aborts
+// the row's Scan, which previously dropped every NULL-prid row from the sweep
+// (the modal case in prod). An empty providerResourceID is safe to pass to the
+// provisioner: K8sBackend.Regrade falls back to k8sNsPrefix+token when it is "".
 type entitlementCandidate struct {
 	id                 uuid.UUID
 	token              string
-	providerResourceID string
+	providerResourceID sql.NullString
 	resourceTier       string         // resources.tier — informational only
 	appliedConnLimit   sql.NullInt64  // NULL = never re-graded (migration 047)
 	planTier           string         // teams.plan_tier — the entitled tier
@@ -268,7 +275,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		// provisioner a stable idempotency key per resource.
 		regradeCtx, cancel := context.WithTimeout(ctx, entitlementReconcilerRegradeTimeout)
 		out, regErr := w.regrader.RegradeResource(
-			regradeCtx, c.token, c.providerResourceID,
+			regradeCtx, c.token, c.providerResourceID.String,
 			commonv1.ResourceType_RESOURCE_TYPE_POSTGRES, c.planTier, c.id.String(),
 		)
 		cancel()
