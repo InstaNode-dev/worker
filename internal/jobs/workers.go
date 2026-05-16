@@ -278,7 +278,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	if cfg.CustomerDatabaseURL != "" || cfg.MongoAdminURI != "" || cfg.CustomerRedisURL != "" {
 		storageRevoker = NewDirectResourceRevoker(cfg.CustomerDatabaseURL, cfg.MongoAdminURI, cfg.CustomerRedisURL)
 	}
-	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorker(db, planRegistry, storageRevoker), nrApp))
+	// Build the per-tenant Redis key evictor (A4). It uses the same shared-Redis
+	// admin URL as the revoker; when CUSTOMER_REDIS_URL is unset the evictor is
+	// a logged no-op and the quota worker still runs its suspend/unsuspend
+	// loops. This is the only per-tenant memory enforcement on the shared
+	// `redis-provision` pod — Redis ACL has no per-user maxmemory.
+	var redisEvictor RedisKeyEvictor
+	if cfg.CustomerRedisURL != "" {
+		redisEvictor = NewDirectRedisEvictor(cfg.CustomerRedisURL)
+	}
+	river.AddWorker(workers, WithObservability(NewEnforceStorageQuotaWorkerWithEvictor(db, planRegistry, storageRevoker, redisEvictor), nrApp))
 	river.AddWorker(workers, WithObservability(NewUpdateStorageBytesWorker(db, provClient, minioScanner), nrApp))
 	// Quota-wall nudge — Track U1. Periodic scan that writes a single
 	// near_quota_wall audit row per team per 24h when any axis (storage,

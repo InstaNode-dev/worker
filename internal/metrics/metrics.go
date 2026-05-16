@@ -145,6 +145,53 @@ var (
 		Help: "Dedicated Redis pods the A4 reconciler failed to regrade (gRPC error, retried next sweep).",
 	})
 
+	// ── EnforceStorageQuotaWorker — shared-Redis per-tenant eviction (A4) ─────
+	//
+	// Shared-backend Redis tenants (anonymous/free, key-scoped ACL users on the
+	// `redis-provision` pod) have no per-user maxmemory — the quota worker
+	// SCAN+DELETEs an over-cap tenant's `{token}:*` keyspace oldest-first. These
+	// counters track that eviction path; they are distinct from the
+	// instant_redis_maxmemory_* counters (which track DEDICATED k8s pods).
+	//
+	// NR alert (per-tenant — leading indicator):
+	//   instant_redis_evicted_tenants_total rising steadily → free tenants are
+	//   routinely hitting cap; expected, but a sharp spike warrants a look.
+	//
+	// NR alert (pod-wide — defense-in-depth backstop): configure an alert on the
+	// shared `redis-provision` pod's used_memory / maxmemory ratio —
+	//   WHEN used_memory / maxmemory > 0.85 for 5m THEN page.
+	// The per-tenant eviction is the first line of defence; the pod-wide ratio
+	// alert catches the case where eviction is falling behind the noisy neighbour.
+
+	// RedisEvictedKeysTotal counts keys deleted from over-quota shared-backend
+	// Redis tenants by the quota worker's eviction loop.
+	RedisEvictedKeysTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_evicted_keys_total",
+		Help: "Keys deleted from over-quota shared-backend Redis tenants by the quota worker.",
+	})
+
+	// RedisEvictedBytesTotal counts bytes reclaimed (best-effort, summed from
+	// MEMORY USAGE) by shared-backend Redis per-tenant eviction.
+	RedisEvictedBytesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_evicted_bytes_total",
+		Help: "Bytes reclaimed from over-quota shared-backend Redis tenants by the quota worker.",
+	})
+
+	// RedisEvictedTenantsTotal counts tenants that had at least one key evicted
+	// in a sweep — i.e. distinct over-cap shared-backend Redis tenants enforced.
+	RedisEvictedTenantsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_evicted_tenants_total",
+		Help: "Distinct over-quota shared-backend Redis tenants enforced (>=1 key evicted) by the quota worker.",
+	})
+
+	// RedisEvictionFailedTotal counts tenants whose eviction pass returned an
+	// error (Redis connectivity, parse failure, or a prefix-safety violation).
+	// Fail-soft: the row is left for the next sweep.
+	RedisEvictionFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_redis_eviction_failed_total",
+		Help: "Shared-backend Redis tenants the quota worker failed to evict (retried next sweep).",
+	})
+
 	// ── billing_reconciler metrics ────────────────────────────────────────────
 	//
 	// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.
