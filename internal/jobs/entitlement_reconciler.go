@@ -27,9 +27,15 @@ package jobs
 //
 // Redis maxmemory sweep (A4 backfill):
 //
-//   * SELECT active, non-expired redis resources that are k8s-backed
-//     (provider_resource_id LIKE 'instant-customer-%') joined to their team's
-//     plan_tier.
+//   * SELECT all active, non-expired redis resources joined to their team's
+//     plan_tier. Unlike the original implementation, we do NOT filter on
+//     provider_resource_id — 100% of prod Redis rows have provider_resource_id=NULL,
+//     so the old LIKE 'instant-customer-%' predicate matched 0 rows every tick.
+//   * The k8s namespace is derived from the token: instant-customer-<token>.
+//     This is deterministic and does not require a non-NULL provider_resource_id.
+//     If prid already has the "instant-customer-" prefix (legacy rows with prid set),
+//     it is used as-is; otherwise the bare token is passed to the provisioner which
+//     constructs the namespace itself.
 //   * Skip ephemeral tiers (anonymous / free) — unchanged from Postgres.
 //   * Resolve the entitled maxmemory cap from plans.Registry.StorageLimitMB(tier, "redis").
 //     Values of -1 (unlimited) are passed as 0 to the provisioner, which sets
@@ -38,6 +44,8 @@ package jobs
 //     The provisioner does CONFIG GET maxmemory first; if already correct it
 //     returns {applied:false, skip_reason:"already correct"} so this is idempotent
 //     and safe to re-run every sweep without customer-visible side effects.
+//     Shared/local-backend resources (no k8s pod) return {applied:false,
+//     skip_reason:"backend does not support redis regrade"} — also safe.
 //   * Fail-soft: one bad pod must not abort the sweep. Errors are logged and
 //     the row is left for the next tick.
 //   * No DB column is used to track applied maxmemory — the provisioner's
@@ -212,16 +220,27 @@ func shouldRegrade(plans PlanRegistry, planTier string, appliedConnLimit sql.Nul
 	return false, entitled
 }
 
+// redisK8sNsPrefix is the namespace prefix for k8s-backed dedicated Redis pods.
+// Mirrors the const in provisioner/internal/backend/redis/k8s.go — both must stay
+// in sync. Declared here so the worker can derive the namespace from a bare token
+// without importing the provisioner package.
+const redisK8sNsPrefix = "instant-customer-"
+
 // redisEntitlementCandidate is the projection for one Redis sweep row.
 // Unlike the Postgres candidate, there is no applied_maxmemory_mb DB column
 // (no migration needed — the reconciler is stateless for Redis; the
 // provisioner's idempotent CONFIG GET / CONFIG SET is the convergence signal).
+//
+// providerResourceID is sql.NullString because resources.provider_resource_id
+// is a nullable TEXT column — prod shows 100% NULL for Redis resources. The
+// sweep identifies pods by token (not by prid) and derives the k8s namespace
+// as instant-customer-<token>. The prid is kept for logging / future use.
 type redisEntitlementCandidate struct {
 	id                 uuid.UUID
 	token              string
-	providerResourceID string // always non-empty: only k8s-backed rows are selected
-	resourceTier       string // resources.tier — informational
-	planTier           string // teams.plan_tier — the entitled tier
+	providerResourceID sql.NullString // nullable — prod rows are NULL; namespace derived from token
+	resourceTier       string         // resources.tier — informational
+	planTier           string         // teams.plan_tier — the entitled tier
 }
 
 // Work executes one sweep: Postgres connection-cap regrade + Redis maxmemory
@@ -374,11 +393,19 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 
 	// ── Redis: maxmemory backfill (A4) ───────────────────────────────────────
 	//
-	// Sweep dedicated k8s Redis pods: provider_resource_id prefix
-	// 'instant-customer-%' identifies k8s-backed resources. Shared-backend
-	// Redis resources (provider_resource_id NULL or no k8s prefix) are
-	// intentionally excluded — the shared redis-provision pod has a pod-wide
-	// maxmemory that must never be adjusted per-tenant.
+	// Bug fixed (fix/a4-redis-rekey-on-token): the original sweep filtered on
+	// provider_resource_id LIKE 'instant-customer-%', but 100% of prod Redis
+	// resources have provider_resource_id = NULL — so the sweep matched 0 rows
+	// every tick (redis_checked:0 in prod logs).
+	//
+	// The k8s namespace is deterministic: instant-customer-<token>. We no longer
+	// rely on provider_resource_id to identify k8s pods. Instead we select ALL
+	// active Redis resources and pass the token to RegradeResource; the provisioner
+	// derives the namespace from the token. The provisioner's regradeRedis already
+	// guards against non-k8s (shared) backends by checking the identifier prefix or
+	// the backend type — a bare token produces namespace "instant-customer-<token>"
+	// which is always the k8s path; shared-backend resources with no k8s pod will
+	// return {applied:false, skip_reason:"backend does not support redis regrade"}.
 	//
 	// There is no applied_maxmemory_mb column (no migration); the provisioner's
 	// Regrade is idempotent (CONFIG GET → compare → CONFIG SET only if different)
@@ -391,7 +418,6 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		  JOIN teams t ON t.id = r.team_id
 		 WHERE r.resource_type = 'redis'
 		   AND r.status = 'active'
-		   AND r.provider_resource_id LIKE 'instant-customer-%'
 		   AND (r.expires_at IS NULL OR r.expires_at > now())
 		   AND ($2 = '' OR t.id::text = ANY(string_to_array($2, ',')))
 		 ORDER BY r.id
@@ -413,6 +439,14 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			&c.resourceTier, &c.planTier,
 		); scanErr != nil {
 			slog.Warn("jobs.entitlement_reconciler.redis.scan_failed", "error", scanErr)
+			continue
+		}
+		// Skip resources that have no token — without a token we cannot derive
+		// the k8s namespace. This should never happen in practice (token is a
+		// NOT NULL column), but guard defensively.
+		if c.token == "" {
+			slog.Warn("jobs.entitlement_reconciler.redis.no_token_skip",
+				"resource_id", c.id.String())
 			continue
 		}
 		redisCandidates = append(redisCandidates, c)
@@ -437,9 +471,22 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		// Per-resource regrade — call the provisioner which does an idempotent
 		// CONFIG GET / CONFIG SET. requestID is the resource UUID for stable
 		// idempotency.
+		//
+		// Key change (fix/a4-redis-rekey-on-token): we pass the bare token as
+		// providerResourceID instead of the DB prid (which is NULL in prod). The
+		// provisioner's regradeRedis constructs "instant-customer-<token>" from a
+		// bare token, so the k8s pod is found correctly. If prid already carries
+		// the "instant-customer-" prefix (legacy rows that do have it set) we pass
+		// it as-is — the provisioner accepts both forms.
+		nsIdentifier := c.token
+		if strings.HasPrefix(c.providerResourceID.String, redisK8sNsPrefix) {
+			// prid already encodes the k8s namespace — use it directly.
+			nsIdentifier = c.providerResourceID.String
+		}
+
 		regradeCtx, cancel := context.WithTimeout(ctx, entitlementReconcilerRegradeTimeout)
 		out, regErr := w.regrader.RegradeResource(
-			regradeCtx, c.token, c.providerResourceID,
+			regradeCtx, c.token, nsIdentifier,
 			commonv1.ResourceType_RESOURCE_TYPE_REDIS, c.planTier, c.id.String(),
 		)
 		cancel()
@@ -451,7 +498,8 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 				"resource_id", c.id.String(),
 				"token", c.token,
 				"plan_tier", c.planTier,
-				"provider_resource_id", c.providerResourceID,
+				"ns_identifier", nsIdentifier,
+				"provider_resource_id", c.providerResourceID.String,
 				"error", regErr,
 			)
 			continue // leave for next sweep
@@ -465,7 +513,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 				"token", c.token,
 				"plan_tier", c.planTier,
 				"applied_maxmemory_mb", out.AppliedConnLimit, // AppliedConnLimit repurposed for MB
-				"provider_resource_id", c.providerResourceID,
+				"ns_identifier", nsIdentifier,
 			)
 		} else {
 			redisSkipped++
