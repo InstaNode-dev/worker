@@ -41,3 +41,12 @@ func BillingTierRank(tier string) int {
 
 // ErrReconcilerCircuitOpen exports errReconcilerCircuitOpen for circuit-open tests.
 var ErrReconcilerCircuitOpen = errReconcilerCircuitOpen
+
+// RazorpaySDKClient exports the razorpaySDKClient interface for test injection.
+type RazorpaySDKClient = razorpaySDKClient
+
+// NewRazorpaySubFetcherFromClient exports the internal constructor that injects
+// a mock SDK client. Used in fetcher unit tests to avoid hitting the real Razorpay API.
+func NewRazorpaySubFetcherFromClient(c RazorpaySDKClient) subscriptionFetcher {
+	return newRazorpaySubFetcherFromClient(c)
+}
