@@ -11,10 +11,19 @@ package jobs
 // is automatically covered — no test edit needed.
 
 import (
+	"context"
 	"database/sql"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/rivertype"
+
+	commonv1 "instant.dev/proto/common/v1"
 
 	commonplans "instant.dev/common/plans"
 )
@@ -136,4 +145,138 @@ func TestEntitlementReconcileInterval_BadValue(t *testing.T) {
 				bad, got, defaultEntitlementReconcileInterval)
 		}
 	}
+}
+
+// --- Regression test: NULL provider_resource_id must not abort the scan ---
+//
+// P0-2 / bughunt/U03: before the fix, entitlementCandidate.providerResourceID
+// was typed as `string`. sql.Rows.Scan into a plain string panics/errors on a
+// NULL column value, which caused the entire row to be dropped (the `continue`
+// in the scan loop silently skipped it). In production every pool-claimed and
+// legacy resource has provider_resource_id = NULL, so the sweep always logged
+// `scanned:0` and no resource was ever re-graded.
+//
+// This test seeds a sqlmock result set with three rows:
+//   row 1: provider_resource_id = NULL  (modal prod case)
+//   row 2: provider_resource_id = ""    (empty string — also safe, fallback in K8sBackend)
+//   row 3: provider_resource_id = "ns/abc" (non-NULL non-empty — normal case)
+//
+// All three rows have applied_conn_limit = NULL (never re-graded) and
+// plan_tier = "hobby" (non-ephemeral), so all three are drift candidates.
+// The stub regrader counts calls; the test asserts count == 3 (all rows
+// produced candidates). Pre-fix behaviour yields count == 0 or 1, so the
+// assertion fails exactly when the NULL-scan bug is reintroduced.
+
+// stubRegrader satisfies entitlementRegrader and counts RegradeResource calls.
+type stubRegrader struct{ calls atomic.Int32 }
+
+func (s *stubRegrader) RegradeResource(
+	_ context.Context, _, _ string, _ commonv1.ResourceType, _, _ string,
+) (regradeOutcome, error) {
+	s.calls.Add(1)
+	return regradeOutcome{Applied: true, AppliedConnLimit: 5}, nil
+}
+
+// entitlementSweepCols are the column names the entitlement reconciler SELECT
+// projects. They must match the order in rows.Scan exactly.
+var entitlementSweepCols = []string{
+	"id", "token", "provider_resource_id",
+	"tier", "applied_conn_limit", "plan_tier",
+}
+
+// fakeEntitlementJob returns a minimal *river.Job for EntitlementReconcilerArgs.
+func fakeEntitlementJob() *river.Job[EntitlementReconcilerArgs] {
+	return &river.Job[EntitlementReconcilerArgs]{JobRow: &rivertype.JobRow{ID: 99}}
+}
+
+func TestEntitlementReconciler_NullProviderResourceID_AllRowsScanned(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	id2 := uuid.New()
+	id3 := uuid.New()
+
+	// Three drifted rows: applied_conn_limit=NULL (never re-graded), plan_tier="hobby".
+	// provider_resource_id varies: NULL, empty string, non-empty string.
+	rows := sqlmock.NewRows(entitlementSweepCols).
+		AddRow(id1, "tok-null-prid", nil, "hobby", nil, "hobby").         // NULL prid — the bug case
+		AddRow(id2, "tok-empty-prid", "", "hobby", nil, "hobby").         // empty-string prid
+		AddRow(id3, "tok-nonempty-prid", "ns/abc", "hobby", nil, "hobby") // non-NULL prid
+
+	// The worker does UPDATE resources SET applied_conn_limit = $1 WHERE id = $2
+	// once per successfully re-graded row.
+	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)
+	for i := 0; i < 3; i++ {
+		mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+	}
+
+	stub := &stubRegrader{}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, stub)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	// Assert all three rows were scanned and passed to the regrader.
+	// Pre-fix: rows with NULL prid abort Scan → candidates=[] → calls==0.
+	// Post-fix: all rows scan successfully           → calls==3.
+	if got := int(stub.calls.Load()); got != 3 {
+		t.Errorf("RegradeResource called %d times, want 3 — NULL provider_resource_id may still abort the scan", got)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEntitlementReconciler_NullProviderResourceID_PassesEmptyStringToRegrader
+// verifies that a NULL prid row passes "" (not "<nil>" or a garbage value) to
+// RegradeResource — the K8sBackend falls back to k8sNsPrefix+token when prid=="".
+func TestEntitlementReconciler_NullProviderResourceID_PassesEmptyStringToRegrader(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+
+	rows := sqlmock.NewRows(entitlementSweepCols).
+		AddRow(id1, "tok-null-prid", nil, "hobby", nil, "hobby") // NULL prid, drifted
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)
+	mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	var capturedPRID string
+	capturingRegrader := &capturePRIDRegrader{captured: &capturedPRID}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, capturingRegrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	if capturedPRID != "" {
+		t.Errorf("NULL prid should produce empty string to RegradeResource, got %q", capturedPRID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// capturePRIDRegrader captures the providerResourceID passed to RegradeResource.
+type capturePRIDRegrader struct{ captured *string }
+
+func (c *capturePRIDRegrader) RegradeResource(
+	_ context.Context, _, prid string, _ commonv1.ResourceType, _, _ string,
+) (regradeOutcome, error) {
+	*c.captured = prid
+	return regradeOutcome{Applied: true, AppliedConnLimit: 5}, nil
 }
