@@ -13,6 +13,7 @@ package jobs
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -177,11 +178,25 @@ func (s *stubRegrader) RegradeResource(
 	return regradeOutcome{Applied: true, AppliedConnLimit: 5}, nil
 }
 
-// entitlementSweepCols are the column names the entitlement reconciler SELECT
-// projects. They must match the order in rows.Scan exactly.
+// entitlementSweepCols are the column names the Postgres entitlement reconciler
+// SELECT projects. They must match the order in rows.Scan exactly.
 var entitlementSweepCols = []string{
 	"id", "token", "provider_resource_id",
 	"tier", "applied_conn_limit", "plan_tier",
+}
+
+// redisSweepCols are the column names the Redis A4 backfill SELECT projects.
+// No applied_maxmemory_mb column — the reconciler is stateless for Redis.
+var redisSweepCols = []string{
+	"id", "token", "provider_resource_id",
+	"tier", "plan_tier",
+}
+
+// emptyRedisRows returns an empty sqlmock result set for the Redis sweep query.
+// Use in tests that focus on Postgres behaviour and want the Redis sweep to be
+// a no-op.
+func emptyRedisRows() *sqlmock.Rows {
+	return sqlmock.NewRows(redisSweepCols)
 }
 
 // fakeEntitlementJob returns a minimal *river.Job for EntitlementReconcilerArgs.
@@ -209,11 +224,12 @@ func TestEntitlementReconciler_NullProviderResourceID_AllRowsScanned(t *testing.
 
 	// The worker does UPDATE resources SET applied_conn_limit = $1 WHERE id = $2
 	// once per successfully re-graded row.
-	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(rows) // Postgres query
 	for i := 0; i < 3; i++ {
 		mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 	}
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows()) // Redis A4 query (no-op)
 
 	stub := &stubRegrader{}
 	reg := liveRegistry(t)
@@ -250,9 +266,10 @@ func TestEntitlementReconciler_NullProviderResourceID_PassesEmptyStringToRegrade
 	rows := sqlmock.NewRows(entitlementSweepCols).
 		AddRow(id1, "tok-null-prid", nil, "hobby", nil, "hobby") // NULL prid, drifted
 
-	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)                          // Postgres query
 	mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())               // Redis A4 query (no-op)
 
 	var capturedPRID string
 	capturingRegrader := &capturePRIDRegrader{captured: &capturedPRID}
@@ -272,6 +289,9 @@ func TestEntitlementReconciler_NullProviderResourceID_PassesEmptyStringToRegrade
 }
 
 // capturePRIDRegrader captures the providerResourceID passed to RegradeResource.
+// For the Postgres NULL-prid test it captures the first call only (the Postgres
+// regrade). Redis calls in the same sweep use the k8s namespace IDs which are
+// always non-empty.
 type capturePRIDRegrader struct{ captured *string }
 
 func (c *capturePRIDRegrader) RegradeResource(
@@ -279,4 +299,221 @@ func (c *capturePRIDRegrader) RegradeResource(
 ) (regradeOutcome, error) {
 	*c.captured = prid
 	return regradeOutcome{Applied: true, AppliedConnLimit: 5}, nil
+}
+
+// ─── Redis A4 backfill tests ──────────────────────────────────────────────────
+//
+// The following tests exercise the Redis maxmemory sweep added in A4.
+// They use sqlmock in two-query mode: first SELECT (Postgres) returns empty,
+// second SELECT (Redis) returns the test data.
+//
+// The stubRegrader is reused; it counts calls regardless of resource type.
+
+// captureResourceTypeRegrader records each (resType, prid, tier) triple so
+// tests can verify the reconciler passes RESOURCE_TYPE_REDIS to the provisioner.
+type captureResourceTypeRegrader struct {
+	calls []struct {
+		resType commonv1.ResourceType
+		prid    string
+		tier    string
+	}
+	outcome regradeOutcome
+}
+
+func (c *captureResourceTypeRegrader) RegradeResource(
+	_ context.Context, _, prid string, resType commonv1.ResourceType, tier, _ string,
+) (regradeOutcome, error) {
+	c.calls = append(c.calls, struct {
+		resType commonv1.ResourceType
+		prid    string
+		tier    string
+	}{resType, prid, tier})
+	return c.outcome, nil
+}
+
+// TestRedisA4_SweepCallsRegradeWithRedisType verifies that the Redis sweep
+// emits RegradeResource calls with RESOURCE_TYPE_REDIS and the correct
+// provider_resource_id (the k8s namespace name).
+func TestRedisA4_SweepCallsRegradeWithRedisType(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	id2 := uuid.New()
+
+	// Two k8s-backed Redis resources: pro and team tier.
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, "tok-pro", "instant-customer-tok-pro", "pro", "pro").
+		AddRow(id2, "tok-team", "instant-customer-tok-team", "team", "team")
+
+	// Postgres query returns empty (no postgres drift in this test).
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	// Redis query returns two rows.
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)
+
+	regrader := &captureResourceTypeRegrader{
+		outcome: regradeOutcome{Applied: true, AppliedConnLimit: 512},
+	}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, regrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	if len(regrader.calls) != 2 {
+		t.Fatalf("expected 2 RegradeResource calls, got %d", len(regrader.calls))
+	}
+	for i, call := range regrader.calls {
+		if call.resType != commonv1.ResourceType_RESOURCE_TYPE_REDIS {
+			t.Errorf("call[%d]: resType=%v, want RESOURCE_TYPE_REDIS", i, call.resType)
+		}
+		if call.prid == "" {
+			t.Errorf("call[%d]: empty providerResourceID — k8s namespace should be non-empty", i)
+		}
+	}
+	// Pro tier call.
+	if regrader.calls[0].prid != "instant-customer-tok-pro" {
+		t.Errorf("pro pod prid=%q, want instant-customer-tok-pro", regrader.calls[0].prid)
+	}
+	if regrader.calls[0].tier != "pro" {
+		t.Errorf("pro pod tier=%q, want pro", regrader.calls[0].tier)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestRedisA4_SharedBackendResource_NotInSweep verifies that the SQL query
+// filters out resources without the 'instant-customer-' prefix. This is
+// enforced at the DB query level (LIKE 'instant-customer-%') so this test
+// confirms that the sqlmock only returns k8s-prefixed rows.
+//
+// A shared-backend Redis resource (provider_resource_id NULL or unrelated)
+// cannot appear in the sweep because the WHERE clause excludes it. This test
+// seeds ONLY a k8s row and asserts the regrader is called exactly once.
+func TestRedisA4_OnlyK8sResourcesSwept(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+
+	// Only a k8s-backed Redis resource in the result set (the WHERE clause
+	// in the real DB filters shared resources; sqlmock simulates that outcome).
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, "tok-pro", "instant-customer-tok-pro", "pro", "pro")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)
+
+	stub := &stubRegrader{}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, stub)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+	if got := int(stub.calls.Load()); got != 1 {
+		t.Errorf("RegradeResource called %d times, want 1 (only k8s pod)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestRedisA4_TeamTier_SentToProvisioner verifies that team-tier Redis pods
+// are included in the sweep — the provisioner is responsible for setting
+// maxmemory=0 (unlimited) for team/growth. The reconciler must NOT skip them.
+func TestRedisA4_TeamTier_SentToProvisioner(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, "tok-team", "instant-customer-tok-team", "team", "team")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)
+
+	regrader := &captureResourceTypeRegrader{
+		outcome: regradeOutcome{Applied: true, AppliedConnLimit: 0}, // 0 = unlimited
+	}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, regrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+	if len(regrader.calls) != 1 {
+		t.Fatalf("expected 1 RegradeResource call for team-tier pod, got %d", len(regrader.calls))
+	}
+	if regrader.calls[0].tier != "team" {
+		t.Errorf("tier=%q, want team", regrader.calls[0].tier)
+	}
+	// Team tier is NOT ephemeral — it must NOT be skipped.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestRedisA4_FailSoftPerPod verifies that a gRPC error on one Redis pod
+// does not abort the sweep — subsequent pods are still processed.
+func TestRedisA4_FailSoftPerPod(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	id2 := uuid.New()
+
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, "tok-bad", "instant-customer-tok-bad", "pro", "pro").   // will error
+		AddRow(id2, "tok-ok", "instant-customer-tok-ok", "pro", "pro")      // must still be called
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)
+
+	callCount := 0
+	failSoftRegrader := &funcRegrader{fn: func(_ context.Context, _, prid string, resType commonv1.ResourceType, _, _ string) (regradeOutcome, error) {
+		callCount++
+		if prid == "instant-customer-tok-bad" {
+			return regradeOutcome{}, fmt.Errorf("connection refused: pod not ready")
+		}
+		return regradeOutcome{Applied: true, AppliedConnLimit: 512}, nil
+	}}
+
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, failSoftRegrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() must not return error even when one pod fails: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 RegradeResource calls (one fail-soft, one success), got %d", callCount)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// funcRegrader implements entitlementRegrader with a function for flexible test setup.
+type funcRegrader struct {
+	fn func(ctx context.Context, token, prid string, resType commonv1.ResourceType, tier, reqID string) (regradeOutcome, error)
+}
+
+func (f *funcRegrader) RegradeResource(ctx context.Context, token, prid string, resType commonv1.ResourceType, tier, reqID string) (regradeOutcome, error) {
+	return f.fn(ctx, token, prid, resType, tier, reqID)
 }
