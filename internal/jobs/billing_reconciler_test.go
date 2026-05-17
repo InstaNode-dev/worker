@@ -39,6 +39,7 @@ import (
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 
+	commonplans "instant.dev/common/plans"
 	"instant.dev/worker/internal/jobs"
 )
 
@@ -197,11 +198,11 @@ func TestBillingReconcilerPlanIDToTier_UnknownFallsBackToHobby(t *testing.T) {
 // ── §3: tierRank ordering ─────────────────────────────────────────────────────
 
 // canonicalTierOrder is the single source of truth for tier ranking, taken
-// verbatim from api/plans.yaml. The worker cannot import the api module, so
-// its billingTierRankMap is a hand-maintained mirror — this slice is the
-// contract the mirror must satisfy. P1-F(a): the bug-hunt flagged a
-// growth/pro inversion between api and worker; this test pins the worker's
-// table to the canonical order so any future drift fails here.
+// verbatim from api/plans.yaml. billingTierRank now delegates to the shared
+// commonplans.Rank registry (it no longer keeps a worker-local map), so this
+// slice is also a sanity-anchor for the shared registry's ordering. P1-F(a):
+// the bug-hunt flagged a growth/pro inversion between api and worker; this
+// test pins the order so any future drift fails here.
 var canonicalTierOrder = []string{
 	"anonymous", "free", "hobby", "hobby_plus", "pro", "growth", "team",
 }
@@ -217,6 +218,53 @@ func TestBillingTierRank_Ordering(t *testing.T) {
 			t.Errorf("tierRank(%q) = %d should be < tierRank(%q) = %d — "+
 				"the worker rank table must follow the canonical plans.yaml order",
 				lo, jobs.BillingTierRank(lo), hi, jobs.BillingTierRank(hi))
+		}
+	}
+}
+
+// TestBillingTierRank_MatchesSharedRegistry is the CLAUDE.md rule-18 pin test:
+// it iterates the LIVE shared plans registry (commonplans.Default().All())
+// rather than a hand-typed slice, and asserts the worker's billingTierRank
+// returns commonplans.Rank for every tier the registry knows about.
+//
+// Before the fix this test could not have existed: the worker kept a private
+// billingTierRankMap that silently returned 0 for any tier absent from it. The
+// day a tier was added to plans.yaml + common/plans/rank.go but NOT the worker
+// map, the reconciler mis-ranked it and skipped a legitimate upgrade — with no
+// test to catch the drift. billingTierRank now delegates to commonplans.Rank,
+// so a new tier in the shared registry is ranked correctly with zero worker
+// edits, and this test fails loudly if that delegation is ever broken.
+func TestBillingTierRank_MatchesSharedRegistry(t *testing.T) {
+	reg := commonplans.Default()
+	if reg == nil {
+		t.Fatal("commonplans.Default() returned nil")
+	}
+	tiers := reg.All()
+	if len(tiers) == 0 {
+		t.Fatal("commonplans.Default().All() returned no tiers")
+	}
+	for tier := range tiers {
+		// billingTierRank MUST agree with commonplans.Rank for every
+		// registry tier — that is the delegation contract. (commonplans.Rank
+		// is intentionally case/whitespace-insensitive and does NOT
+		// special-case the "*_yearly" billing variants, so a yearly variant
+		// legitimately ranks -1 on BOTH sides; the equality check still
+		// holds, which is the property that matters.)
+		want := commonplans.Rank(tier)
+		got := jobs.BillingTierRank(tier)
+		if got != want {
+			t.Errorf("billingTierRank(%q) = %d, commonplans.Rank(%q) = %d — "+
+				"the worker rank must delegate to the shared common/plans registry",
+				tier, got, tier, want)
+		}
+		// The canonical (non-yearly) tier MUST resolve to a known rank: if a
+		// tier present in plans.yaml — after CanonicalTier strips any
+		// "_yearly" suffix — ranks as -1, common/plans/rank.go is missing a
+		// case and the reconciler would mis-classify that tier's upgrades.
+		canonical := commonplans.CanonicalTier(tier)
+		if r := commonplans.Rank(canonical); r < 0 {
+			t.Errorf("tier %q (canonical %q) is in the plans registry but commonplans.Rank returns %d (unknown) — "+
+				"add a case for it in common/plans/rank.go", tier, canonical, r)
 		}
 	}
 }

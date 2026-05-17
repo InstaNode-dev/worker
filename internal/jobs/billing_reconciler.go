@@ -56,6 +56,7 @@ import (
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
 
+	commonplans "instant.dev/common/plans"
 	"instant.dev/worker/internal/circuit"
 	"instant.dev/worker/internal/metrics"
 )
@@ -129,21 +130,27 @@ var razorpayStatusClass = map[string]rzpStatusClass{
 
 // ── tier ranking ──────────────────────────────────────────────────────────────
 
-// billingTierRankMap assigns a numeric rank to each tier. Higher rank = higher
-// tier. Tiers absent from the map get rank 0 (treated as unknown / lowest).
-var billingTierRankMap = map[string]int{
-	"anonymous":  0,
-	"free":       1,
-	"hobby":      2,
-	"hobby_plus": 3,
-	"pro":        4,
-	"growth":     5,
-	"team":       6,
-}
-
-// billingTierRank returns the numeric rank for a tier name.
+// billingTierRank returns the numeric rank for a tier name, delegating to the
+// shared common/plans canonical rank registry (commonplans.Rank). Higher rank
+// = higher tier.
+//
+// This used to be a worker-local hand-maintained map (billingTierRankMap).
+// That map silently returned rank 0 for any tier absent from it — so the day
+// a new tier was added to plans.yaml + common/plans/rank.go but NOT to the
+// worker map, the reconciler mis-ranked it as the lowest tier and skipped a
+// legitimate upgrade. Routing through commonplans.Rank keeps the worker in
+// lock-step with the single source of truth: a tier added to rank.go is
+// ranked correctly here with no worker edit.
+//
+// commonplans.Rank returns -1 for an unknown tier. The original map returned
+// 0 (== "anonymous") for unknowns. The reconciler's only caller compares two
+// ranks with `>=` to decide "DB tier already at/above expected" — and -1 is
+// strictly below every known tier, so an unknown DB tier still correctly
+// resolves to "below expected" (i.e. it will be upgraded), matching the
+// old 0-for-unknown behaviour. The case/whitespace normalisation that used
+// to live here is handled inside commonplans.Rank.
 func billingTierRank(tier string) int {
-	return billingTierRankMap[strings.ToLower(strings.TrimSpace(tier))]
+	return commonplans.Rank(tier)
 }
 
 // billingPaidTiers is the set of tiers that represent an active paid subscription.
