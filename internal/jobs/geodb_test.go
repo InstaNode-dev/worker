@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"instant.dev/worker/internal/jobs"
 )
@@ -119,5 +120,94 @@ func TestExtractGeoLite2MMDB_NotGzip(t *testing.T) {
 	err := jobs.ExtractGeoLite2MMDB(strings.NewReader("<html>not a tarball</html>"), dst)
 	if err == nil {
 		t.Fatal("expected error for non-gzip input, got nil")
+	}
+}
+
+// ── P1-D: GeoLite2 refresh freshness gate ─────────────────────────────────────
+
+// TestGeoDBIsFresh_RecentFileIsFresh proves a file modified within
+// GeoLite2MaxAge is reported fresh — so Work() skips the MaxMind download on
+// a routine worker restart instead of refetching every time.
+func TestGeoDBIsFresh_RecentFileIsFresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
+	if err := os.WriteFile(path, []byte("mmdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if !jobs.GeoDBIsFresh(path, now) {
+		t.Error("a just-written file must be reported fresh; otherwise every worker restart refetches from MaxMind")
+	}
+}
+
+// TestGeoDBIsFresh_StaleFileIsNotFresh proves a file older than
+// GeoLite2MaxAge is reported NOT fresh — so Work() proceeds with the refresh.
+// This is the core P1-D guarantee: the geo DB does NOT stay the stale
+// baked-in copy forever.
+func TestGeoDBIsFresh_StaleFileIsNotFresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
+	if err := os.WriteFile(path, []byte("mmdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate the mtime well past the freshness window.
+	old := time.Now().Add(-2 * jobs.GeoLite2MaxAge)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if jobs.GeoDBIsFresh(path, time.Now()) {
+		t.Errorf("a file older than GeoLite2MaxAge (%s) must NOT be fresh — Work() must refresh it", jobs.GeoLite2MaxAge)
+	}
+}
+
+// TestGeoDBIsFresh_MissingFileIsNotFresh proves a missing file is treated as
+// not-fresh so the very first refresh always proceeds.
+func TestGeoDBIsFresh_MissingFileIsNotFresh(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.mmdb")
+	if jobs.GeoDBIsFresh(missing, time.Now()) {
+		t.Error("a missing geo DB file must NOT be reported fresh — the first refresh must run")
+	}
+	if jobs.GeoDBIsFresh("", time.Now()) {
+		t.Error("an empty path must NOT be reported fresh")
+	}
+}
+
+// TestGeoLite2RefreshInterval_AlignsWithMaxAge guards the P1-D contract: the
+// periodic backstop interval must not exceed the freshness window, or a
+// never-redeployed worker could let the geo DB drift past stale before the
+// next periodic tick. Both are derived from the same 7-day window.
+func TestGeoLite2RefreshInterval_AlignsWithMaxAge(t *testing.T) {
+	if jobs.GeoLite2RefreshInterval > jobs.GeoLite2MaxAge {
+		t.Errorf("GeoLite2RefreshInterval (%s) must be <= GeoLite2MaxAge (%s); "+
+			"a longer interval lets the geo DB go stale on a long-lived worker before the backstop fires",
+			jobs.GeoLite2RefreshInterval, jobs.GeoLite2MaxAge)
+	}
+}
+
+// TestGeoDBPeriodicJob_RunsOnStart is the P1-D regression guard. The refresh
+// periodic job MUST be registered with RunOnStart:true — with RunOnStart
+// false (the original bug) a frequently-redeployed worker keeps resetting
+// the long periodic timer and the job never fires, leaving the geo DB the
+// stale baked-in copy forever. This scans workers.go for the geodb periodic
+// job block and fails if it is not RunOnStart:true.
+func TestGeoDBPeriodicJob_RunsOnStart(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("workers.go"))
+	if err != nil {
+		t.Fatalf("read workers.go: %v", err)
+	}
+	body := string(src)
+	idx := strings.Index(body, "RefreshGeoDBArgs{")
+	if idx < 0 {
+		t.Fatal("workers.go no longer registers RefreshGeoDBArgs — geodb refresh job missing")
+	}
+	// Inspect the ~400 bytes following the geodb job builder — that window
+	// covers the PeriodicJobOpts literal for this job.
+	end := idx + 400
+	if end > len(body) {
+		end = len(body)
+	}
+	window := body[idx:end]
+	if !strings.Contains(window, "RunOnStart: true") {
+		t.Errorf("the GeoLite2 refresh periodic job must be registered with "+
+			"RunOnStart: true (P1-D) — otherwise a redeployed worker never runs it. "+
+			"Block inspected:\n%s", window)
 	}
 }
