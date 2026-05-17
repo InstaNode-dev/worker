@@ -25,15 +25,19 @@
 package jobs
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,6 +54,16 @@ func (CustomerRestoreRunnerArgs) Kind() string { return "customer_restore_runner
 const (
 	restoreBatchSize     = 5
 	restorePerRunTimeout = 30 * time.Minute
+
+	// restoreReasonIntegrityFailed is the error_summary written when the
+	// SHA-256 of the downloaded S3 object does not match the digest the
+	// backup runner stored in resource_backups.sha256. It mirrors the
+	// `backup_integrity_failed` reason documented by the api side
+	// (api/internal/handlers/backup.go) and migration 043_backup_sha256.sql.
+	// On this reason the runner DOES NOT invoke pg_restore — a bit-rotted
+	// or truncated archive must never be applied with --clean --if-exists
+	// over live customer data.
+	restoreReasonIntegrityFailed = "backup_integrity_failed"
 )
 
 // pgRestoreRunner mirrors pgDumpRunner — abstraction seam for tests.
@@ -117,7 +131,7 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT rr.id::text, rr.resource_id::text, rr.backup_id::text,
-		       rb.s3_key,
+		       rb.s3_key, rb.sha256,
 		       r.connection_url, r.resource_type, r.token::text, r.team_id
 		FROM resource_restores rr
 		JOIN resource_backups rb ON rb.id = rr.backup_id
@@ -136,6 +150,7 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 		resourceID   string
 		backupID     string
 		s3Key        sql.NullString
+		sha256       sql.NullString
 		connURL      sql.NullString
 		resourceType string
 		token        string
@@ -146,7 +161,7 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 		var p pending
 		if scanErr := rows.Scan(
 			&p.restoreID, &p.resourceID, &p.backupID,
-			&p.s3Key, &p.connURL, &p.resourceType, &p.token, &p.teamID,
+			&p.s3Key, &p.sha256, &p.connURL, &p.resourceType, &p.token, &p.teamID,
 		); scanErr != nil {
 			slog.Warn("jobs.customer_restore_runner.scan_failed", "error", scanErr)
 			continue
@@ -190,6 +205,7 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 	resourceID   string
 	backupID     string
 	s3Key        sql.NullString
+	sha256       sql.NullString
 	connURL      sql.NullString
 	resourceType string
 	token        string
@@ -248,15 +264,55 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 		return false
 	}
 
-	// Download from S3 → gunzip → pg_restore stdin.
+	// Download from S3. We buffer the WHOLE object into memory rather than
+	// streaming it straight into gunzip→pg_restore, because the SHA-256
+	// integrity check below must hash the exact bytes BEFORE pg_restore's
+	// `--clean --if-exists` DROPs every table. A streaming verify-as-you-go
+	// would only detect a mismatch after the destructive restore already ran.
+	// Memory cost is bounded by the per-tier backup size (the same gzipped
+	// object the backup runner already round-trips through io.Pipe).
 	obj, dlErr := w.store.Download(ctx, w.bucket, p.s3Key.String)
 	if dlErr != nil {
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("S3 download failed: %v", dlErr), start, p)
 		return false
 	}
-	defer obj.Close()
+	objBytes, readErr := io.ReadAll(obj)
+	obj.Close()
+	if readErr != nil {
+		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("S3 read failed: %v", readErr), start, p)
+		return false
+	}
 
-	gzReader, gzErr := gzip.NewReader(obj)
+	// Integrity gate. The backup runner (customer_backup_runner.go, FIX-H
+	// #59) hashes the COMPRESSED (gzipped) object — its SHA-256 hasher sits
+	// in an io.MultiWriter fed by the gzip writer's output, i.e. the exact
+	// bytes uploaded to S3. So we hash objBytes here (still gzipped, BEFORE
+	// gunzip) to compare against the stored digest. A mismatch means the
+	// object bit-rotted or was truncated in transit → refuse to restore.
+	//
+	// Fail-open on a NULL/empty stored digest: rows predating migration
+	// 043_backup_sha256.sql have no sha256, and the documented contract is
+	// to log a warning and proceed rather than block restores of legacy
+	// backups.
+	if storedDigest := strings.TrimSpace(p.sha256.String); !p.sha256.Valid || storedDigest == "" {
+		slog.Warn("jobs.customer_restore_runner.integrity_check_skipped",
+			"reason", "stored sha256 is null/empty (legacy backup predating migration 043)",
+			"restore_id", p.restoreID,
+			"backup_id", p.backupID,
+		)
+	} else {
+		sum := sha256.Sum256(objBytes)
+		actualDigest := hex.EncodeToString(sum[:])
+		if !strings.EqualFold(actualDigest, storedDigest) {
+			w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf(
+				"%s: sha256 mismatch (stored %s, downloaded %s) — backup object is corrupt or truncated; pg_restore NOT run",
+				restoreReasonIntegrityFailed, storedDigest, actualDigest), start, p)
+			return false
+		}
+	}
+
+	// Verified (or fail-open legacy) → gunzip the buffered bytes and restore.
+	gzReader, gzErr := gzip.NewReader(bytes.NewReader(objBytes))
 	if gzErr != nil {
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("gunzip header: %v", gzErr), start, p)
 		return false
@@ -305,6 +361,7 @@ func (w *CustomerRestoreRunnerWorker) markRestoreFailed(
 		resourceID   string
 		backupID     string
 		s3Key        sql.NullString
+		sha256       sql.NullString
 		connURL      sql.NullString
 		resourceType string
 		token        string
