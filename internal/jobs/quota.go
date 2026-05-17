@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -51,6 +52,35 @@ const (
 	resourceStatusSuspended = "suspended"
 	resourceStatusActive    = "active"
 )
+
+// Audit kinds for the storage-quota suspend/unsuspend lifecycle.
+//
+// Suspending a customer's database is a highly user-impacting event but, prior
+// to this, produced ZERO customer-visible artifact — only a slog line. These
+// audit_log rows give the event a durable, customer-facing surface (Recent
+// Activity in the dashboard; the api side renders an email for them). They
+// mirror the resource.degraded / resource.recovered pattern in
+// resource_heartbeat.go.
+//
+// The literal strings ARE the cross-module contract: the api repo wires an
+// email renderer keyed on these exact values. They must match byte-for-byte —
+// a typo here silently drops the email. Named constants per CLAUDE.md
+// ("Use named constants, not inline strings").
+const (
+	// quotaSuspendedKind is the audit_log.kind written after a resource's
+	// status is flipped to 'suspended' for exceeding its storage quota.
+	quotaSuspendedKind = "resource.quota_suspended"
+
+	// quotaUnsuspendedKind is the audit_log.kind written after a resource's
+	// status is flipped back to 'active' once usage drops below the
+	// hysteresis threshold.
+	quotaUnsuspendedKind = "resource.quota_unsuspended"
+)
+
+// quotaAuditActor is the audit_log.actor value for the system-written
+// suspend/unsuspend rows. Matches the convention used by resource_heartbeat.go
+// (resourceHeartbeatActor) and churn_predictor.go.
+const quotaAuditActor = "system"
 
 // quotaUnsuspendHysteresisFactor is the hysteresis band on the unsuspend
 // threshold. A resource is SUSPENDED at bytesUsed >= limitBytes but only
@@ -284,7 +314,8 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]string, error) {
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, token, resource_type, tier, storage_bytes,
-		       COALESCE(provider_resource_id, '')
+		       COALESCE(provider_resource_id, ''),
+		       team_id, COALESCE(name, '')
 		FROM resources
 		WHERE status = $1
 		  AND resource_type IN ('postgres', 'redis', 'mongodb')
@@ -306,8 +337,10 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 			tier               string
 			storageBytes       int64
 			providerResourceID string
+			teamID             sql.NullString
+			name               string
 		)
-		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID); scanErr != nil {
+		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID, &teamID, &name); scanErr != nil {
 			slog.Error("jobs.enforce_storage_quota.scan_error", "error", scanErr)
 			continue
 		}
@@ -381,6 +414,13 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 			"storage_bytes", storageBytes,
 			"limit_mb", limitMB,
 		)
+
+		// Emit the customer-visible audit_log row ONLY after the status flip
+		// actually landed — a suspend that never updated the row must not
+		// produce a "your resource was suspended" artifact. Best-effort: an
+		// audit insert failure is logged but does not unwind the suspend.
+		emitQuotaAuditRow(ctx, w.db, quotaSuspendedKind, teamID, id, resourceType, name)
+
 		suspendedIDs = append(suspendedIDs, id)
 	}
 	if err := rows.Err(); err != nil {
@@ -410,7 +450,8 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, token, resource_type, tier, storage_bytes,
-		       COALESCE(provider_resource_id, '')
+		       COALESCE(provider_resource_id, ''),
+		       team_id, COALESCE(name, '')
 		FROM resources
 		WHERE status = $1
 		  AND resource_type IN ('postgres', 'redis', 'mongodb')
@@ -431,8 +472,10 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 			tier               string
 			storageBytes       int64
 			providerResourceID string
+			teamID             sql.NullString
+			name               string
 		)
-		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID); scanErr != nil {
+		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID, &teamID, &name); scanErr != nil {
 			slog.Error("jobs.enforce_storage_quota.unsuspend_scan_error", "error", scanErr)
 			continue
 		}
@@ -511,6 +554,12 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 			"storage_bytes", storageBytes,
 			"limit_mb", limitMB,
 		)
+
+		// Emit the customer-visible audit_log row ONLY after the status flip
+		// back to 'active' actually landed. Best-effort: an audit insert
+		// failure is logged but does not unwind the unsuspend.
+		emitQuotaAuditRow(ctx, w.db, quotaUnsuspendedKind, teamID, id, resourceType, name)
+
 		unsuspended++
 	}
 	if err := rows.Err(); err != nil {
@@ -562,4 +611,45 @@ func checkStorageQuota(ctx context.Context, db *sql.DB, resourceID uuid.UUID, li
 
 	limitBytes := int64(limitMB) * 1024 * 1024
 	return bytesUsed, bytesUsed >= limitBytes, nil
+}
+
+// emitQuotaAuditRow writes one audit_log row recording a storage-quota
+// suspend / unsuspend. Called ONLY after the corresponding status UPDATE
+// succeeded — the audit row is the durable, customer-visible artifact for an
+// event that previously surfaced as nothing but a slog line.
+//
+// Mirrors the resource_heartbeat.go INSERT pattern: the metadata JSON carries
+// resource_id / resource_type / name so the api-side email renderer can read
+// them; team_id is NULL for anonymous resources (nullableTeamID handles that).
+//
+// Best-effort: a failure to insert is logged but never propagated — the status
+// flip has already landed and must not be unwound for a missing audit row.
+func emitQuotaAuditRow(ctx context.Context, db *sql.DB, kind string, teamID sql.NullString, resourceID, resourceType, name string) {
+	meta := map[string]any{
+		"resource_id":   resourceID,
+		"resource_type": resourceType,
+		"name":          name,
+	}
+	metaBytes, _ := json.Marshal(meta)
+
+	var summary string
+	switch kind {
+	case quotaSuspendedKind:
+		summary = fmt.Sprintf("%s resource %s suspended — storage quota exceeded", resourceType, resourceID)
+	case quotaUnsuspendedKind:
+		summary = fmt.Sprintf("%s resource %s unsuspended — storage usage back under quota", resourceType, resourceID)
+	default:
+		summary = fmt.Sprintf("%s resource %s storage-quota event", resourceType, resourceID)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO audit_log (team_id, actor, kind, summary, metadata, resource_type)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, nullableTeamID(teamID), quotaAuditActor, kind, summary, metaBytes, resourceType); err != nil {
+		slog.Error("jobs.enforce_storage_quota.audit_insert_failed",
+			"resource_id", resourceID,
+			"kind", kind,
+			"error", err,
+		)
+	}
 }
