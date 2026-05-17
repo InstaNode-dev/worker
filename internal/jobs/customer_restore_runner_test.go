@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"testing"
@@ -14,6 +16,15 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
 )
+
+// sha256Hex returns the lowercase hex SHA-256 of b — the exact digest shape
+// the backup runner stores in resource_backups.sha256 (it hashes the
+// COMPRESSED/gzipped object). Tests use it to pre-compute the stored digest
+// of a gzip blob so the restore runner's integrity gate passes.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 func fakeRestoreJob() *river.Job[CustomerRestoreRunnerArgs] {
 	return &river.Job[CustomerRestoreRunnerArgs]{JobRow: &rivertype.JobRow{ID: 1}}
@@ -75,12 +86,20 @@ func TestRestoreRunner_HappyPath(t *testing.T) {
 	plainConn := "postgres://u:p@host/db"
 	encConn := encryptForTest(t, plainConn)
 
+	store := newFakeBackupStore()
+	payload := []byte("PG-RESTORE-PAYLOAD")
+	gzBytes := gzipFor(t, payload)
+	store.objects["instant-shared/"+s3Key] = gzBytes
+	// Stored digest = SHA-256 of the gzipped object, matching what the
+	// backup runner persists. The integrity gate must pass on this row.
+	storedSHA := sha256Hex(gzBytes)
+
 	mock.ExpectQuery(`SELECT rr.id::text`).
 		WithArgs(restoreBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "resource_id", "backup_id", "s3_key",
+			"id", "resource_id", "backup_id", "s3_key", "sha256",
 			"connection_url", "resource_type", "token", "team_id",
-		}).AddRow(restoreID, resID, backupID, s3Key, encConn, "postgres", "tok-abc", teamID))
+		}).AddRow(restoreID, resID, backupID, s3Key, storedSHA, encConn, "postgres", "tok-abc", teamID))
 
 	mock.ExpectQuery(`UPDATE resource_restores\s+SET status = 'running'`).
 		WithArgs(restoreID).
@@ -97,10 +116,6 @@ func TestRestoreRunner_HappyPath(t *testing.T) {
 	// restore.succeeded audit.
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	store := newFakeBackupStore()
-	payload := []byte("PG-RESTORE-PAYLOAD")
-	store.objects["instant-shared/"+s3Key] = gzipFor(t, payload)
 
 	pgr := &fakePgRestore{}
 	w := &CustomerRestoreRunnerWorker{
@@ -146,9 +161,9 @@ func TestRestoreRunner_NullS3Key_FailsWithExplicitMessage(t *testing.T) {
 	mock.ExpectQuery(`SELECT rr.id::text`).
 		WithArgs(restoreBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "resource_id", "backup_id", "s3_key",
+			"id", "resource_id", "backup_id", "s3_key", "sha256",
 			"connection_url", "resource_type", "token", "team_id",
-		}).AddRow(restoreID, resID, "bk", nil, encConn, "postgres", "tok-abc", teamID))
+		}).AddRow(restoreID, resID, "bk", nil, nil, encConn, "postgres", "tok-abc", teamID))
 
 	mock.ExpectQuery(`UPDATE resource_restores\s+SET status = 'running'`).
 		WithArgs(restoreID).
@@ -194,12 +209,16 @@ func TestRestoreRunner_PgRestoreFails_MarksFailed(t *testing.T) {
 	s3Key := "backups/tok-abc/" + backupID + ".dump.gz"
 	encConn := encryptForTest(t, "postgres://u:p@host/db")
 
+	store := newFakeBackupStore()
+	gzBytes := gzipFor(t, []byte("PG-RESTORE-PAYLOAD"))
+	store.objects["instant-shared/"+s3Key] = gzBytes
+
 	mock.ExpectQuery(`SELECT rr.id::text`).
 		WithArgs(restoreBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "resource_id", "backup_id", "s3_key",
+			"id", "resource_id", "backup_id", "s3_key", "sha256",
 			"connection_url", "resource_type", "token", "team_id",
-		}).AddRow(restoreID, resID, backupID, s3Key, encConn, "postgres", "tok-abc", teamID))
+		}).AddRow(restoreID, resID, backupID, s3Key, sha256Hex(gzBytes), encConn, "postgres", "tok-abc", teamID))
 
 	mock.ExpectQuery(`UPDATE resource_restores\s+SET status = 'running'`).
 		WithArgs(restoreID).
@@ -210,9 +229,6 @@ func TestRestoreRunner_PgRestoreFails_MarksFailed(t *testing.T) {
 		WithArgs(restoreID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
-
-	store := newFakeBackupStore()
-	store.objects["instant-shared/"+s3Key] = gzipFor(t, []byte("PG-RESTORE-PAYLOAD"))
 
 	w := &CustomerRestoreRunnerWorker{
 		db:        db,
@@ -250,5 +266,141 @@ func TestRestoreRunner_NilStore_NoOp(t *testing.T) {
 	}
 	if err := w.Work(context.Background(), fakeRestoreJob()); err != nil {
 		t.Fatalf("expected no-op, got %v", err)
+	}
+}
+
+// TestRestoreRunner_IntegrityMismatch_RefusesRestore — the stored sha256
+// does NOT match the SHA-256 of the downloaded S3 object (bit-rot /
+// truncation). The runner MUST mark the restore 'failed' with the
+// backup_integrity_failed reason and MUST NOT invoke pg_restore — running
+// pg_restore --clean --if-exists would DROP every customer table before
+// applying a corrupt archive. This test fails if the integrity check is
+// removed (pgr.Run would then be called).
+func TestRestoreRunner_IntegrityMismatch_RefusesRestore(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	restoreID := "rrrrrrr0-1111-2222-3333-444444444444"
+	resID := "22222222-2222-2222-2222-222222222222"
+	backupID := "11111111-1111-1111-1111-111111111111"
+	teamID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	s3Key := "backups/tok-abc/" + backupID + ".dump.gz"
+	encConn := encryptForTest(t, "postgres://u:p@host/db")
+
+	store := newFakeBackupStore()
+	gzBytes := gzipFor(t, []byte("PG-RESTORE-PAYLOAD"))
+	store.objects["instant-shared/"+s3Key] = gzBytes
+	// Stored digest is for DIFFERENT bytes than what S3 will return —
+	// simulates a corrupt/truncated object.
+	wrongDigest := sha256Hex([]byte("THESE-ARE-NOT-THE-OBJECT-BYTES"))
+
+	mock.ExpectQuery(`SELECT rr.id::text`).
+		WithArgs(restoreBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "resource_id", "backup_id", "s3_key", "sha256",
+			"connection_url", "resource_type", "token", "team_id",
+		}).AddRow(restoreID, resID, backupID, s3Key, wrongDigest, encConn, "postgres", "tok-abc", teamID))
+
+	mock.ExpectQuery(`UPDATE resource_restores\s+SET status = 'running'`).
+		WithArgs(restoreID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(restoreID))
+	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// The restore must be marked 'failed' with the integrity reason.
+	mock.ExpectExec(`UPDATE resource_restores\s+SET status = 'failed'`).
+		WithArgs(restoreID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	pgr := &fakePgRestore{}
+	w := &CustomerRestoreRunnerWorker{
+		db:        db,
+		store:     store,
+		pgRestore: pgr,
+		bucket:    "instant-shared",
+		aesKey:    testAESKeyHex,
+		now:       time.Now,
+		timeout:   time.Minute,
+		batchN:    restoreBatchSize,
+	}
+
+	if err := w.Work(context.Background(), fakeRestoreJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	// The load-bearing assertion: pg_restore must NOT have run. gotConn is
+	// the empty string until fakePgRestore.Run is invoked.
+	if pgr.gotConn != "" {
+		t.Errorf("pg_restore was invoked on a corrupt backup (gotConn=%q) — "+
+			"integrity check is missing or broken", pgr.gotConn)
+	}
+}
+
+// TestRestoreRunner_NullDigest_FailsOpen — a legacy backup row predating
+// migration 043_backup_sha256.sql has NULL sha256. The documented contract
+// is fail-open: log a warning and proceed with the restore rather than
+// block it. pg_restore MUST run and the row finalizes 'ok'.
+func TestRestoreRunner_NullDigest_FailsOpen(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	restoreID := "rrrrrrr0-1111-2222-3333-444444444444"
+	resID := "22222222-2222-2222-2222-222222222222"
+	backupID := "11111111-1111-1111-1111-111111111111"
+	teamID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	s3Key := "backups/tok-abc/" + backupID + ".dump.gz"
+	plainConn := "postgres://u:p@host/db"
+	encConn := encryptForTest(t, plainConn)
+
+	store := newFakeBackupStore()
+	payload := []byte("PG-RESTORE-PAYLOAD")
+	store.objects["instant-shared/"+s3Key] = gzipFor(t, payload)
+
+	mock.ExpectQuery(`SELECT rr.id::text`).
+		WithArgs(restoreBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "resource_id", "backup_id", "s3_key", "sha256",
+			"connection_url", "resource_type", "token", "team_id",
+		}).AddRow(restoreID, resID, backupID, s3Key, nil, encConn, "postgres", "tok-abc", teamID))
+
+	mock.ExpectQuery(`UPDATE resource_restores\s+SET status = 'running'`).
+		WithArgs(restoreID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(restoreID))
+	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE resource_restores\s+SET status = 'ok'`).
+		WithArgs(restoreID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	pgr := &fakePgRestore{}
+	w := &CustomerRestoreRunnerWorker{
+		db:        db,
+		store:     store,
+		pgRestore: pgr,
+		bucket:    "instant-shared",
+		aesKey:    testAESKeyHex,
+		now:       time.Now,
+		timeout:   time.Minute,
+		batchN:    restoreBatchSize,
+	}
+
+	if err := w.Work(context.Background(), fakeRestoreJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	// Fail-open: the restore proceeded despite the missing digest.
+	if !bytes.Equal(pgr.gotBody, payload) {
+		t.Errorf("pg_restore body = %q; want %q — fail-open on NULL digest is broken",
+			pgr.gotBody, payload)
 	}
 }
