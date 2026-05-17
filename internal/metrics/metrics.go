@@ -239,4 +239,16 @@ var (
 		Name: "instant_billing_reconciler_razorpay_errors_total",
 		Help: "Razorpay API errors (including circuit-open) encountered during a reconciler tick.",
 	})
+
+	// GoroutinePanicsRecovered counts panics caught by the shared
+	// fire-and-forget goroutine recovery helper (jobs.SafeGo). A non-zero
+	// value means a background goroutine panicked but the worker pod
+	// survived (without the helper the panic crashes the whole process).
+	// Labelled by `site` — a stable string identifying the goroutine — so
+	// the NR alert can point straight at the failing job.
+	// NR alert: instant_worker_goroutine_panics_recovered_total > 0 in 15m → P2.
+	GoroutinePanicsRecovered = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_worker_goroutine_panics_recovered_total",
+		Help: "Panics recovered by the worker's fire-and-forget goroutine recovery helper, labelled by site.",
+	}, []string{"site"})
 )

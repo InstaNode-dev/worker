@@ -371,6 +371,18 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	// then we close pw to signal EOF to the S3 Upload reader side.
 	dumpDone := make(chan error, 1)
 	go func() {
+		// Panic boundary (P1-B): a panic in pg_dump / gzip would otherwise
+		// crash the worker pod. On panic the inline pw.CloseWithError below
+		// is skipped, so close the pipe with an explicit error here too so
+		// the Upload reader sees EOF instead of blocking forever.
+		defer func() {
+			if r := recover(); r != nil {
+				panicErr := fmt.Errorf("pg_dump goroutine panicked: %v", r)
+				_ = pw.CloseWithError(panicErr)
+				dumpDone <- panicErr
+				LogRecoveredPanic("customer_backup_runner.pg_dump_pipe", r)
+			}
+		}()
 		mw := io.MultiWriter(hasher, pw)
 		gz := gzip.NewWriter(mw)
 		runErr := w.pgDump.Run(ctx, plainConn, gz)

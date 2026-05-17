@@ -365,6 +365,19 @@ func (w *PlatformDBBackupWorker) Work(ctx context.Context, job *river.Job[Platfo
 	dumpErrCh := make(chan error, 1)
 	dumpSizeCh := make(chan int64, 1)
 	go func() {
+		// Panic boundary (P1-B): a panic in the dumper would otherwise crash
+		// the worker pod. On panic close the pipe with an explicit error so
+		// the uploader's Read returns instead of blocking forever, and push
+		// values onto both channels so the main goroutine isn't deadlocked.
+		defer func() {
+			if r := recover(); r != nil {
+				panicErr := fmt.Errorf("platform_db_backup dump goroutine panicked: %v", r)
+				_ = pw.CloseWithError(panicErr)
+				dumpSizeCh <- 0
+				dumpErrCh <- panicErr
+				LogRecoveredPanic("platform_db_backup.dump_pipe", r)
+			}
+		}()
 		// CloseWithError is the contract — even success must close so the
 		// uploader's Read returns EOF.
 		n, err := w.dumper.Dump(ctx, w.databaseURL, pw)

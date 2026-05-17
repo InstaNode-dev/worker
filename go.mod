@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
+	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.17
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16
@@ -16,6 +17,7 @@ require (
 	github.com/minio/minio-go/v7 v7.0.90
 	github.com/newrelic/go-agent/v3 v3.43.3
 	github.com/prometheus/client_golang v1.21.0
+	github.com/prometheus/client_model v0.6.2
 	github.com/razorpay/razorpay-go v1.4.0
 	github.com/redis/go-redis/v9 v9.6.1
 	github.com/riverqueue/river v0.11.4
@@ -37,7 +39,6 @@ require (
 )
 
 require (
-	github.com/alicebob/miniredis/v2 v2.37.0 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
@@ -92,7 +93,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.63.0 // indirect
 	github.com/prometheus/procfs v0.16.0 // indirect
 	github.com/prometheus/prom2json v1.4.2 // indirect

@@ -208,6 +208,10 @@ func (w *ResourceHeartbeatWorker) Work(ctx context.Context, job *river.Job[Resou
 		}
 		wg.Add(1)
 		go func(cc heartbeatCandidate) {
+			// Recover is declared first so it runs LAST (LIFO) — wg.Done and
+			// sem.Release still fire on the panic path, so wg.Wait() below
+			// is never left hanging (P1-B).
+			defer Recover("resource_heartbeat.probe")
 			defer wg.Done()
 			defer sem.Release(1)
 			outcome := w.probeOne(ctx, cc)

@@ -434,6 +434,17 @@ func (w *TeamDeletionExecutorWorker) deleteS3BackupsForToken(ctx context.Context
 
 	go func() {
 		defer close(objectsCh)
+		// Panic boundary (P1-B): a panic in the S3 list iterator would
+		// otherwise crash the worker pod. This defer is declared AFTER the
+		// close(objectsCh) defer so it runs FIRST (LIFO) — it pushes a
+		// terminal error onto the buffered listErrCh so the RemoveObjects
+		// consumer is not left blocked, then close(objectsCh) signals EOF.
+		defer func() {
+			if r := recover(); r != nil {
+				listErrCh <- fmt.Errorf("team_deletion S3 list goroutine panicked: %v", r)
+				LogRecoveredPanic("team_deletion_executor.s3_list", r)
+			}
+		}()
 		for obj := range w.s3.ListObjects(ctx, w.bucketName, minio.ListObjectsOptions{
 			Prefix:    prefix,
 			Recursive: true,
