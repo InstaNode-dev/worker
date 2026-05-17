@@ -47,12 +47,15 @@ type ResourceInfraRevoker interface {
 	//
 	// tier is required for redis: the Redis ACL username scheme differs
 	// between the shared backend (usr_<full-token>) and the dedicated
-	// backend (ded_<token[:8]>). See redisUsernameForToken.
-	RevokeAccess(ctx context.Context, resourceType, token, tier string) error
+	// backend (ded_<full-token>). providerResourceID carries the canonical
+	// username the provisioner stamped on the resource row at provision time;
+	// when non-empty it is used verbatim, never re-derived. See
+	// redisUsernameForToken.
+	RevokeAccess(ctx context.Context, resourceType, token, tier, providerResourceID string) error
 
 	// GrantAccess re-enables connectivity (GRANT CONNECT, ACL SETUSER on,
 	// grantRolesToUser). Same semantics as RevokeAccess.
-	GrantAccess(ctx context.Context, resourceType, token, tier string) error
+	GrantAccess(ctx context.Context, resourceType, token, tier, providerResourceID string) error
 }
 
 // StatusOnly is the sentinel constant used as resourceType when a resource type
@@ -81,12 +84,12 @@ func NewDirectResourceRevoker(customerDatabaseURL, mongoAdminURI, customerRedisU
 }
 
 // RevokeAccess implements ResourceInfraRevoker.
-func (r *directResourceRevoker) RevokeAccess(ctx context.Context, resourceType, token, tier string) error {
+func (r *directResourceRevoker) RevokeAccess(ctx context.Context, resourceType, token, tier, providerResourceID string) error {
 	switch resourceType {
 	case "postgres":
 		return r.revokePostgres(ctx, token)
 	case "redis":
-		return r.revokeRedis(ctx, token, tier)
+		return r.revokeRedis(ctx, token, tier, providerResourceID)
 	case "mongodb":
 		return r.revokeMongo(ctx, token)
 	default:
@@ -97,12 +100,12 @@ func (r *directResourceRevoker) RevokeAccess(ctx context.Context, resourceType, 
 }
 
 // GrantAccess implements ResourceInfraRevoker.
-func (r *directResourceRevoker) GrantAccess(ctx context.Context, resourceType, token, tier string) error {
+func (r *directResourceRevoker) GrantAccess(ctx context.Context, resourceType, token, tier, providerResourceID string) error {
 	switch resourceType {
 	case "postgres":
 		return r.grantPostgres(ctx, token)
 	case "redis":
-		return r.grantRedis(ctx, token, tier)
+		return r.grantRedis(ctx, token, tier, providerResourceID)
 	case "mongodb":
 		return r.grantMongo(ctx, token)
 	default:
@@ -203,61 +206,89 @@ func (r *directResourceRevoker) grantPostgres(ctx context.Context, token string)
 //
 // DEDICATED backend (paid tiers — a per-tenant k8s Redis pod):
 //
-//	ded_<token[:8]>
+//	ded_<FULL-token>          (current scheme, P1 round-2 token-truncation fix)
+//	ded_<token[:8]>           (legacy scheme — rows provisioned before the fix)
 //
 //	Verified against:
-//	  - provisioner/internal/backend/redis/dedicated.go provisionLocal:
-//	    short := token; if len(short) > 8 { short = short[:8] }
-//	    username := fmt.Sprintf("ded_%s", short)
+//	  - provisioner/internal/backend/redis/dedident.go:
+//	    dedicatedACLUsername(token) = "ded_" + token  (the FULL token).
+//	  - the provisioner stamps that canonical username into
+//	    ProviderResourceID, the api persists it on resources.provider_resource_id.
 //
 // The two schemes are distinguished by tier: anonymous/free live on the shared
 // backend, every paid tier gets a dedicated pod. isSharedRedisTier (defined in
 // quota_redis_eviction.go) is the canonical tier→backend classifier and is
 // reused here so the two call sites can never drift.
+//
+// Username resolution is store-at-provision, never re-derive (matches the
+// provisioner's dedident.go and api's poolident.go pattern): the worker uses
+// the provider_resource_id value stamped on the resource row when present, and
+// falls back to a token derivation only for legacy rows (provider_resource_id
+// NULL/empty). For dedicated Redis the legacy derivation must reproduce the
+// old ded_<token[:8]> form — that is what a pre-fix dedicated pod's ACL user
+// is actually called.
 const (
 	sharedRedisACLUserPrefix    = "usr_" // shared backend: usr_<full-token>
-	dedicatedRedisACLUserPrefix = "ded_" // dedicated backend: ded_<token[:8]>
-	// dedicatedRedisACLUserTokenLen is the token-prefix length the dedicated
-	// provisioner backend uses for its ACL username. Kept as a named constant
-	// per CLAUDE.md ("Use named constants, not inline strings") and so a future
-	// audit can grep it against provisioner/.../redis/dedicated.go.
-	dedicatedRedisACLUserTokenLen = 8
+	dedicatedRedisACLUserPrefix = "ded_" // dedicated backend: ded_<full-token>
+	// dedicatedRedisLegacyTokenLen is the token-prefix length the PRE-FIX
+	// dedicated provisioner backend used for its ACL username
+	// (ded_<token[:8]>). Retained as a named constant ONLY so the worker can
+	// reconstruct the legacy username for a dedicated-Redis resource row that
+	// was provisioned before the token-truncation fix and therefore has an
+	// empty provider_resource_id. New rows never use it.
+	dedicatedRedisLegacyTokenLen = 8
 )
 
-// redisUsernameForToken returns the EXACT ACL username the provisioner/api
-// assign to a Redis resource of the given tier. It must be byte-for-byte
-// identical to the provision-time username or the quota-suspend ACL op is a
-// silent no-op (see the scheme documentation above).
-func redisUsernameForToken(token, tier string) string {
+// redisUsernameForToken returns the EXACT ACL username the quota-suspend ACL
+// op must target for a Redis resource. It MUST be byte-for-byte identical to
+// the provision-time username or the op is a silent no-op (see the scheme
+// documentation above).
+//
+// Resolution order:
+//  1. providerResourceID — the canonical username the provisioner stamped on
+//     the resource row at provision time. Used verbatim when non-empty. This
+//     is the path every resource provisioned after the token-truncation fix
+//     takes; no re-derivation, no drift.
+//  2. shared tier  → usr_<full-token>  (the shared backend never truncated).
+//  3. dedicated tier, empty providerResourceID → ded_<token[:8]>, the LEGACY
+//     truncated form, because a dedicated-Redis row with no stored identifier
+//     was provisioned before the fix and its ACL user really is under the old
+//     8-char name.
+func redisUsernameForToken(token, tier, providerResourceID string) string {
+	// (1) Stored canonical identifier wins — it is the exact provisioned name.
+	if providerResourceID != "" {
+		return providerResourceID
+	}
 	if isSharedRedisTier(tier) {
-		// Shared backend: full token, never truncated (P1-D / P1-E).
+		// (2) Shared backend: full token, never truncated (P1-D / P1-E).
 		return sharedRedisACLUserPrefix + token
 	}
-	// Dedicated backend: ded_ + first 8 chars of the token.
+	// (3) Legacy dedicated row (no stored PRID): the ACL user is under the
+	// old truncated ded_<token[:8]> name.
 	short := token
-	if len(short) > dedicatedRedisACLUserTokenLen {
-		short = short[:dedicatedRedisACLUserTokenLen]
+	if len(short) > dedicatedRedisLegacyTokenLen {
+		short = short[:dedicatedRedisLegacyTokenLen]
 	}
 	return dedicatedRedisACLUserPrefix + short
 }
 
-func (r *directResourceRevoker) revokeRedis(ctx context.Context, token, tier string) error {
+func (r *directResourceRevoker) revokeRedis(ctx context.Context, token, tier, providerResourceID string) error {
 	if r.customerRedisURL == "" {
 		slog.Warn("quota_infra.revokeRedis: CUSTOMER_REDIS_URL not set — skipping infra revoke",
 			"token", token)
 		return nil
 	}
-	username := redisUsernameForToken(token, tier)
+	username := redisUsernameForToken(token, tier, providerResourceID)
 	return setCustomerRedisACL(ctx, r.customerRedisURL, username, false, token)
 }
 
-func (r *directResourceRevoker) grantRedis(ctx context.Context, token, tier string) error {
+func (r *directResourceRevoker) grantRedis(ctx context.Context, token, tier, providerResourceID string) error {
 	if r.customerRedisURL == "" {
 		slog.Warn("quota_infra.grantRedis: CUSTOMER_REDIS_URL not set — skipping infra grant",
 			"token", token)
 		return nil
 	}
-	username := redisUsernameForToken(token, tier)
+	username := redisUsernameForToken(token, tier, providerResourceID)
 	return setCustomerRedisACL(ctx, r.customerRedisURL, username, true, token)
 }
 

@@ -104,9 +104,23 @@ func newMinIOScannerWithClient(client minioObjectLister, bucketName string) *min
 	return &minioStorageScanner{client: client, bucketName: bucketName}
 }
 
+// legacyStorageObjectPrefixTokenLen is the token-prefix length the PRE-FIX
+// storage backend used to derive the object-key prefix (token[:8]). Retained
+// as a named constant ONLY so the scanner can reproduce the legacy prefix for
+// a storage resource row provisioned before the token-truncation fix (those
+// rows have an empty provider_resource_id). New storage rows persist the FULL
+// token as provider_resource_id and never use this fallback.
+const legacyStorageObjectPrefixTokenLen = 8
+
 // minioObjectPrefix returns the S3 key prefix for a storage resource.
-// Matches api/internal/providers/storage/local.go (Provision) and the
-// provisioner backend.
+//
+// Store-at-provision, never re-derive: when the resource row carries a
+// provider_resource_id (set by api/internal/providers/storage/local.go at
+// provision time) it IS the canonical prefix and is used verbatim. The
+// token[:8] derivation is a LEGACY fallback only — it covers storage rows
+// provisioned before the token-truncation fix, whose objects sit under the old
+// 8-char prefix. New rows always carry the full-token provider_resource_id, so
+// two tenants sharing 8 hex characters never share an object prefix.
 func minioObjectPrefix(token, providerResourceID string) string {
 	p := strings.TrimSpace(providerResourceID)
 	if p != "" {
@@ -115,12 +129,14 @@ func minioObjectPrefix(token, providerResourceID string) string {
 		}
 		return p
 	}
+	// Legacy row (empty provider_resource_id): reproduce the old token[:8]
+	// prefix so the scanner still measures pre-fix storage resources.
 	if token == "" {
 		return ""
 	}
 	pfx := token
-	if len(pfx) > 8 {
-		pfx = pfx[:8]
+	if len(pfx) > legacyStorageObjectPrefixTokenLen {
+		pfx = pfx[:legacyStorageObjectPrefixTokenLen]
 	}
 	return pfx + "/"
 }

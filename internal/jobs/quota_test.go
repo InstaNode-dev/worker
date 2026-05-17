@@ -39,19 +39,27 @@ type mockResourceInfraRevoker struct {
 	grantedTokens []string
 	revokedTiers  []string
 	grantedTiers  []string
-	revokeErr     error
-	grantErr      error
+	// revokedPRIDs / grantedPRIDs record the provider_resource_id argument so
+	// tests can assert the quota worker threads the stored canonical
+	// identifier through to the revoker (token-truncation fix: the Redis ACL
+	// username resolves from provider_resource_id when present).
+	revokedPRIDs []string
+	grantedPRIDs []string
+	revokeErr    error
+	grantErr     error
 }
 
-func (m *mockResourceInfraRevoker) RevokeAccess(_ context.Context, _, token, tier string) error {
+func (m *mockResourceInfraRevoker) RevokeAccess(_ context.Context, _, token, tier, providerResourceID string) error {
 	m.revokedTokens = append(m.revokedTokens, token)
 	m.revokedTiers = append(m.revokedTiers, tier)
+	m.revokedPRIDs = append(m.revokedPRIDs, providerResourceID)
 	return m.revokeErr
 }
 
-func (m *mockResourceInfraRevoker) GrantAccess(_ context.Context, _, token, tier string) error {
+func (m *mockResourceInfraRevoker) GrantAccess(_ context.Context, _, token, tier, providerResourceID string) error {
 	m.grantedTokens = append(m.grantedTokens, token)
 	m.grantedTiers = append(m.grantedTiers, tier)
+	m.grantedPRIDs = append(m.grantedPRIDs, providerResourceID)
 	return m.grantErr
 }
 
@@ -67,11 +75,11 @@ func TestEnforceStorageQuotaWorker_NoResources_NoSuspend(t *testing.T) {
 	// Suspend loop query (status='active').
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 	// Unsuspend loop query (status='suspended').
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 
 	plans := &mockPlanRegistry{limitMB: 10}
 	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil)
@@ -127,6 +135,9 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	token := "tok_overquota"
 	resourceType := "postgres"
 	tier := "anonymous"
+	// The canonical provider_resource_id stamped at provision time — the
+	// worker must thread this through to the revoker (token-truncation fix).
+	providerResourceID := "usr_tok_overquota"
 	// storage_bytes == 11 MB; limit is 10 MB → exceeded.
 	storageBytes := int64(11 * 1024 * 1024)
 	limitMB := 10
@@ -134,8 +145,8 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	// Suspend loop query.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}).
-			AddRow(resourceID, token, resourceType, tier, storageBytes))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, providerResourceID))
 	// checkStorageQuota inner query.
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
@@ -148,7 +159,7 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	// Unsuspend loop query — empty (no suspended resources yet).
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 
 	revoker := &mockResourceInfraRevoker{}
 	plans := &mockPlanRegistry{limitMB: limitMB}
@@ -167,6 +178,13 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	// derive the correct Redis ACL username (shared vs dedicated scheme).
 	if len(revoker.revokedTiers) != 1 || revoker.revokedTiers[0] != tier {
 		t.Errorf("expected revoker.RevokeAccess called with tier %q; got %v", tier, revoker.revokedTiers)
+	}
+	// Token-truncation fix: the canonical provider_resource_id stamped at
+	// provision time MUST be threaded through so the revoker uses the exact
+	// ACL username instead of re-deriving from the token.
+	if len(revoker.revokedPRIDs) != 1 || revoker.revokedPRIDs[0] != providerResourceID {
+		t.Errorf("expected revoker.RevokeAccess called with provider_resource_id %q; got %v",
+			providerResourceID, revoker.revokedPRIDs)
 	}
 }
 
@@ -193,13 +211,13 @@ func TestEnforceStorageQuotaWorker_UnderQuota_UnsuspendsResource(t *testing.T) {
 	// Suspend loop: no active-status over-quota resources.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 
 	// Unsuspend loop: one suspended resource.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}).
-			AddRow(resourceID, token, resourceType, tier, storageBytes))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, "")) // empty PRID = legacy row
 	// checkStorageQuota inner query.
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
@@ -247,8 +265,8 @@ func TestEnforceStorageQuotaWorker_NilRevoker_StatusFlipStillLands(t *testing.T)
 
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}).
-			AddRow(resourceID, token, "mongodb", "hobby", storageBytes))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
+			AddRow(resourceID, token, "mongodb", "hobby", storageBytes, "")) // empty PRID = legacy row
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
@@ -257,7 +275,7 @@ func TestEnforceStorageQuotaWorker_NilRevoker_StatusFlipStillLands(t *testing.T)
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 
 	plans := &mockPlanRegistry{limitMB: limitMB}
 	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil) // nil revoker
@@ -298,13 +316,13 @@ func TestEnforceStorageQuotaWorker_HysteresisDeadBand_StaysSuspended(t *testing.
 	// Suspend loop: no active over-quota resources.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 
 	// Unsuspend loop: one suspended resource sitting in the dead-band.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}).
-			AddRow(resourceID, token, resourceType, tier, storageBytes))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, "")) // empty PRID = legacy row
 	// readStorageBytes inner query — returns the dead-band value.
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
@@ -340,13 +358,13 @@ func TestEnforceStorageQuotaWorker_UnlimitedTier_NoSuspend(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}).
-			AddRow(resourceID, "tok_unlimited", "postgres", "team", storageBytes))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
+			AddRow(resourceID, "tok_unlimited", "postgres", "team", storageBytes, "")) // empty PRID = legacy row
 	// No checkStorageQuota call expected — unlimited tier skips quota check.
 	// No UPDATE expected.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
 
 	revoker := &mockResourceInfraRevoker{}
 	plans := &mockPlanRegistry{limitMB: -1} // unlimited

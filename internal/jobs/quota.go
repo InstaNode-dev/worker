@@ -283,7 +283,8 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 // suspended and unsuspended within the same Work() tick.
 func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]string, error) {
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, token, resource_type, tier, storage_bytes
+		SELECT id, token, resource_type, tier, storage_bytes,
+		       COALESCE(provider_resource_id, '')
 		FROM resources
 		WHERE status = $1
 		  AND resource_type IN ('postgres', 'redis', 'mongodb')
@@ -299,13 +300,14 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 
 	for rows.Next() {
 		var (
-			id           string
-			token        string
-			resourceType string
-			tier         string
-			storageBytes int64
+			id                 string
+			token              string
+			resourceType       string
+			tier               string
+			storageBytes       int64
+			providerResourceID string
 		)
-		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes); scanErr != nil {
+		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID); scanErr != nil {
 			slog.Error("jobs.enforce_storage_quota.scan_error", "error", scanErr)
 			continue
 		}
@@ -343,9 +345,12 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 		// intentional: a row marked 'suspended' blocks new provisions from the
 		// API even when the infra revoke is not available (customer DB down).
 		if w.revoker != nil {
-			// tier is passed so the revoker can derive the correct Redis ACL
-			// username (shared usr_<full-token> vs dedicated ded_<token[:8]>).
-			if revokeErr := w.revoker.RevokeAccess(ctx, resourceType, token, tier); revokeErr != nil {
+			// tier + provider_resource_id are passed so the revoker resolves
+			// the EXACT Redis ACL username: the stored provider_resource_id
+			// when present (canonical, never re-derived), else a tier-driven
+			// derivation (shared usr_<full-token> / legacy dedicated
+			// ded_<token[:8]>). See redisUsernameForToken.
+			if revokeErr := w.revoker.RevokeAccess(ctx, resourceType, token, tier, providerResourceID); revokeErr != nil {
 				// revoker implementations are fail-open (return nil on infra
 				// error, log a WARN). A non-nil error here is unexpected —
 				// log it but don't abort the row update.
@@ -404,7 +409,8 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 	}
 
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, token, resource_type, tier, storage_bytes
+		SELECT id, token, resource_type, tier, storage_bytes,
+		       COALESCE(provider_resource_id, '')
 		FROM resources
 		WHERE status = $1
 		  AND resource_type IN ('postgres', 'redis', 'mongodb')
@@ -419,13 +425,14 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 
 	for rows.Next() {
 		var (
-			id           string
-			token        string
-			resourceType string
-			tier         string
-			storageBytes int64
+			id                 string
+			token              string
+			resourceType       string
+			tier               string
+			storageBytes       int64
+			providerResourceID string
 		)
-		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes); scanErr != nil {
+		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID); scanErr != nil {
 			slog.Error("jobs.enforce_storage_quota.unsuspend_scan_error", "error", scanErr)
 			continue
 		}
@@ -472,9 +479,12 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 
 		// Re-grant infra access before flipping the status row.
 		if w.revoker != nil {
-			// tier is passed so the revoker can derive the correct Redis ACL
-			// username (shared usr_<full-token> vs dedicated ded_<token[:8]>).
-			if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, tier); grantErr != nil {
+			// tier + provider_resource_id are passed so the revoker resolves
+			// the EXACT Redis ACL username: the stored provider_resource_id
+			// when present (canonical, never re-derived), else a tier-driven
+			// derivation (shared usr_<full-token> / legacy dedicated
+			// ded_<token[:8]>). See redisUsernameForToken.
+			if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, tier, providerResourceID); grantErr != nil {
 				slog.Error("jobs.enforce_storage_quota.grant_error",
 					"resource_id", id, "token", token, "resource_type", resourceType,
 					"error", grantErr,
