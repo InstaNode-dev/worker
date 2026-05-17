@@ -48,11 +48,16 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	start := time.Now()
 
 	// Step 1: Find all anonymous resources that have passed their TTL.
+	// TTL must win over lifecycle state: a paused/suspended anonymous resource
+	// whose 24h TTL has elapsed is still an expired resource. Filtering on
+	// status='active' alone leaks paused/suspended rows past their TTL — the
+	// physical DB/ACL/Mongo user is never dropped and the row never reaches
+	// 'deleted'. Expire any non-terminal status past TTL.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id::text, token::text, resource_type, COALESCE(provider_resource_id, '')
 		FROM resources
 		WHERE team_id IS NULL
-		  AND status = 'active'
+		  AND status IN ('active', 'paused', 'suspended')
 		  AND expires_at IS NOT NULL
 		  AND expires_at < now()
 	`)
@@ -117,8 +122,12 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 			}
 		}
 
+		// Guarded UPDATE: mark deleted only from a non-terminal status, matching
+		// the SELECT above. Gating on status='active' alone would leave the
+		// paused/suspended rows we just deprovisioned stuck in their old status.
 		if _, err := w.db.ExecContext(ctx,
-			`UPDATE resources SET status = 'deleted' WHERE id = $1 AND status = 'active'`,
+			`UPDATE resources SET status = 'deleted'
+			 WHERE id = $1 AND status IN ('active', 'paused', 'suspended')`,
 			r.id,
 		); err != nil {
 			slog.Error("jobs.expire_anonymous.mark_deleted_failed",

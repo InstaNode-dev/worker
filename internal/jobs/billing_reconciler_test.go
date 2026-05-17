@@ -19,7 +19,8 @@ package jobs_test
 //  7. Grace no-op: halted/paused subscription, active grace row already exists →
 //     no duplicate OpenGracePeriod.
 //  8. Downgrade on terminal status: cancelled + paid tier → UpdatePlanTier("hobby").
-//  9. Downgrade free on zero paidCount: cancelled + PaidCount==0 → "free".
+//  9. Terminal status + PaidCount==0 still downgrades to "hobby" (never the
+//     ephemeral "free" tier — see the §9 test comment for the rationale).
 // 10. Terminal status, already-downgraded tier → no mutation.
 // 11. Unknown Razorpay status → no mutation (WARN only).
 // 12. Razorpay fetch error → per-team skip (no DB mutation).
@@ -393,9 +394,16 @@ func TestBillingReconciler_CancelledSubscription_PaidTier_Downgrades(t *testing.
 	}
 }
 
-// ── §9: Downgrade to "free" when paidCount == 0 ──────────────────────────────
-
-func TestBillingReconciler_CancelledSubscription_ZeroPaidCount_DegradesToFree(t *testing.T) {
+// ── §9: Terminal status with paidCount == 0 still downgrades to "hobby" ───────
+//
+// Previously the reconciler downgraded a zero-paidCount terminal subscription
+// to the "free" tier. That was a P2 bug: "free" is the 24h-TTL ephemeral
+// claimed-but-unpaid tier, and the downgrade path leaves the team's resources
+// on their paid tier with expires_at=NULL — stranding permanent paid infra
+// under an ephemeral team tier with no billing relationship. The fix routes
+// every terminal status to "hobby" (the lowest PAID tier) regardless of
+// PaidCount, keeping team-tier and resource-tier coherent.
+func TestBillingReconciler_CancelledSubscription_ZeroPaidCount_DowngradesToHobby(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -407,10 +415,10 @@ func TestBillingReconciler_CancelledSubscription_ZeroPaidCount_DegradesToFree(t 
 
 	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
-			AddRow(teamID, subID, "hobby"))
+			AddRow(teamID, subID, "pro"))
 
 	mock.ExpectExec(`UPDATE teams SET plan_tier`).
-		WithArgs("free", teamID).
+		WithArgs("hobby", teamID).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
