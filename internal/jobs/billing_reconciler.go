@@ -25,7 +25,9 @@ package jobs
 //   active / authenticated → tier from plan_id (upgrade if DB is lower)
 //   pending               → no change (may self-resolve)
 //   halted / paused       → open grace period if none active
-//   cancelled / completed / expired → downgrade to hobby (or free if paidCount==0)
+//   cancelled / completed / expired → downgrade to hobby (always — never the
+//                           ephemeral "free" tier; see the terminal branch in
+//                           Work() for the strands-paid-resources rationale)
 //
 // # Idempotency
 //
@@ -750,10 +752,21 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 				gapDowngrade++
 				metrics.BillingReconcilerGapDetected.WithLabelValues("downgrade").Inc()
 
-				targetTier := "hobby"
-				if details.PaidCount == 0 {
-					targetTier = "free"
-				}
+				// Terminal subscription → always downgrade to "hobby", never
+				// "free". "free" is the 24h-TTL ephemeral claimed-but-unpaid
+				// tier; the downgrade path (updatePlanTier) deliberately leaves
+				// existing resources on their paid tier with expires_at=NULL
+				// (user-benefit policy). Setting the TEAM to "free" while its
+				// resources stay permanent + paid-tier strands permanent paid
+				// infra with no billing relationship — a tier mismatch the
+				// rest of the system has no path to reconcile. "hobby" is the
+				// lowest paid tier and matches the non-zero-paid branch, so
+				// team-tier and resource-tier stay coherent regardless of
+				// PaidCount. (PaidCount==0 only means no *successful* charge
+				// was recorded — e.g. a failed first charge then cancellation;
+				// it is not a signal that resources should become ephemeral.)
+				const terminalDowngradeTier = "hobby"
+				targetTier := terminalDowngradeTier
 				slog.Warn("billing.reconciler.tier_corrected",
 					"team_id", team.id,
 					"from", team.planTier,

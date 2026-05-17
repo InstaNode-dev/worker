@@ -80,3 +80,41 @@ func TestExpireAnonymousWorker_DBError_ReturnsError(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 }
+
+// TestExpireAnonymousWorker_ExpiresPausedAndSuspended proves the expiry query
+// (and the mark-deleted UPDATE) cover paused/suspended anonymous resources, not
+// just status='active'. Regression guard for the P2 bug where a paused or
+// suspended anonymous resource whose 24h TTL had elapsed was never expired —
+// the SELECT filtered status='active' only, orphaning the physical resource.
+// TTL must win over lifecycle state.
+func TestExpireAnonymousWorker_ExpiresPausedAndSuspended(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// The SELECT must include the paused/suspended statuses, not just active.
+	mock.ExpectQuery(`status IN \('active', 'paused', 'suspended'\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
+			AddRow("id-paused", "tok-p", "postgres", "").
+			AddRow("id-susp", "tok-s", "redis", ""))
+
+	// The mark-deleted UPDATE must be guarded on the same expanded status set
+	// so a paused/suspended row actually transitions to 'deleted'.
+	for i := 0; i < 2; i++ {
+		mock.ExpectExec(`UPDATE resources SET status = 'deleted'\s+WHERE id = \$1 AND status IN \('active', 'paused', 'suspended'\)`).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+	}
+	// The trailing active-anon count query.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}

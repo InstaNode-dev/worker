@@ -139,7 +139,7 @@ func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStac
 	var deleted int
 	for _, s := range expired {
 		// Tear down k8s namespace first — if this fails, skip DB deletion so we
-		// can retry next run. Fail-open: if not in-cluster, log and continue.
+		// can retry next run.
 		if w.k8sClient != nil && s.namespace != "" {
 			if nsErr := deleteK8sNamespace(ctx, w.k8sClient, s.namespace, w.nsPrefix); nsErr != nil {
 				slog.Error("jobs.expire_stacks.namespace_teardown_failed",
@@ -148,11 +148,19 @@ func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStac
 			}
 			slog.Info("jobs.expire_stacks.namespace_deleted", "slug", s.slug, "namespace", s.namespace)
 		} else if s.namespace != "" {
-			slog.Info("jobs.expire_stacks.namespace_skipped",
+			// Not running in-cluster: the namespace is still live. Hard-deleting
+			// the stacks row here would orphan the namespace with no DB pointer
+			// — a later in-cluster worker run would never see it to tear it
+			// down. Skip the DELETE and leave the row for the next in-cluster
+			// run to expire properly. (TTL still wins eventually — the row's
+			// expires_at remains in the past so a future in-cluster tick picks
+			// it up.)
+			slog.Warn("jobs.expire_stacks.delete_skipped",
 				"slug", s.slug,
 				"namespace", s.namespace,
-				"note", "not running in-cluster — namespace left for manual teardown",
+				"note", "not running in-cluster — row left intact so a later in-cluster run can tear down the namespace before deleting the row",
 			)
+			continue
 		}
 
 		if _, err := w.db.ExecContext(ctx, `DELETE FROM stacks WHERE id = $1`, s.id); err != nil {

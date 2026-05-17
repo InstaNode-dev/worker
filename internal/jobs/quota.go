@@ -52,6 +52,16 @@ const (
 	resourceStatusActive    = "active"
 )
 
+// quotaUnsuspendHysteresisFactor is the hysteresis band on the unsuspend
+// threshold. A resource is SUSPENDED at bytesUsed >= limitBytes but only
+// UNSUSPENDED once bytesUsed drops below limitBytes * factor (i.e. below 90%
+// of the limit). Without this band a resource sitting exactly at the limit
+// flip-flops suspend→active→suspend every tick — and each flip does a real
+// provider-side REVOKE/GRANT round-trip. The 10% gap means usage must
+// meaningfully recede before access is restored. Each flip is also costly
+// (a customer-facing infra mutation), so the dead-band is deliberately wide.
+const quotaUnsuspendHysteresisFactor = 0.9
+
 // EnforceStorageQuotaWorker checks all active resources against their plan's
 // storage limit and suspends those that have exceeded it. It also scans
 // currently-suspended resources and unsuspends those whose usage has dropped
@@ -106,12 +116,19 @@ func (w *EnforceStorageQuotaWorker) Work(ctx context.Context, job *river.Job[Enf
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.enforce_storage_quota")
 	defer span.End()
 
-	suspended, err := w.runSuspendLoop(ctx)
+	suspendedIDs, err := w.runSuspendLoop(ctx)
 	if err != nil {
 		return err
 	}
+	suspended := len(suspendedIDs)
 
-	unsuspended, err := w.runUnsuspendLoop(ctx)
+	// The unsuspend loop must NOT act on a resource the suspend loop just
+	// flipped in this same Work() — the suspend loop's UPDATE is already
+	// committed, so a fresh status='suspended' SELECT would re-include it and
+	// (on a stale storage_bytes snapshot) immediately unsuspend it: a
+	// suspend→active flap inside one tick. Pass the just-suspended IDs as a
+	// skip-set so this tick can never undo its own work.
+	unsuspended, err := w.runUnsuspendLoop(ctx, suspendedIDs)
 	if err != nil {
 		// Don't fail the job for unsuspend errors — suspends already landed.
 		slog.Error("jobs.enforce_storage_quota.unsuspend_loop_error", "error", err)
@@ -261,8 +278,10 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 }
 
 // runSuspendLoop scans status='active' resources, suspends over-quota ones,
-// and returns the count of newly suspended resources.
-func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) (int, error) {
+// and returns the IDs of the newly suspended resources. The caller passes
+// those IDs to runUnsuspendLoop as a skip-set so a resource cannot be
+// suspended and unsuspended within the same Work() tick.
+func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]string, error) {
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, token, resource_type, tier, storage_bytes
 		FROM resources
@@ -271,11 +290,12 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) (int, er
 		ORDER BY created_at
 	`, resourceStatusActive)
 	if err != nil {
-		return 0, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: query failed: %w", err)
+		return nil, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: query failed: %w", err)
 	}
 	defer rows.Close()
 
-	checked, suspended := 0, 0
+	checked := 0
+	suspendedIDs := make([]string, 0)
 
 	for rows.Next() {
 		var (
@@ -354,23 +374,33 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) (int, er
 			"storage_bytes", storageBytes,
 			"limit_mb", limitMB,
 		)
-		suspended++
+		suspendedIDs = append(suspendedIDs, id)
 	}
 	if err := rows.Err(); err != nil {
-		return suspended, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: rows error: %w", err)
+		return suspendedIDs, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: rows error: %w", err)
 	}
 
 	slog.Info("jobs.enforce_storage_quota.suspend_loop_done",
 		"checked_count", checked,
-		"suspended_count", suspended,
+		"suspended_count", len(suspendedIDs),
 	)
-	return suspended, nil
+	return suspendedIDs, nil
 }
 
 // runUnsuspendLoop scans status='suspended' resources, re-checks quota, and
-// re-grants infra access + flips to 'active' for those now under their limit.
+// re-grants infra access + flips to 'active' for those now under the
+// hysteresis threshold (quotaUnsuspendHysteresisFactor of the limit).
+// skipIDs are resources suspended earlier in this same Work() tick — they are
+// never unsuspended here, so one tick cannot suspend-then-unsuspend a row.
 // Returns the count of newly unsuspended resources.
-func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context) (int, error) {
+func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipIDs []string) (int, error) {
+	// Build the skip-set once. Resources the suspend loop just flipped to
+	// 'suspended' must be excluded so this tick cannot undo its own work.
+	skip := make(map[string]struct{}, len(skipIDs))
+	for _, id := range skipIDs {
+		skip[id] = struct{}{}
+	}
+
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, token, resource_type, tier, storage_bytes
 		FROM resources
@@ -398,11 +428,17 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context) (int, 
 			continue
 		}
 
+		// Skip any resource the suspend loop flipped this tick — it must not
+		// be unsuspended in the same Work() (intra-tick flap guard).
+		if _, justSuspended := skip[id]; justSuspended {
+			continue
+		}
+
 		limitMB := w.plans.StorageLimitMB(tier, resourceType)
 		if limitMB == -1 {
 			// Unlimited tier shouldn't have been suspended, but unsuspend
 			// eagerly to self-heal any historical bad state.
-			limitMB = 0 // treat as exceeded=false below
+			limitMB = 0 // treat as belowThreshold=true below
 		}
 
 		uid, parseErr := uuid.Parse(id)
@@ -411,19 +447,25 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context) (int, 
 			continue
 		}
 
-		var exceeded bool
+		// Hysteresis: a suspend fires at bytesUsed >= limitBytes, but an
+		// unsuspend fires only once bytesUsed drops below the hysteresis
+		// threshold (90% of the limit). The dead-band between the two
+		// thresholds stops a resource sitting at the limit from flip-flopping
+		// every tick. limitMB == 0 means unlimited → always below threshold.
+		belowThreshold := true
 		if limitMB > 0 {
-			_, exceeded, err = checkStorageQuota(ctx, w.db, uid, limitMB)
-			if err != nil {
+			bytesUsed, checkErr := readStorageBytes(ctx, w.db, uid)
+			if checkErr != nil {
 				slog.Error("jobs.enforce_storage_quota.unsuspend_check_error",
-					"resource_id", id, "error", err)
+					"resource_id", id, "error", checkErr)
 				continue // fail open — don't unsuspend on check error
 			}
+			unsuspendThreshold := int64(float64(int64(limitMB)*1024*1024) * quotaUnsuspendHysteresisFactor)
+			belowThreshold = bytesUsed < unsuspendThreshold
 		}
-		// limitMB == 0 means unlimited; exceeded stays false → will unsuspend.
 
-		if exceeded {
-			continue // still over quota — remain suspended
+		if !belowThreshold {
+			continue // not yet far enough below the limit — remain suspended
 		}
 
 		// Re-grant infra access before flipping the status row.
@@ -462,6 +504,26 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context) (int, 
 	}
 
 	return unsuspended, nil
+}
+
+// readStorageBytes reads the current resources.storage_bytes for a resource.
+// Returns 0 (no error) when the row is gone. Used by the unsuspend loop's
+// hysteresis check, which needs the raw byte count rather than a fixed-
+// threshold exceeded/not boolean.
+func readStorageBytes(ctx context.Context, db *sql.DB, resourceID uuid.UUID) (int64, error) {
+	var bytesUsed int64
+	err := db.QueryRowContext(ctx,
+		`SELECT storage_bytes FROM resources WHERE id = $1`,
+		resourceID,
+	).Scan(&bytesUsed)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		slog.Error("quota.storage.db_error", "resource_id", resourceID, "error", err)
+		return 0, fmt.Errorf("readStorageBytes: %w", err)
+	}
+	return bytesUsed, nil
 }
 
 // checkStorageQuota reads resources.storage_bytes and compares to limitMB.

@@ -471,6 +471,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewUptimeProberWorker(db), nrApp))
 	// Uptime retention sweep — daily prune of uptime_samples > 90d.
 	river.AddWorker(workers, WithObservability(NewUptimeRetentionWorker(db), nrApp))
+	// Razorpay webhook-events prune — daily DELETE of razorpay_webhook_events
+	// rows > 30d. The api appends one dedup row per Razorpay webhook delivery;
+	// migration 033 envisioned a periodic prune but never shipped one, so the
+	// table grew unbounded. See razorpay_webhook_prune.go.
+	river.AddWorker(workers, WithObservability(NewRazorpayWebhookPruneWorker(db), nrApp))
 	// Entitlement reconciler — detects "upgrade drift" (a postgres resource
 	// whose tier was bumped on plan upgrade but whose actual connection cap
 	// was never re-applied) and fixes it via the provisioner RegradeResource
@@ -845,6 +850,18 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			river.PeriodicInterval(24*time.Hour),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return UptimeRetentionArgs{}, nil
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Razorpay webhook-events prune — daily DELETE of dedup rows > 30d.
+		// RunOnStart=false: a restart shouldn't immediately scan; the table
+		// grows slowly (one row per webhook delivery) so a day's delay before
+		// the first prune after a restart is harmless. Wait for the next 24h
+		// slot.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(24*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return RazorpayWebhookPruneArgs{}, nil
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),

@@ -257,6 +257,62 @@ func TestEnforceStorageQuotaWorker_NilRevoker_StatusFlipStillLands(t *testing.T)
 	}
 }
 
+// ── Hysteresis: a suspended resource in the dead-band stays suspended ─────────
+//
+// A resource suspended at >= 100% of the limit must NOT be unsuspended until
+// usage drops below the hysteresis threshold (90% of the limit). A resource
+// sitting at 95% is inside the dead-band — above 90%, below 100% — so it must
+// remain suspended, with no GrantAccess call and no UPDATE. Without the
+// hysteresis band the unsuspend loop would flip it back to 'active' the moment
+// usage dipped below 100%, and the next tick would re-suspend it: a flap that
+// fires a real provider REVOKE+GRANT every cycle.
+
+func TestEnforceStorageQuotaWorker_HysteresisDeadBand_StaysSuspended(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resourceID := "55555555-5555-5555-5555-555555555555"
+	token := "tok_deadband"
+	resourceType := "postgres"
+	tier := "hobby"
+	limitMB := 100
+	// storage_bytes == 95% of the 100 MB limit — inside the dead-band
+	// (above the 90% unsuspend threshold, below the 100% suspend threshold).
+	storageBytes := int64(float64(int64(limitMB)*1024*1024) * 0.95)
+
+	// Suspend loop: no active over-quota resources.
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("active").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
+
+	// Unsuspend loop: one suspended resource sitting in the dead-band.
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("suspended").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}).
+			AddRow(resourceID, token, resourceType, tier, storageBytes))
+	// readStorageBytes inner query — returns the dead-band value.
+	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
+	// NO UPDATE expected — the resource stays suspended.
+
+	revoker := &mockResourceInfraRevoker{}
+	plans := &mockPlanRegistry{limitMB: limitMB}
+	w := jobs.NewEnforceStorageQuotaWorker(db, plans, revoker)
+	if err := w.Work(context.Background(), fakeJob[jobs.EnforceStorageQuotaArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+	if len(revoker.grantedTokens) != 0 {
+		t.Errorf("expected no GrantAccess calls inside the hysteresis dead-band; got %v", revoker.grantedTokens)
+	}
+}
+
 // ── UnlimitedTier: never suspend ─────────────────────────────────────────────
 
 func TestEnforceStorageQuotaWorker_UnlimitedTier_NoSuspend(t *testing.T) {
