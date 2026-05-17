@@ -258,7 +258,20 @@ type subscriptionFetcher interface {
 type gracePeriodOpener interface {
 	GetActiveGracePeriod(ctx context.Context, teamID uuid.UUID) (bool, error)
 	OpenGracePeriod(ctx context.Context, teamID uuid.UUID, subscriptionID string) error
+	// HasTerminatedGracePeriod reports whether the team already has a grace
+	// period for subscriptionID that has reached a terminal status
+	// ('terminated' / 'expired'). It is the P1-F(b) guard: once the grace
+	// clock has run out and the team was terminated, Razorpay can still
+	// report halted/paused for some time — without this check the reconciler
+	// would see "no ACTIVE grace" and open a FRESH 7-day grace period,
+	// restarting the dunning-email cycle indefinitely.
+	HasTerminatedGracePeriod(ctx context.Context, teamID uuid.UUID, subscriptionID string) (bool, error)
 }
+
+// gracePeriodTerminalStatuses are the payment_grace_periods.status values that
+// mean the grace clock already ran its course — a new grace period for the
+// same subscription must NOT be opened (P1-F(b)).
+var gracePeriodTerminalStatuses = []string{"terminated", "expired"}
 
 // ── DB-backed gracePeriodOpener ───────────────────────────────────────────────
 
@@ -345,6 +358,30 @@ func (d *dbGracePeriodOpener) OpenGracePeriod(ctx context.Context, teamID uuid.U
 		)
 	}
 	return nil
+}
+
+// HasTerminatedGracePeriod reports whether the team already has a grace
+// period for subscriptionID in a terminal status (see
+// gracePeriodTerminalStatuses). When true the reconciler must NOT open a
+// fresh grace period — the grace clock has already run out and the team was
+// terminated; re-opening would restart the 7-day dunning-email cycle
+// (P1-F(b)).
+func (d *dbGracePeriodOpener) HasTerminatedGracePeriod(ctx context.Context, teamID uuid.UUID, subscriptionID string) (bool, error) {
+	var id string
+	err := d.db.QueryRowContext(ctx, `
+		SELECT id FROM payment_grace_periods
+		WHERE team_id = $1
+		  AND subscription_id = $2
+		  AND status = ANY($3)
+		LIMIT 1
+	`, teamID, subscriptionID, pq.Array(gracePeriodTerminalStatuses)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("dbGracePeriodOpener.HasTerminatedGracePeriod: %w", err)
+	}
+	return true, nil
 }
 
 // ── errReconcilerCircuitOpen sentinel ────────────────────────────────────────
@@ -725,6 +762,30 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 				}
 				if hasGrace {
 					continue // grace period already active — idempotent
+				}
+				// P1-F(b) guard: Razorpay can keep reporting halted/paused
+				// for a while AFTER the grace clock expired and the team was
+				// terminated. Without this check the reconciler sees "no
+				// ACTIVE grace" and opens a FRESH 7-day grace period every
+				// tick — restarting the dunning-email cycle indefinitely. If
+				// a terminal grace period already exists for this
+				// subscription, the team has been through grace; do not
+				// re-enter it.
+				terminated, termErr := w.grace.HasTerminatedGracePeriod(ctx, team.id, team.subscriptionID)
+				if termErr != nil {
+					slog.Warn("billing.reconciler.terminated_grace_check_failed",
+						"team_id", team.id, "error", termErr,
+					)
+					continue
+				}
+				if terminated {
+					slog.Info("billing.reconciler.grace_reopen_skipped_terminal",
+						"team_id", team.id,
+						"subscription_id", team.subscriptionID,
+						"razorpay_status", details.Status,
+						"note", "team already terminated via a prior grace period; not re-opening grace",
+					)
+					continue
 				}
 				// Gap: Razorpay says halted/paused but no grace period exists.
 				gapDowngrade++
