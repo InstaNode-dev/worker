@@ -31,20 +31,27 @@ func (m *mockPlanRegistry) ProvisionLimit(tier string) int             { return 
 
 // mockResourceInfraRevoker records revoke/grant calls for assertion in tests.
 // It satisfies the ResourceInfraRevoker interface without touching real infra.
+// revokedTiers / grantedTiers record the tier argument so tests can assert the
+// quota worker threads the resource tier through to the revoker (P1 fix: the
+// Redis ACL username scheme depends on tier).
 type mockResourceInfraRevoker struct {
 	revokedTokens []string
 	grantedTokens []string
+	revokedTiers  []string
+	grantedTiers  []string
 	revokeErr     error
 	grantErr      error
 }
 
-func (m *mockResourceInfraRevoker) RevokeAccess(_ context.Context, _, token, _ string) error {
+func (m *mockResourceInfraRevoker) RevokeAccess(_ context.Context, _, token, tier string) error {
 	m.revokedTokens = append(m.revokedTokens, token)
+	m.revokedTiers = append(m.revokedTiers, tier)
 	return m.revokeErr
 }
 
-func (m *mockResourceInfraRevoker) GrantAccess(_ context.Context, _, token, _ string) error {
+func (m *mockResourceInfraRevoker) GrantAccess(_ context.Context, _, token, tier string) error {
 	m.grantedTokens = append(m.grantedTokens, token)
+	m.grantedTiers = append(m.grantedTiers, tier)
 	return m.grantErr
 }
 
@@ -155,6 +162,11 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	// Verify the revoker was called (P0-4: infra revoke on suspend).
 	if len(revoker.revokedTokens) != 1 || revoker.revokedTokens[0] != token {
 		t.Errorf("expected revoker.RevokeAccess called with %q; got %v", token, revoker.revokedTokens)
+	}
+	// P1: the resource tier MUST be threaded through to the revoker so it can
+	// derive the correct Redis ACL username (shared vs dedicated scheme).
+	if len(revoker.revokedTiers) != 1 || revoker.revokedTiers[0] != tier {
+		t.Errorf("expected revoker.RevokeAccess called with tier %q; got %v", tier, revoker.revokedTiers)
 	}
 }
 
