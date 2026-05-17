@@ -541,15 +541,22 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
+		// GeoLite2 refresh (P1-D). RunOnStart=true: a frequently-redeployed
+		// worker would otherwise reset the long periodic timer on every
+		// restart and the job would never fire — the geo DB stayed the
+		// stale baked-in copy forever. The job itself is cheap on a fresh
+		// worker: geodb.Work() skips the MaxMind download when the on-disk
+		// MMDB is still within geoLite2MaxAge (7d). The interval is a
+		// backstop for the rare long-lived worker that never restarts.
 		river.NewPeriodicJob(
-			river.PeriodicInterval(30*24*time.Hour),
+			river.PeriodicInterval(geoLite2RefreshInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return RefreshGeoDBArgs{
 					LicenseKey: cfg.MaxMindLicenseKey,
 					DBPath:     cfg.GeoLite2DBPath,
 				}, nil
 			},
-			&river.PeriodicJobOpts{RunOnStart: false},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 		// TrialExpiry periodic job removed in FOLLOWUP-5 (2026-05-14) —
 		// see deletion note above on TrialExpiryWorker. No-trial policy is

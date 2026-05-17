@@ -41,10 +41,55 @@ const geoLite2DownloadURL = "https://download.maxmind.com/app/geoip_download?edi
 // text files; we extract only the *.mmdb member by suffix-match.
 const geoLite2MMDBSuffix = ".mmdb"
 
+// geoLite2MaxAge is the freshness window for the on-disk MMDB (P1-D).
+//
+// The refresh job is registered with RunOnStart=true so a freshly-deployed
+// worker always re-checks the geo DB — without this the periodic 30-day
+// timer keeps resetting on every redeploy and the job effectively never
+// runs, leaving the stale baked-in copy permanently in place. To stop a
+// frequently-redeployed worker from hammering MaxMind on every restart,
+// Work() skips the download when the existing file's mtime is newer than
+// this window. MaxMind publishes GeoLite2-City twice weekly; 7 days means
+// we are at most one update cycle behind while still skipping the refetch
+// on routine restarts.
+const geoLite2MaxAge = 7 * 24 * time.Hour
+
+// geoLite2RefreshInterval is the periodic backstop cadence for the refresh
+// job. With RunOnStart=true the job runs on every worker restart, so this
+// interval only matters for a worker that is never redeployed. 7 days keeps
+// it aligned with geoLite2MaxAge — a long-lived worker still re-checks once
+// per freshness window.
+const geoLite2RefreshInterval = 7 * 24 * time.Hour
+
+// geoDBIsFresh reports whether the file at path exists and was modified
+// within geoLite2MaxAge. A missing/unstattable file is treated as NOT fresh
+// so the refresh proceeds. now is injected for deterministic tests.
+func geoDBIsFresh(path string, now time.Time) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return now.Sub(info.ModTime()) < geoLite2MaxAge
+}
+
 // Work downloads the latest GeoLite2 City MMDB and atomically replaces the existing file.
 func (w *RefreshGeoDBWorker) Work(ctx context.Context, job *river.Job[RefreshGeoDBArgs]) error {
 	if job.Args.LicenseKey == "" {
 		slog.Warn("jobs.refresh_geodb.skipped: no license key configured")
+		return nil
+	}
+
+	// Freshness gate (P1-D): with RunOnStart=true the job fires on every
+	// worker restart; skip the MaxMind download when the on-disk copy is
+	// still within geoLite2MaxAge so routine redeploys don't refetch.
+	if geoDBIsFresh(job.Args.DBPath, time.Now()) {
+		slog.Info("jobs.refresh_geodb.skipped_fresh",
+			"path", job.Args.DBPath,
+			"max_age", geoLite2MaxAge.String(),
+		)
 		return nil
 	}
 
