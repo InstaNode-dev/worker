@@ -2,6 +2,8 @@ package jobs_test
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -11,6 +13,14 @@ import (
 )
 
 var errDB = errors.New("db error")
+
+// quotaScanCols is the column set the suspend/unsuspend loop SELECTs project.
+// Centralised so a column-list change (e.g. the team_id + name additions for
+// the audit-row emission) updates every test in one place.
+var quotaScanCols = []string{
+	"id", "token", "resource_type", "tier", "storage_bytes",
+	"provider_resource_id", "team_id", "name",
+}
 
 // mockPlanRegistry is a simple PlanRegistry stub. ConnectionsLimit /
 // ProvisionLimit are stubbed at "unlimited" so EnforceStorageQuotaWorker
@@ -75,11 +85,11 @@ func TestEnforceStorageQuotaWorker_NoResources_NoSuspend(t *testing.T) {
 	// Suspend loop query (status='active').
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 	// Unsuspend loop query (status='suspended').
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	plans := &mockPlanRegistry{limitMB: 10}
 	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil)
@@ -142,11 +152,14 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	storageBytes := int64(11 * 1024 * 1024)
 	limitMB := 10
 
+	teamID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	name := "my-overquota-db"
+
 	// Suspend loop query.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
-			AddRow(resourceID, token, resourceType, tier, storageBytes, providerResourceID))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, providerResourceID, teamID, name))
 	// checkStorageQuota inner query.
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
@@ -155,11 +168,15 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	mock.ExpectExec(`UPDATE resources SET status = \$1`).
 		WithArgs("suspended", resourceID, "active").
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	// The customer-visible audit_log row, emitted AFTER the successful UPDATE.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(teamID, "system", "resource.quota_suspended", sqlmock.AnyArg(), sqlmock.AnyArg(), resourceType).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	// Unsuspend loop query — empty (no suspended resources yet).
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	revoker := &mockResourceInfraRevoker{}
 	plans := &mockPlanRegistry{limitMB: limitMB}
@@ -211,13 +228,16 @@ func TestEnforceStorageQuotaWorker_UnderQuota_UnsuspendsResource(t *testing.T) {
 	// Suspend loop: no active-status over-quota resources.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
+
+	teamID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	name := "my-underquota-cache"
 
 	// Unsuspend loop: one suspended resource.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
-			AddRow(resourceID, token, resourceType, tier, storageBytes, "")) // empty PRID = legacy row
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, "", teamID, name)) // empty PRID = legacy row
 	// checkStorageQuota inner query.
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
@@ -225,6 +245,10 @@ func TestEnforceStorageQuotaWorker_UnderQuota_UnsuspendsResource(t *testing.T) {
 	// The UPDATE back to 'active'.
 	mock.ExpectExec(`UPDATE resources SET status = \$1`).
 		WithArgs("active", resourceID, "suspended").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	// The customer-visible audit_log row, emitted AFTER the successful UPDATE.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(teamID, "system", "resource.quota_unsuspended", sqlmock.AnyArg(), sqlmock.AnyArg(), resourceType).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	revoker := &mockResourceInfraRevoker{}
@@ -263,19 +287,25 @@ func TestEnforceStorageQuotaWorker_NilRevoker_StatusFlipStillLands(t *testing.T)
 	storageBytes := int64(15 * 1024 * 1024)
 	limitMB := 10
 
+	// team_id is the SQL NULL sentinel ("" in the scanned NullString) — this is
+	// an anonymous resource. nullableTeamID maps it to a NULL audit_log.team_id.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
-			AddRow(resourceID, token, "mongodb", "hobby", storageBytes, "")) // empty PRID = legacy row
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, token, "mongodb", "hobby", storageBytes, "", nil, "")) // empty PRID = legacy row; nil team_id = anonymous
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
 	mock.ExpectExec(`UPDATE resources SET status = \$1`).
 		WithArgs("suspended", resourceID, "active").
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	// Audit row for an anonymous resource: team_id is NULL.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(nil, "system", "resource.quota_suspended", sqlmock.AnyArg(), sqlmock.AnyArg(), "mongodb").
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	plans := &mockPlanRegistry{limitMB: limitMB}
 	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil) // nil revoker
@@ -316,13 +346,13 @@ func TestEnforceStorageQuotaWorker_HysteresisDeadBand_StaysSuspended(t *testing.
 	// Suspend loop: no active over-quota resources.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	// Unsuspend loop: one suspended resource sitting in the dead-band.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
-			AddRow(resourceID, token, resourceType, tier, storageBytes, "")) // empty PRID = legacy row
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, "", "cccccccc-cccc-cccc-cccc-cccccccccccc", "deadband-db")) // empty PRID = legacy row
 	// readStorageBytes inner query — returns the dead-band value.
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WithArgs(sqlmock.AnyArg()).
@@ -358,13 +388,13 @@ func TestEnforceStorageQuotaWorker_UnlimitedTier_NoSuspend(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("active").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}).
-			AddRow(resourceID, "tok_unlimited", "postgres", "team", storageBytes, "")) // empty PRID = legacy row
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, "tok_unlimited", "postgres", "team", storageBytes, "", "dddddddd-dddd-dddd-dddd-dddddddddddd", "unlimited-db")) // empty PRID = legacy row
 	// No checkStorageQuota call expected — unlimited tier skips quota check.
 	// No UPDATE expected.
 	mock.ExpectQuery(`SELECT id, token`).
 		WithArgs("suspended").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id"}))
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	revoker := &mockResourceInfraRevoker{}
 	plans := &mockPlanRegistry{limitMB: -1} // unlimited
@@ -377,5 +407,197 @@ func TestEnforceStorageQuotaWorker_UnlimitedTier_NoSuspend(t *testing.T) {
 	}
 	if len(revoker.revokedTokens) != 0 {
 		t.Errorf("expected no revoke calls for unlimited tier; got %v", revoker.revokedTokens)
+	}
+}
+
+// ── Audit-row emission regression tests ───────────────────────────────────────
+//
+// Suspending a customer's database is highly user-impacting but used to
+// produce ZERO customer-visible artifact (slog only). These tests pin the
+// contract that the suspend/unsuspend loops emit an audit_log row of the
+// EXACT kind the api-side email renderer keys on.
+
+// auditKindArgMatcher is a sqlmock.Argument that asserts the audit_log.kind
+// passed to the INSERT matches the expected literal byte-for-byte.
+type auditKindArgMatcher struct{ want string }
+
+func (m auditKindArgMatcher) Match(v driver.Value) bool {
+	s, ok := v.(string)
+	return ok && s == m.want
+}
+
+// metadataContainsMatcher is a sqlmock.Argument that asserts the audit_log
+// metadata JSONB payload contains the expected resource_id / resource_type /
+// name fields the api email renderer reads.
+type metadataContainsMatcher struct {
+	resourceID   string
+	resourceType string
+	name         string
+}
+
+func (m metadataContainsMatcher) Match(v driver.Value) bool {
+	var raw []byte
+	switch t := v.(type) {
+	case []byte:
+		raw = t
+	case string:
+		raw = []byte(t)
+	default:
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return false
+	}
+	return meta["resource_id"] == m.resourceID &&
+		meta["resource_type"] == m.resourceType &&
+		meta["name"] == m.name
+}
+
+// TestEnforceStorageQuotaWorker_SuspendEmitsAuditRow proves the suspend loop
+// inserts an audit_log row of kind EXACTLY "resource.quota_suspended" with the
+// resource_id / resource_type / name in the metadata JSON, AND only after the
+// status UPDATE succeeded.
+func TestEnforceStorageQuotaWorker_SuspendEmitsAuditRow(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resourceID := "11111111-1111-1111-1111-111111111111"
+	teamID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	resourceType := "postgres"
+	name := "prod-db"
+	storageBytes := int64(20 * 1024 * 1024)
+	limitMB := 10
+
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("active").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, "tok_s", resourceType, "hobby", storageBytes, "", teamID, name))
+	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
+	// The status UPDATE must land FIRST.
+	mock.ExpectExec(`UPDATE resources SET status = \$1`).
+		WithArgs("suspended", resourceID, "active").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	// THEN the audit row — kind pinned byte-for-byte, metadata carries the
+	// fields the api email renderer reads.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(
+			teamID,
+			"system",
+			auditKindArgMatcher{want: "resource.quota_suspended"},
+			sqlmock.AnyArg(), // summary
+			metadataContainsMatcher{resourceID: resourceID, resourceType: resourceType, name: name},
+			resourceType,
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("suspended").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
+
+	plans := &mockPlanRegistry{limitMB: limitMB}
+	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.EnforceStorageQuotaArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestEnforceStorageQuotaWorker_UnsuspendEmitsAuditRow proves the unsuspend
+// loop inserts an audit_log row of kind EXACTLY "resource.quota_unsuspended".
+func TestEnforceStorageQuotaWorker_UnsuspendEmitsAuditRow(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resourceID := "22222222-2222-2222-2222-222222222222"
+	teamID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	resourceType := "redis"
+	name := "prod-cache"
+	storageBytes := int64(1 * 1024 * 1024) // well under the 25 MB limit
+	limitMB := 25
+
+	// Suspend loop: nothing over quota.
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("active").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
+	// Unsuspend loop: one suspended resource now under quota.
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("suspended").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, "tok_u", resourceType, "hobby", storageBytes, "", teamID, name))
+	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
+	mock.ExpectExec(`UPDATE resources SET status = \$1`).
+		WithArgs("active", resourceID, "suspended").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(
+			teamID,
+			"system",
+			auditKindArgMatcher{want: "resource.quota_unsuspended"},
+			sqlmock.AnyArg(),
+			metadataContainsMatcher{resourceID: resourceID, resourceType: resourceType, name: name},
+			resourceType,
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	plans := &mockPlanRegistry{limitMB: limitMB}
+	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.EnforceStorageQuotaArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestEnforceStorageQuotaWorker_NoAuditRowWhenUpdateFails proves the audit row
+// is NOT emitted when the status UPDATE itself errors — the customer-visible
+// artifact must only follow a status flip that actually landed.
+func TestEnforceStorageQuotaWorker_NoAuditRowWhenUpdateFails(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resourceID := "99999999-9999-9999-9999-999999999999"
+	storageBytes := int64(20 * 1024 * 1024)
+
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("active").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, "tok_f", "postgres", "hobby", storageBytes, "", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "fail-db"))
+	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
+	// The UPDATE fails — NO audit INSERT must follow.
+	mock.ExpectExec(`UPDATE resources SET status = \$1`).
+		WithArgs("suspended", resourceID, "active").
+		WillReturnError(errDB)
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("suspended").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
+
+	plans := &mockPlanRegistry{limitMB: 10}
+	w := jobs.NewEnforceStorageQuotaWorker(db, plans, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.EnforceStorageQuotaArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// ExpectationsWereMet would FAIL if the code issued an unexpected
+	// INSERT — no INSERT expectation was registered, so a stray audit row
+	// surfaces as an error here.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (a stray audit INSERT would surface here): %v", err)
 	}
 }

@@ -255,6 +255,20 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}
 	}
 
+	// Object-store deleter for storage-resource expiry. Built from the same
+	// minioScanner so it reaches the same S3-compatible OBJECT_STORE_* backend
+	// (DO Spaces in prod). Without this, ExpireAnonymousWorker's storage case
+	// flips the row to 'deleted' but never removes the tenant's objects —
+	// cleanup silently relied on the 24h bucket-lifecycle rule. nil when no
+	// OBJECT_STORE_* is wired (CI / docker-compose) or under the test seam;
+	// the storage case then logs a WARN instead of a silent no-op.
+	var storageObjectDeleter S3BackupDeleter
+	if minioScanner != nil {
+		if concrete, ok := minioScanner.(*minioStorageScanner); ok {
+			storageObjectDeleter = newMinIOBackupDeleter(concrete)
+		}
+	}
+
 	// Customer-backup object store — same endpoint/credentials as the
 	// storage_bytes scanner, but a different BUCKET so pg_dump tarballs
 	// don't mix with /storage/new customer object data. Nil = fail open:
@@ -273,7 +287,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// stamps tid + trace_id on ctx and (optionally) opens a New Relic
 	// transaction. nrApp may be nil — the wrapper still does the ctx work.
 	// See middleware.go for the full contract.
-	river.AddWorker(workers, WithObservability(NewExpireAnonymousWorker(db, provClient, minioClient), nrApp))
+	river.AddWorker(workers, WithObservability(
+		NewExpireAnonymousWorker(db, provClient, minioClient).
+			WithObjectDeleter(storageObjectDeleter, cfg.ObjectStoreBucket),
+		nrApp,
+	))
 	river.AddWorker(workers, WithObservability(NewExpireStacksWorker(db, cfg.KubeNamespaceApps+"-"), nrApp))
 	river.AddWorker(workers, WithObservability(NewRefreshGeoDBWorker(), nrApp))
 	// TrialExpiryWorker was deleted in FOLLOWUP-5 (2026-05-14) — per project
