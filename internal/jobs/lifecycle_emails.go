@@ -201,6 +201,24 @@ var (
   <tr><td style="color:#666;width:160px;">Active resources</td><td><strong>{{ if .TotalActiveResources }}{{ .TotalActiveResources }}{{ else }}0{{ end }}</strong></td></tr>
 </table>
 <p style="margin:0 0 4px;color:#555;font-size:14px;">Open your dashboard for the full per-resource breakdown.</p>`))
+
+	bodyResourceQuotaSuspended = template.Must(template.New("b_qsusp").Parse(
+		`<p style="margin:0 0 14px;">Your {{ .ResourceType }} resource <strong>{{ .Name }}</strong> has been <strong>suspended</strong> because it exceeded its storage limit.</p>
+<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  <tr><td style="color:#666;width:140px;">Resource</td><td><strong>{{ .Name }}</strong></td></tr>
+  <tr><td style="color:#666;">Type</td><td>{{ .ResourceType }}</td></tr>
+  <tr><td style="color:#666;">Status</td><td><strong>suspended</strong></td></tr>
+</table>
+<p style="margin:0 0 4px;">To restore access, either delete data to drop usage back under the limit, or upgrade your plan for a higher storage limit. Access is restored automatically once usage is back under the limit.</p>`))
+
+	bodyResourceQuotaUnsuspended = template.Must(template.New("b_qunsusp").Parse(
+		`<p style="margin:0 0 14px;">Your {{ .ResourceType }} resource <strong>{{ .Name }}</strong> is <strong>active again</strong> — storage usage is back under its limit and access has been restored.</p>
+<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  <tr><td style="color:#666;width:140px;">Resource</td><td><strong>{{ .Name }}</strong></td></tr>
+  <tr><td style="color:#666;">Type</td><td>{{ .ResourceType }}</td></tr>
+  <tr><td style="color:#666;">Status</td><td><strong>active</strong></td></tr>
+</table>
+<p style="margin:0 0 4px;color:#555;font-size:14px;">No action is needed. To avoid another suspension, keep usage below the limit or upgrade for more headroom.</p>`))
 )
 
 // ── Body view structs — flat, compiler-checked field references ───────────
@@ -221,6 +239,7 @@ type viewDeployExpired struct{ DeployName, ExpiresAt string }
 type viewDeployMadePermanent struct{ Source string }
 type viewDeployDeletionConfirmed struct{ FreedAt string }
 type viewDigestWeekly struct{ TeamName, TotalActiveResources string }
+type viewResourceQuota struct{ ResourceType, Name string }
 
 // ── Render helpers ────────────────────────────────────────────────────────
 
@@ -602,6 +621,56 @@ func renderDigestWeekly(params map[string]string) (string, string, string) {
 		Heading: heading,
 		Body:    "Here's your weekly instanode summary. You have " + count + " active resource(s). Open your dashboard for the full breakdown.",
 		CTALabel: "View your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderResourceQuotaSuspended — pairs with buildResourceQuotaSuspended
+// (resource.quota_suspended). The customer's database/cache/store was
+// suspended for exceeding its storage limit. NOT an expiry kind — the
+// subject must not mention expiry.
+func renderResourceQuotaSuspended(params map[string]string) (string, string, string) {
+	rtype := orDefault(params["resource_type"], "resource")
+	name := orDefault(params["name"], "your resource")
+	subject := "Your instanode " + rtype + " resource was suspended — storage limit exceeded"
+	heading := "Your resource was suspended"
+	body := renderBody(bodyResourceQuotaSuspended, viewResourceQuota{
+		ResourceType: rtype, Name: name,
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Upgrade your plan", CTAURL: pricingURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body: "Your " + rtype + " resource " + name + " was suspended because it exceeded its storage limit. " +
+			"To restore access, delete data to drop usage back under the limit, or upgrade your plan for a higher limit. " +
+			"Access is restored automatically once usage is back under the limit.",
+		CTALabel: "Upgrade your plan", CTAURL: pricingURL,
+	})
+	return subject, html, text
+}
+
+// renderResourceQuotaUnsuspended — pairs with buildResourceQuotaUnsuspended
+// (resource.quota_unsuspended). The customer's resource is back under its
+// storage limit and access has been restored.
+func renderResourceQuotaUnsuspended(params map[string]string) (string, string, string) {
+	rtype := orDefault(params["resource_type"], "resource")
+	name := orDefault(params["name"], "your resource")
+	subject := "Your instanode " + rtype + " resource " + name + " is active again"
+	heading := "Your resource is active again"
+	body := renderBody(bodyResourceQuotaUnsuspended, viewResourceQuota{
+		ResourceType: rtype, Name: name,
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body: "Your " + rtype + " resource " + name + " is active again — storage usage is back under its limit " +
+			"and access has been restored. No action is needed.",
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
 	})
 	return subject, html, text
 }

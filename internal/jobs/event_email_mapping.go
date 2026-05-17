@@ -106,6 +106,24 @@ const (
 	auditKindDeployDeletionConfirmed = "deploy.deletion_confirmed"
 	auditKindDeployDeletionCancelled = "deploy.deletion_cancelled"
 	auditKindDeployDeletionExpired   = "deploy.deletion_expired"
+
+	// Storage-quota suspend/unsuspend lifecycle (follow-up to commit 49639e7).
+	// Producer: EnforceStorageQuotaWorker (quota.go) — emitQuotaAuditRow writes
+	// these rows after a resource's status is flipped to 'suspended' (over its
+	// storage limit) or back to 'active' (usage receded below the hysteresis
+	// threshold).
+	//
+	// 49639e7 added the audit_log rows but never registered the kinds in this
+	// pipeline, so the rows were emitted and the dashboard showed them but NO
+	// customer email was ever sent — the whole point of the change (a customer
+	// whose database gets suspended hears about it). These two constants close
+	// that gap; they MUST equal quota.go's quotaSuspendedKind /
+	// quotaUnsuspendedKind byte-for-byte (asserted by
+	// TestEventEmail_QuotaKindsMatchQuotaGoConstants). The audit metadata JSON
+	// carries resource_id / resource_type / name — same shape the
+	// resource.expiry_imminent builder reads.
+	auditKindResourceQuotaSuspended   = quotaSuspendedKind
+	auditKindResourceQuotaUnsuspended = quotaUnsuspendedKind
 )
 
 // auditRow is the projection of audit_log + users used by the forwarder.
@@ -166,6 +184,10 @@ var supportedAuditKinds = []string{
 	// EmailClient.SendWeeklyDigest / SendExpiryReminder paths.
 	auditKindDigestWeekly,
 	auditKindAnonExpiryWarning,
+	// Storage-quota suspend/unsuspend (follow-up to 49639e7) — without these
+	// in the SQL filter the forwarder never fetches the rows quota.go emits.
+	auditKindResourceQuotaSuspended,
+	auditKindResourceQuotaUnsuspended,
 }
 
 // auditKindDeployTTLSet and auditKindTeamSettingsChanged are emitted by the
@@ -243,6 +265,9 @@ var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
 	auditKindDeployDeletionExpired:   renderDeployDeletionExpired,
 	// Weekly digest.
 	auditKindDigestWeekly: renderDigestWeekly,
+	// Storage-quota suspend/unsuspend (follow-up to 49639e7).
+	auditKindResourceQuotaSuspended:   renderResourceQuotaSuspended,
+	auditKindResourceQuotaUnsuspended: renderResourceQuotaUnsuspended,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
@@ -272,6 +297,9 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	// FOLLOWUP-5 migration (2026-05-14).
 	auditKindDigestWeekly:      buildDigestWeekly,
 	auditKindAnonExpiryWarning: buildAnonExpiryWarning,
+	// Storage-quota suspend/unsuspend (follow-up to 49639e7).
+	auditKindResourceQuotaSuspended:   buildResourceQuotaSuspended,
+	auditKindResourceQuotaUnsuspended: buildResourceQuotaUnsuspended,
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────
@@ -642,5 +670,51 @@ func buildAnonExpiryWarning(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "token_prefix", "token_prefix")
 	copyMetaStr(params, meta, "upgrade_url", "upgrade_url")
 	copyMetaStr(params, meta, "resource_url", "resource_url")
+	return params, true
+}
+
+// ── Storage-quota suspend/unsuspend builders (follow-up to 49639e7) ───────
+//
+// Metadata shape (set by quota.go::emitQuotaAuditRow):
+//
+//   resource.quota_suspended   — {resource_id, resource_type, name}
+//   resource.quota_unsuspended — {resource_id, resource_type, name}
+//
+// resource_type also flows through the audit_log.resource_type COLUMN, so —
+// like buildResourceExpiring / buildAnonExpiryWarning — prefer the column
+// and fall back to the metadata field. The renderer's subject + body read
+// resource_type and name; resource_id is carried for forensic linkage.
+
+func buildResourceQuotaSuspended(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	params["audit_kind"] = row.Kind
+	if row.ResourceType != "" {
+		params["resource_type"] = row.ResourceType
+	} else {
+		copyMetaStr(params, meta, "resource_type", "resource_type")
+	}
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "name", "name")
+	return params, true
+}
+
+func buildResourceQuotaUnsuspended(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	params["audit_kind"] = row.Kind
+	if row.ResourceType != "" {
+		params["resource_type"] = row.ResourceType
+	} else {
+		copyMetaStr(params, meta, "resource_type", "resource_type")
+	}
+	copyMetaStr(params, meta, "resource_id", "resource_id")
+	copyMetaStr(params, meta, "name", "name")
 	return params, true
 }

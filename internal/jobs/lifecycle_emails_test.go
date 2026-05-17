@@ -90,6 +90,8 @@ func representativeParams(kind string) map[string]string {
 		auditKindDigestWeekly:            {"team_name": "Acme", "total_active_resources": "12", "resource_breakdown": "[]"},
 		auditKindAnonExpiryWarning:       {"resource_type": "postgres", "hours_remaining": "12", "expires_at": "2026-05-16T00:00:00Z", "reminder_index": "1", "token_prefix": "ist_abc1", "upgrade_url": "https://instanode.dev/pricing", "resource_url": "https://instanode.dev/dashboard"},
 		auditKindResourceExpiryImminent:  {"resource_type": "redis", "hours_remaining": "6", "expires_at": "2026-05-16T00:00:00Z", "reminder_index": "1", "token_prefix": "ist_xyz9", "upgrade_url": "https://instanode.dev/pricing", "resource_url": "https://instanode.dev/dashboard"},
+		auditKindResourceQuotaSuspended:   {"resource_type": "postgres", "name": "prod-db", "resource_id": "res-1", "audit_kind": "resource.quota_suspended"},
+		auditKindResourceQuotaUnsuspended: {"resource_type": "postgres", "name": "prod-db", "resource_id": "res-1", "audit_kind": "resource.quota_unsuspended"},
 	}
 	for k, v := range per[kind] {
 		common[k] = v
