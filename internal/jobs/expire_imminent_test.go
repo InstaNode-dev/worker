@@ -300,3 +300,61 @@ func (c *captureBytesArg) Match(v driver.Value) bool {
 	}
 	return false
 }
+
+// TestExpireImminent_JoinsOnlyPrimaryUser pins fix #1: the candidate query's
+// LEFT JOIN users MUST carry `AND u.is_primary = true` so the owner email is
+// the team's canonical primary user — not the oldest user (the old
+// LEFT JOIN LATERAL … ORDER BY created_at ASC LIMIT 1 picked whoever signed
+// up first, which is not necessarily the primary). Migration 029
+// (uq_users_one_primary_per_team) guarantees exactly one match.
+//
+// sqlmock's QueryMatcherRegexp matches the expected query as a regex against
+// the SQL the worker actually issues; a query missing the predicate fails
+// ExpectationsWereMet. Mirrors TestExpiryReminderWorker_JoinsOnlyPrimaryUser.
+func TestExpireImminent_JoinsOnlyPrimaryUser(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`LEFT JOIN users u ON u\.team_id = r\.team_id AND u\.is_primary = true`).
+		WillReturnRows(sqlmock.NewRows(imminentRowCols))
+
+	w := jobs.NewExpireImminentWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireImminentArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("query did not include the `AND u.is_primary = true` join predicate: %v", err)
+	}
+}
+
+// TestExpireImminent_DedupeUsesNullSafeNotExists pins fix #3: the 12h dedupe
+// MUST be a correlated NOT EXISTS, not a `NOT IN (subquery)`. A NOT IN against
+// a subquery that can project a NULL uuid — an audit_log row whose
+// metadata->>'resource_id' is JSON null → (null)::uuid — evaluates NULL for
+// EVERY candidate row, so the whole query returns nothing and the worker
+// silently idles. NOT EXISTS is NULL-safe.
+//
+// This test fails if the query ever reverts to `NOT IN`: the regex requires
+// the NOT EXISTS form to be present.
+func TestExpireImminent_DedupeUsesNullSafeNotExists(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Require the NULL-safe correlated NOT EXISTS dedupe clause.
+	mock.ExpectQuery(`NOT EXISTS \(\s*SELECT 1\s*FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(imminentRowCols))
+
+	w := jobs.NewExpireImminentWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireImminentArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("dedupe clause is not a NULL-safe NOT EXISTS (likely reverted to NOT IN): %v", err)
+	}
+}

@@ -350,3 +350,33 @@ func (c *captureChurnBytesArg) Match(v driver.Value) bool {
 	}
 	return false
 }
+
+// TestChurnPredictor_JoinsOnlyPrimaryUser pins fix #2: the candidate query's
+// users join MUST be `LEFT JOIN users u ON u.team_id = t.id AND u.is_primary
+// = true` — the team's canonical primary user. The old code used a
+// LEFT JOIN LATERAL … ORDER BY created_at ASC LIMIT 1 (oldest user) under a
+// stale comment that falsely claimed the users table had no is_primary
+// column; migration 029 added it (and uq_users_one_primary_per_team
+// guarantees exactly one match).
+//
+// sqlmock's QueryMatcherRegexp matches the expected query as a regex against
+// the SQL the worker actually issues; a query missing the predicate fails
+// ExpectationsWereMet. Mirrors TestExpiryReminderWorker_JoinsOnlyPrimaryUser.
+func TestChurnPredictor_JoinsOnlyPrimaryUser(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`LEFT JOIN users u ON u\.team_id = t\.id AND u\.is_primary = true`).
+		WillReturnRows(sqlmock.NewRows(churnRowCols))
+
+	w := jobs.NewChurnPredictorWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.ChurnPredictorArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("query did not include the `AND u.is_primary = true` join predicate: %v", err)
+	}
+}

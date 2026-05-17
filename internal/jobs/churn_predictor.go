@@ -49,10 +49,12 @@ package jobs
 //
 // ─── Schema notes ────────────────────────────────────────────────────
 //
-// The brief's example query uses `users.is_primary = true` to pick the
-// owner's email. The users table has no `is_primary` column (see
-// migration 001_initial.sql). We use the "oldest user on the team"
-// convention from expire_imminent.go — consistent across the worker.
+// The owner's email is resolved via `users.is_primary = true` — the
+// canonical primary user of the team. Migration 029
+// (uq_users_one_primary_per_team) guarantees exactly one such row per
+// team. This matches the convention in expire_imminent.go,
+// expiry_reminder.go and deployment_expirer.go — consistent across the
+// worker.
 
 import (
 	"context"
@@ -160,11 +162,13 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 
 	// Single-query candidate scan — no N+1.
 	//
-	// The LEFT JOIN LATERAL on users picks the oldest user on the team
-	// (same convention as expire_imminent.go). A team with no users
-	// surfaces as NULL email; we skip the row at the application layer
-	// (see per-row handling below) so the brief's "include email in
-	// metadata" contract is preserved.
+	// The LEFT JOIN on users … is_primary=true picks the team's canonical
+	// primary user (same convention as expire_imminent.go and
+	// expiry_reminder.go). Migration 029 (uq_users_one_primary_per_team)
+	// guarantees exactly one match. A team with no primary user surfaces
+	// as NULL email; we skip the row at the application layer (see per-row
+	// handling below) so the brief's "include email in metadata" contract
+	// is preserved.
 	//
 	// The LEFT JOIN on audit_log carries activity kinds via LIKE
 	// patterns so the query is forward-compatible the day deploy/vault/
@@ -183,13 +187,7 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 			MAX(a.created_at)     AS last_activity,
 			COUNT(r.id)           AS active_resource_count
 		FROM teams t
-		LEFT JOIN LATERAL (
-			SELECT email
-			FROM users
-			WHERE team_id = t.id
-			ORDER BY created_at ASC
-			LIMIT 1
-		) u ON true
+		LEFT JOIN users u ON u.team_id = t.id AND u.is_primary = true
 		LEFT JOIN audit_log a ON a.team_id = t.id
 			AND (
 				a.kind = 'provision'
@@ -246,10 +244,10 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 
 	var flagged, skipped int
 	for _, r := range candidates {
-		// Defensive: a team can exist without users (orphan / pre-signup).
-		// Brevo keys events on email, so a churn.risk_flagged row with no
-		// addressable email is dead weight — skip and log so an operator
-		// can investigate.
+		// Defensive: a team can exist without a primary user (orphan /
+		// pre-signup). Brevo keys events on email, so a churn.risk_flagged
+		// row with no addressable email is dead weight — skip and log so an
+		// operator can investigate.
 		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
 			slog.Warn("jobs.churn_predictor.no_owner_email",
 				"team_id", r.teamID.String(),

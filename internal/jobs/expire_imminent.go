@@ -127,16 +127,22 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 
 	// Candidate query.
 	//
-	// The NOT IN clause is the freshness window: at most one
+	// The NOT EXISTS clause is the freshness window: at most one
 	// resource.expiry_imminent row per resource per 12h. The metadata
 	// JSONB carries resource_id (set by the INSERT below) so the
-	// subquery can join back. cast to uuid so the NOT IN comparison
-	// matches r.id's type.
+	// correlated subquery can match back. A correlated NOT EXISTS is
+	// used (NOT a NOT IN): if any audit_log row had a NULL
+	// (metadata->>'resource_id')::uuid — JSON key present but value
+	// null — the SQL `x NOT IN (..., NULL, ...)` would evaluate NULL
+	// for every candidate, silently dropping the whole batch and
+	// idling the worker. NOT EXISTS is NULL-safe: a NULL projected
+	// value simply fails the `= r.id` correlation and is ignored.
 	//
-	// LEFT JOIN LATERAL picks the oldest user on the team — same
-	// convention as loops_event_forwarder.go's owner_email resolution.
-	// A team with no users surfaces as NULL email; we skip the row
-	// (see per-row handling below).
+	// LEFT JOIN users … is_primary=true resolves the team's canonical
+	// primary user — the same convention as expiry_reminder.go and
+	// deployment_expirer.go. Migration 029 (uq_users_one_primary_per_team)
+	// guarantees exactly one match. A team with no primary user surfaces
+	// as NULL email; we skip the row (see per-row handling below).
 	//
 	// LIMIT bounds per-tick fan-out; the 12h dedupe absorbs spillover.
 	rows, err := w.db.QueryContext(ctx, `
@@ -148,24 +154,19 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 			r.expires_at,
 			COALESCE(u.email, '') AS owner_email
 		FROM resources r
-		LEFT JOIN LATERAL (
-			SELECT email
-			FROM users
-			WHERE team_id = r.team_id
-			ORDER BY created_at ASC
-			LIMIT 1
-		) u ON true
+		LEFT JOIN users u ON u.team_id = r.team_id AND u.is_primary = true
 		WHERE r.team_id IS NOT NULL
 		  AND r.status = 'active'
 		  AND r.expires_at IS NOT NULL
 		  AND r.expires_at > $1
 		  AND r.expires_at < $2
-		  AND r.id NOT IN (
-			SELECT (metadata->>'resource_id')::uuid
-			FROM audit_log
-			WHERE kind = $3
-			  AND created_at > $4
-			  AND metadata ? 'resource_id'
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM audit_log al
+			WHERE al.kind = $3
+			  AND al.created_at > $4
+			  AND al.metadata ? 'resource_id'
+			  AND (al.metadata->>'resource_id')::uuid = r.id
 		  )
 		ORDER BY r.expires_at ASC
 		LIMIT $5
@@ -204,9 +205,9 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 
 	var emitted, skipped int
 	for _, r := range candidates {
-		// Defensive: a team can exist without users (orphan / pre-signup).
-		// Loops keys events on email, so an audit row with no email is
-		// dead weight — skip and log so an operator can investigate.
+		// Defensive: a team can exist without a primary user (orphan /
+		// pre-signup). Loops keys events on email, so an audit row with no
+		// email is dead weight — skip and log so an operator can investigate.
 		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
 			slog.Warn("jobs.expire_imminent.no_owner_email",
 				"resource_id", r.resourceID.String(),
