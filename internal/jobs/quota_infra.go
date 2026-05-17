@@ -44,11 +44,15 @@ type ResourceInfraRevoker interface {
 	// Returns nil on success or when the resource type has no infra revoke
 	// (queue/storage/webhook — a row status flip is the entire effect).
 	// Logs and returns nil on connectivity failure (fail-open).
-	RevokeAccess(ctx context.Context, resourceType, token, connectionURL string) error
+	//
+	// tier is required for redis: the Redis ACL username scheme differs
+	// between the shared backend (usr_<full-token>) and the dedicated
+	// backend (ded_<token[:8]>). See redisUsernameForToken.
+	RevokeAccess(ctx context.Context, resourceType, token, tier string) error
 
 	// GrantAccess re-enables connectivity (GRANT CONNECT, ACL SETUSER on,
 	// grantRolesToUser). Same semantics as RevokeAccess.
-	GrantAccess(ctx context.Context, resourceType, token, connectionURL string) error
+	GrantAccess(ctx context.Context, resourceType, token, tier string) error
 }
 
 // StatusOnly is the sentinel constant used as resourceType when a resource type
@@ -77,12 +81,12 @@ func NewDirectResourceRevoker(customerDatabaseURL, mongoAdminURI, customerRedisU
 }
 
 // RevokeAccess implements ResourceInfraRevoker.
-func (r *directResourceRevoker) RevokeAccess(ctx context.Context, resourceType, token, _ string) error {
+func (r *directResourceRevoker) RevokeAccess(ctx context.Context, resourceType, token, tier string) error {
 	switch resourceType {
 	case "postgres":
 		return r.revokePostgres(ctx, token)
 	case "redis":
-		return r.revokeRedis(ctx, token)
+		return r.revokeRedis(ctx, token, tier)
 	case "mongodb":
 		return r.revokeMongo(ctx, token)
 	default:
@@ -93,12 +97,12 @@ func (r *directResourceRevoker) RevokeAccess(ctx context.Context, resourceType, 
 }
 
 // GrantAccess implements ResourceInfraRevoker.
-func (r *directResourceRevoker) GrantAccess(ctx context.Context, resourceType, token, _ string) error {
+func (r *directResourceRevoker) GrantAccess(ctx context.Context, resourceType, token, tier string) error {
 	switch resourceType {
 	case "postgres":
 		return r.grantPostgres(ctx, token)
 	case "redis":
-		return r.grantRedis(ctx, token)
+		return r.grantRedis(ctx, token, tier)
 	case "mongodb":
 		return r.grantMongo(ctx, token)
 	default:
@@ -180,34 +184,80 @@ func (r *directResourceRevoker) grantPostgres(ctx context.Context, token string)
 
 // ── Redis ─────────────────────────────────────────────────────────────────────
 
-// redisUsernameForToken returns the ACL username the provisioner assigns to a
-// Redis resource. Matches provisioner/internal/backend/redis/local.go convention.
-func redisUsernameForToken(token string) string {
-	// Token length >= 8 is guaranteed by the provisioner; short-token guard is
-	// belt-and-suspenders only.
-	if len(token) < 8 {
-		return "usr_" + token
+// Redis ACL username schemes. These MUST match — byte-for-byte — the
+// usernames the provisioner and api create at provision time, or the worker's
+// quota-suspend `ACL SETUSER <user> off` targets a user that does not exist
+// (a silent no-op: the row flips to 'suspended' but the customer keeps full
+// Redis access). This is the token-truncation class of bug — see P1 in
+// BUGHUNT-REPORT-2026-05-17-round2.md.
+//
+// SHARED backend (anonymous / free tiers — the shared `redis-provision` pod):
+//
+//	usr_<FULL-token>
+//
+//	Verified against:
+//	  - provisioner/internal/backend/redis/local.go  — aclUserPrefix = "usr_",
+//	    aclUsername(token) = aclUserPrefix + token  (the FULL token, P1-D fix).
+//	  - api/internal/providers/cache/redis.go        — aclUsernamePrefix = "usr_",
+//	    aclUsername(token) = aclUsernamePrefix + token  (the FULL token, P1-E fix).
+//
+// DEDICATED backend (paid tiers — a per-tenant k8s Redis pod):
+//
+//	ded_<token[:8]>
+//
+//	Verified against:
+//	  - provisioner/internal/backend/redis/dedicated.go provisionLocal:
+//	    short := token; if len(short) > 8 { short = short[:8] }
+//	    username := fmt.Sprintf("ded_%s", short)
+//
+// The two schemes are distinguished by tier: anonymous/free live on the shared
+// backend, every paid tier gets a dedicated pod. isSharedRedisTier (defined in
+// quota_redis_eviction.go) is the canonical tier→backend classifier and is
+// reused here so the two call sites can never drift.
+const (
+	sharedRedisACLUserPrefix    = "usr_" // shared backend: usr_<full-token>
+	dedicatedRedisACLUserPrefix = "ded_" // dedicated backend: ded_<token[:8]>
+	// dedicatedRedisACLUserTokenLen is the token-prefix length the dedicated
+	// provisioner backend uses for its ACL username. Kept as a named constant
+	// per CLAUDE.md ("Use named constants, not inline strings") and so a future
+	// audit can grep it against provisioner/.../redis/dedicated.go.
+	dedicatedRedisACLUserTokenLen = 8
+)
+
+// redisUsernameForToken returns the EXACT ACL username the provisioner/api
+// assign to a Redis resource of the given tier. It must be byte-for-byte
+// identical to the provision-time username or the quota-suspend ACL op is a
+// silent no-op (see the scheme documentation above).
+func redisUsernameForToken(token, tier string) string {
+	if isSharedRedisTier(tier) {
+		// Shared backend: full token, never truncated (P1-D / P1-E).
+		return sharedRedisACLUserPrefix + token
 	}
-	return "usr_" + token[:8]
+	// Dedicated backend: ded_ + first 8 chars of the token.
+	short := token
+	if len(short) > dedicatedRedisACLUserTokenLen {
+		short = short[:dedicatedRedisACLUserTokenLen]
+	}
+	return dedicatedRedisACLUserPrefix + short
 }
 
-func (r *directResourceRevoker) revokeRedis(ctx context.Context, token string) error {
+func (r *directResourceRevoker) revokeRedis(ctx context.Context, token, tier string) error {
 	if r.customerRedisURL == "" {
 		slog.Warn("quota_infra.revokeRedis: CUSTOMER_REDIS_URL not set — skipping infra revoke",
 			"token", token)
 		return nil
 	}
-	username := redisUsernameForToken(token)
+	username := redisUsernameForToken(token, tier)
 	return setCustomerRedisACL(ctx, r.customerRedisURL, username, false, token)
 }
 
-func (r *directResourceRevoker) grantRedis(ctx context.Context, token string) error {
+func (r *directResourceRevoker) grantRedis(ctx context.Context, token, tier string) error {
 	if r.customerRedisURL == "" {
 		slog.Warn("quota_infra.grantRedis: CUSTOMER_REDIS_URL not set — skipping infra grant",
 			"token", token)
 		return nil
 	}
-	username := redisUsernameForToken(token)
+	username := redisUsernameForToken(token, tier)
 	return setCustomerRedisACL(ctx, r.customerRedisURL, username, true, token)
 }
 

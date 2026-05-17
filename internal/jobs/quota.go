@@ -343,7 +343,9 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 		// intentional: a row marked 'suspended' blocks new provisions from the
 		// API even when the infra revoke is not available (customer DB down).
 		if w.revoker != nil {
-			if revokeErr := w.revoker.RevokeAccess(ctx, resourceType, token, ""); revokeErr != nil {
+			// tier is passed so the revoker can derive the correct Redis ACL
+			// username (shared usr_<full-token> vs dedicated ded_<token[:8]>).
+			if revokeErr := w.revoker.RevokeAccess(ctx, resourceType, token, tier); revokeErr != nil {
 				// revoker implementations are fail-open (return nil on infra
 				// error, log a WARN). A non-nil error here is unexpected —
 				// log it but don't abort the row update.
@@ -470,7 +472,9 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 
 		// Re-grant infra access before flipping the status row.
 		if w.revoker != nil {
-			if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, ""); grantErr != nil {
+			// tier is passed so the revoker can derive the correct Redis ACL
+			// username (shared usr_<full-token> vs dedicated ded_<token[:8]>).
+			if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, tier); grantErr != nil {
 				slog.Error("jobs.enforce_storage_quota.grant_error",
 					"resource_id", id, "token", token, "resource_type", resourceType,
 					"error", grantErr,
