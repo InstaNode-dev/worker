@@ -146,11 +146,20 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 	windowEnd := now.Add(reminderSchedule[0].expiresWithin)
 	cooldownBefore := now.Add(-reminderCooldown)
 
+	// LEFT JOIN users u ... AND u.is_primary = true — the is_primary
+	// predicate MUST be in the JOIN clause. Without it the join fans out one
+	// candidate row per team member: the expiry warning is emailed to EVERY
+	// teammate (anon.expiry_warning audit row written N times) and the
+	// per-tick LIMIT 500 budget is consumed by duplicates. migration 029
+	// guarantees exactly one users row per team has is_primary=true
+	// (uq_users_one_primary_per_team), so this collapses the join back to one
+	// recipient per resource. Matches deployment_expirer.go /
+	// deployment_reminder.go, which already join on AND u.is_primary = true.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT r.id, r.team_id, r.resource_type, r.expires_at,
 		       r.reminders_sent, r.key_prefix, u.email
 		FROM resources r
-		LEFT JOIN users u ON u.team_id = r.team_id
+		LEFT JOIN users u ON u.team_id = r.team_id AND u.is_primary = true
 		WHERE r.team_id IS NOT NULL
 		  AND r.tier = 'free'
 		  AND r.status = 'active'

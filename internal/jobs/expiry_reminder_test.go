@@ -303,6 +303,40 @@ func TestExpiryReminderWorker_TopLevelQueryError_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestExpiryReminderWorker_JoinsOnlyPrimaryUser is the P6 coverage test
+// (BUGHUNT-REPORT-2026-05-17-round2.md): the LEFT JOIN users MUST carry
+// `AND u.is_primary = true`. Without it, a team with N members fans the join
+// out to N candidate rows per resource — the anon.expiry_warning audit row is
+// written N times (every teammate emailed) and the per-tick LIMIT 500 budget
+// is consumed by duplicates.
+//
+// sqlmock matches the expected query as a regular expression against the SQL
+// the worker actually issues, so a query missing the predicate fails
+// ExpectationsWereMet. This test fails if the is_primary predicate is ever
+// dropped from the join.
+func TestExpiryReminderWorker_JoinsOnlyPrimaryUser(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// The expected-query regex REQUIRES the is_primary predicate to be present
+	// in the JOIN clause. A query without it will not match → ExpectationsWereMet
+	// fails the test.
+	mock.ExpectQuery(`LEFT JOIN users u ON u\.team_id = r\.team_id AND u\.is_primary = true`).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "team_id", "resource_type", "expires_at", "reminders_sent", "key_prefix", "email"}))
+
+	w := jobs.NewExpiryReminderWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("query did not include the `AND u.is_primary = true` join predicate: %v", err)
+	}
+}
+
 // TestExpiryReminderWorker_CASLoses_NoAudit: another worker advanced
 // reminders_sent between SELECT and UPDATE — RowsAffected=0 → skip
 // without writing the audit row.
