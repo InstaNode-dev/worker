@@ -415,3 +415,78 @@ func TestEventEmail_BuildDeployDeletionConfirmedFlowsContext(t *testing.T) {
 		t.Errorf("freed_at = %q; want \"2026-05-14T13:00:00Z\"", params["freed_at"])
 	}
 }
+
+// TestEventEmail_QuotaKindsMatchQuotaGoConstants pins the cross-module
+// contract: the audit kinds registered in the email pipeline MUST equal
+// quota.go's quotaSuspendedKind / quotaUnsuspendedKind byte-for-byte.
+// quota.go writes the audit_log row with those constants; if the pipeline
+// constants drift, the SQL filter silently never matches and no email is
+// ever sent (the exact gap commit 49639e7 left open). Both live in the
+// `jobs` package, so this test compares the actual values.
+func TestEventEmail_QuotaKindsMatchQuotaGoConstants(t *testing.T) {
+	if auditKindResourceQuotaSuspended != quotaSuspendedKind {
+		t.Errorf("auditKindResourceQuotaSuspended = %q but quota.go's quotaSuspendedKind = %q — "+
+			"the email pipeline must use the SAME literal quota.go writes to audit_log, else the "+
+			"SQL filter never matches and no email is sent", auditKindResourceQuotaSuspended, quotaSuspendedKind)
+	}
+	if auditKindResourceQuotaUnsuspended != quotaUnsuspendedKind {
+		t.Errorf("auditKindResourceQuotaUnsuspended = %q but quota.go's quotaUnsuspendedKind = %q — "+
+			"the email pipeline must use the SAME literal quota.go writes to audit_log", auditKindResourceQuotaUnsuspended, quotaUnsuspendedKind)
+	}
+}
+
+// TestEventEmail_QuotaKindsFullyWired is the regression guard for the
+// 49639e7 follow-up: commit 49639e7 emitted the quota audit rows but never
+// registered the kinds in the email pipeline, so no customer email was
+// ever sent. Both quota kinds MUST be in supportedAuditKinds (the SQL
+// filter) AND have an eventEmailBuilders entry AND an
+// eventEmailBodyRenderers entry. A future edit that half-registers them
+// (e.g. adds the builder but drops the renderer) fails here.
+func TestEventEmail_QuotaKindsFullyWired(t *testing.T) {
+	supportedSet := map[string]bool{}
+	for _, k := range supportedAuditKinds {
+		supportedSet[k] = true
+	}
+	for _, k := range []string{auditKindResourceQuotaSuspended, auditKindResourceQuotaUnsuspended} {
+		if !supportedSet[k] {
+			t.Errorf("49639e7 follow-up: %q missing from supportedAuditKinds — the forwarder's SQL "+
+				"filter will never fetch the audit row, so the customer never gets an email", k)
+		}
+		if _, ok := eventEmailBuilders[k]; !ok {
+			t.Errorf("49639e7 follow-up: %q has no eventEmailBuilders entry — the forwarder hits "+
+				"no_builder_for_kind and skips the row", k)
+		}
+		if _, ok := eventEmailBodyRenderers[k]; !ok {
+			t.Errorf("49639e7 follow-up: %q has no eventEmailBodyRenderers entry — it would fall "+
+				"through to the legacy broken dashboard-template path", k)
+		}
+	}
+
+	// Exercise both builders end-to-end: a valid row produces params that
+	// carry the resource context the renderer's subject/body reads.
+	for _, kind := range []string{auditKindResourceQuotaSuspended, auditKindResourceQuotaUnsuspended} {
+		row := auditRow{
+			ID:           "audit-1",
+			TeamID:       "team-1",
+			Kind:         kind,
+			ResourceType: "postgres",
+			Summary:      "test summary",
+			OwnerEmail:   "u@example.com",
+			Metadata:     []byte(`{"resource_id":"res-1","resource_type":"postgres","name":"prod-db"}`),
+		}
+		params, ok := eventEmailBuilders[kind](row)
+		if !ok {
+			t.Errorf("builder for %q returned ok=false with a valid email", kind)
+			continue
+		}
+		if params["resource_type"] != "postgres" {
+			t.Errorf("builder for %q: resource_type = %q; want postgres (column flows into params)", kind, params["resource_type"])
+		}
+		if params["name"] != "prod-db" {
+			t.Errorf("builder for %q: name = %q; want prod-db (metadata flows into params)", kind, params["name"])
+		}
+		if params["resource_id"] != "res-1" {
+			t.Errorf("builder for %q: resource_id = %q; want res-1", kind, params["resource_id"])
+		}
+	}
+}
