@@ -11,6 +11,7 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -555,6 +556,52 @@ var errFakeSuppression = &fakeSuppressionError{}
 type fakeSuppressionError struct{}
 
 func (*fakeSuppressionError) Error() string { return "fake suppression DB error" }
+
+// TestEventForwarder_UnsubscribeCheckError_FailsClosed verifies the
+// SPLIT fail posture: a DB error specifically in the UNSUBSCRIBE lookup
+// (wrapping errUnsubscribeLookupFailed) MUST fail CLOSED — the send
+// is skipped AND the cursor is NOT advanced, so the row retries when the
+// DB recovers. Emailing an unsubscribed user during a DB brownout is a
+// CAN-SPAM / GDPR compliance violation, unlike a bounce-lookup error
+// (covered by TestEventForwarder_SuppressionCheckerError_FailsOpen).
+func TestEventForwarder_UnsubscribeCheckError_FailsClosed(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Date(2026, 5, 13, 19, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("unsub-err-1", "team-ue", auditKindOnboardingClaimed, "", "x", []byte(`{}`), createdAt, "maybe-unsub@example.com"))
+
+	provider := &fakeProvider{
+		sendFn: func(_ context.Context, _ email.EventEmail) error {
+			t.Errorf("SendEvent must NOT be called when the unsubscribe lookup failed (fail-closed)")
+			return nil
+		},
+	}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.suppression = &memSuppression{
+		suppressedEmails: map[string]bool{},
+		// Wraps the sentinel so Work() takes the fail-CLOSED branch.
+		failNext: fmt.Errorf("simulated unsubscribe DB error: %w", errUnsubscribeLookupFailed),
+	}
+
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if got := provider.callCount(); got != 0 {
+		t.Errorf("expected 0 SendEvent calls (fail-closed), got %d", got)
+	}
+	// Cursor MUST NOT advance — the row must be retried once the DB recovers.
+	if cursor.c.ID != "" {
+		t.Errorf("cursor.ID = %q; want \"\" (cursor MUST NOT advance on unsubscribe-lookup failure)", cursor.c.ID)
+	}
+}
 
 // TestEventForwarder_NoopProvider_AdvancesCursor — wiring a real
 // email.NoopProvider through the forwarder is the integration check that

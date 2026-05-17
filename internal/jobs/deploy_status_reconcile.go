@@ -200,8 +200,8 @@ func newDeployK8sClientset() (*kubernetes.Clientset, error) {
 type DeployStatusReconciler struct {
 	river.WorkerDefaults[DeployStatusReconcileArgs]
 	db         *sql.DB
-	k8s        deployStatusK8sProvider      // may be nil — the worker then warn-logs each run
-	autopsyK8s deployAutopsyK8sProvider     // may be nil — autopsy rows will use Unknown reason
+	k8s        deployStatusK8sProvider  // may be nil — the worker then warn-logs each run
+	autopsyK8s deployAutopsyK8sProvider // may be nil — autopsy rows will use Unknown reason
 }
 
 // NewDeployStatusReconciler constructs the worker.
@@ -298,6 +298,32 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 			continue
 		}
 
+		// Phase 0 — Failure Autopsy: capture a deployment_events row whenever
+		// the CURRENT k8s state is "failed" — decoupled from the status
+		// transition. The api's GET /deploy/:id handler reads this row and
+		// surfaces it as the optional "failure" object in the response.
+		//
+		// Capture is intentionally NOT gated behind `newStatus != d.status`.
+		// A healthy→failed-on-redeploy deployment whose DB row the api already
+		// flipped to "failed" (so the worker sees newStatus == d.status ==
+		// "failed") would otherwise be skipped by the transition `continue`
+		// below and never get a structured "failure" object. The upsert is
+		// idempotent — the deployment_events partial-unique index +
+		// ON CONFLICT DO UPDATE make re-capture on every tick a safe no-op
+		// (re-overwrites the row with the latest pod state). We still bound
+		// the cost: the capture only runs for rows listActiveDeployments
+		// already returned (building|deploying|healthy), so the reconciler
+		// does not start polling the whole failed-row history.
+		//
+		// This runs synchronously in the sweep loop because the log-tail call
+		// has its own 10s timeout (k8sGetTimeout is reused per sub-call).
+		// The worst case is one 10s stall per failed pod, which is acceptable
+		// given the 30s reconcile interval and the small number of failed pods
+		// in a healthy cluster.
+		if newStatus == deployStatusFailed {
+			captureDeploymentAutopsy(ctx, w.db, d.id, d.providerID, w.autopsyK8s)
+		}
+
 		if newStatus == d.status {
 			continue
 		}
@@ -314,26 +340,6 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 			"id", d.id, "provider_id", d.providerID,
 			"from", d.status, "to", newStatus)
 		transitions++
-
-		// Phase 0 — Failure Autopsy: capture a deployment_events row whenever
-		// a deployment transitions INTO the "failed" state. The api's
-		// GET /deploy/:id handler reads this row and surfaces it as the
-		// optional "failure" object in the response.
-		//
-		// We capture on EVERY transition into "failed" (not just the first)
-		// because the reconciler may see building→failed if k8s fires a
-		// ReplicaFailure condition before the pod emits its first log.
-		// The upsert is idempotent, so re-capturing overwrites the row with
-		// the latest pod state rather than accumulating duplicates.
-		//
-		// This runs synchronously in the sweep loop because the log-tail call
-		// has its own 10s timeout (k8sGetTimeout is reused per sub-call).
-		// The worst case is one 10s stall per failed pod, which is acceptable
-		// given the 30s reconcile interval and the small number of failed pods
-		// in a healthy cluster.
-		if newStatus == deployStatusFailed {
-			captureDeploymentAutopsy(ctx, w.db, d.id, d.providerID, w.autopsyK8s)
-		}
 	}
 
 	slog.Info("jobs.deploy_status_reconcile.completed",
