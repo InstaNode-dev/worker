@@ -34,6 +34,17 @@ func BillingReconcilerPlanIDToTier(planID string) string {
 	return billingReconcilerPlanIDToTier(planID)
 }
 
+// BillingReconcilerPlanEnvKeys returns the Razorpay plan-id env-var names the
+// reconciler reads — exported so the worker↔api env-var-name agreement test
+// can pin them against api/internal/config/config.go.
+func BillingReconcilerPlanEnvKeys() []string {
+	keys := make([]string, 0, len(billingReconcilerPlanEnvEntries))
+	for _, e := range billingReconcilerPlanEnvEntries {
+		keys = append(keys, e.envKey)
+	}
+	return keys
+}
+
 // BillingTierRank exports billingTierRank for ordering tests.
 func BillingTierRank(tier string) int {
 	return billingTierRank(tier)

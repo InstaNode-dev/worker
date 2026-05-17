@@ -156,6 +156,48 @@ var billingPaidTiers = map[string]bool{
 
 // ── worker-local planIDToTier ─────────────────────────────────────────────────
 
+// Razorpay plan-id env-var names. These MUST match the names the api reads in
+// api/internal/config/config.go AND the keys in the live `instant-secrets` k8s
+// Secret — both pods receive the same Secret. The api fixed this on 2026-05-15:
+// every YEARLY plan id uses the `_ANNUAL` suffix (not `_YEARLY`). The worker
+// previously read `_YEARLY` for Hobby/Pro/Team, so os.Getenv returned "" in
+// prod → a yearly-Pro/Team team that missed its upgrade webhook was reconciled
+// DOWN to hobby and every tick logged a spurious plan_id_to_tier.unrecognised.
+//
+// If the api renames any of these, this list must change in lock-step — see
+// TestBillingReconcilerPlanEnvNamesMatchAPI which pins the agreement.
+const (
+	envRazorpayPlanIDHobby           = "RAZORPAY_PLAN_ID_HOBBY"
+	envRazorpayPlanIDHobbyAnnual     = "RAZORPAY_PLAN_ID_HOBBY_ANNUAL"
+	envRazorpayPlanIDHobbyPlus       = "RAZORPAY_PLAN_ID_HOBBY_PLUS"
+	envRazorpayPlanIDHobbyPlusAnnual = "RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL"
+	envRazorpayPlanIDPro             = "RAZORPAY_PLAN_ID_PRO"
+	envRazorpayPlanIDProAnnual       = "RAZORPAY_PLAN_ID_PRO_ANNUAL"
+	envRazorpayPlanIDTeam            = "RAZORPAY_PLAN_ID_TEAM"
+	envRazorpayPlanIDTeamAnnual      = "RAZORPAY_PLAN_ID_TEAM_ANNUAL"
+)
+
+// billingReconcilerPlanEntry pairs a Razorpay plan-id env-var name with the
+// canonical tier it grants.
+type billingReconcilerPlanEntry struct {
+	envKey string
+	tier   string
+}
+
+// billingReconcilerPlanEnvEntries is the ordered (most-specific-first) lookup
+// table for billingReconcilerPlanIDToTier. Ordering avoids a "" env var
+// stealing a match.
+var billingReconcilerPlanEnvEntries = []billingReconcilerPlanEntry{
+	{envRazorpayPlanIDTeamAnnual, "team"},
+	{envRazorpayPlanIDTeam, "team"},
+	{envRazorpayPlanIDProAnnual, "pro"},
+	{envRazorpayPlanIDPro, "pro"},
+	{envRazorpayPlanIDHobbyPlusAnnual, "hobby_plus"},
+	{envRazorpayPlanIDHobbyPlus, "hobby_plus"},
+	{envRazorpayPlanIDHobbyAnnual, "hobby"},
+	{envRazorpayPlanIDHobby, "hobby"},
+}
+
 // billingReconcilerPlanIDToTier maps a Razorpay plan_id to a canonical tier.
 //
 // TECH DEBT (Option 3 from design doc §8): this function duplicates ~30 lines
@@ -177,21 +219,7 @@ func billingReconcilerPlanIDToTier(planID string) string {
 	}
 
 	// Ordered most-specific-first to avoid a "" env var stealing a match.
-	type planEntry struct {
-		envKey string
-		tier   string
-	}
-	entries := []planEntry{
-		{"RAZORPAY_PLAN_ID_TEAM_YEARLY", "team"},
-		{"RAZORPAY_PLAN_ID_TEAM", "team"},
-		{"RAZORPAY_PLAN_ID_PRO_YEARLY", "pro"},
-		{"RAZORPAY_PLAN_ID_PRO", "pro"},
-		{"RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL", "hobby_plus"},
-		{"RAZORPAY_PLAN_ID_HOBBY_PLUS", "hobby_plus"},
-		{"RAZORPAY_PLAN_ID_HOBBY_YEARLY", "hobby"},
-		{"RAZORPAY_PLAN_ID_HOBBY", "hobby"},
-	}
-	for _, e := range entries {
+	for _, e := range billingReconcilerPlanEnvEntries {
 		if configured := os.Getenv(e.envKey); configured != "" && planID == configured {
 			return e.tier
 		}
@@ -260,11 +288,17 @@ func (d *dbGracePeriodOpener) OpenGracePeriod(ctx context.Context, teamID uuid.U
 	startedAt := time.Now().UTC()
 	expiresAt := startedAt.Add(billingReconcilerGraceDays * 24 * time.Hour)
 
-	_, err := d.db.ExecContext(ctx, `
+	// RETURNING id so the audit row below can carry grace_id — the Brevo
+	// dunning template renders grace_id / started_at / expires_at, matching
+	// the api webhook path (emitPaymentGraceStartedAudit). Without these
+	// fields the warning email shows a blank recovery deadline.
+	var graceID string
+	err := d.db.QueryRowContext(ctx, `
 		INSERT INTO payment_grace_periods
 		    (team_id, subscription_id, status, started_at, expires_at)
 		VALUES ($1, $2, 'active', $3, $4)
-	`, teamID, subscriptionID, startedAt, expiresAt)
+		RETURNING id
+	`, teamID, subscriptionID, startedAt, expiresAt).Scan(&graceID)
 	if err != nil {
 		var pqErr *pq.Error
 		if errors.As(err, &pqErr) && string(pqErr.Code) == billingReconcilerPGUniqueViolation {
@@ -278,16 +312,31 @@ func (d *dbGracePeriodOpener) OpenGracePeriod(ctx context.Context, teamID uuid.U
 	slog.Info("billing.reconciler.grace_period_opened",
 		"team_id", teamID,
 		"subscription_id", subscriptionID,
+		"grace_id", graceID,
 		"expires_at", expiresAt,
 	)
 
-	// Best-effort audit row — the grace period is committed; a log failure is tolerable.
+	// Best-effort audit row — the grace period is committed; a log failure is
+	// tolerable. Metadata carries grace_id / started_at / expires_at so the
+	// dunning email renders the recovery deadline. attempted_amount is null:
+	// the reconciler has no payment entity (it polls subscription state, not
+	// the failed charge) — the Brevo template tolerates a null amount.
 	_, auditErr := d.db.ExecContext(ctx, `
 		INSERT INTO audit_log (team_id, actor, kind, summary, metadata)
 		VALUES ($1, 'system', 'payment.grace_started',
 		        'Grace period opened by billing reconciler poller',
-		        jsonb_build_object('subscription_id', $2::text, 'source', 'billing_reconciler'))
-	`, teamID, subscriptionID)
+		        jsonb_build_object(
+		            'subscription_id',  $2::text,
+		            'grace_id',         $3::text,
+		            'started_at',       $4::text,
+		            'expires_at',       $5::text,
+		            'attempted_amount', NULL,
+		            'source',           'billing_reconciler'
+		        ))
+	`, teamID, subscriptionID, graceID,
+		startedAt.Format(time.RFC3339),
+		expiresAt.Format(time.RFC3339),
+	)
 	if auditErr != nil {
 		slog.Warn("billing.reconciler.grace_audit_insert_failed",
 			"team_id", teamID, "error", auditErr,

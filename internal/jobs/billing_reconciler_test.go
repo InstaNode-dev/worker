@@ -45,7 +45,7 @@ import (
 
 // stubFetcher implements subscriptionFetcher for tests.
 type stubFetcher struct {
-	details *jobs.ReconcilerSubDetails // nil → return fetchErr
+	details  *jobs.ReconcilerSubDetails // nil → return fetchErr
 	fetchErr error
 }
 
@@ -111,14 +111,16 @@ func TestBillingReconcilerPlanIDToTier_EnvMapped(t *testing.T) {
 		envKey   string
 		wantTier string
 	}{
+		// Yearly variants use the `_ANNUAL` suffix — must match the api
+		// (api/internal/config/config.go) and the live `instant-secrets`.
 		{"RAZORPAY_PLAN_ID_HOBBY", "hobby"},
-		{"RAZORPAY_PLAN_ID_HOBBY_YEARLY", "hobby"},
+		{"RAZORPAY_PLAN_ID_HOBBY_ANNUAL", "hobby"},
 		{"RAZORPAY_PLAN_ID_HOBBY_PLUS", "hobby_plus"},
 		{"RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL", "hobby_plus"},
 		{"RAZORPAY_PLAN_ID_PRO", "pro"},
-		{"RAZORPAY_PLAN_ID_PRO_YEARLY", "pro"},
+		{"RAZORPAY_PLAN_ID_PRO_ANNUAL", "pro"},
 		{"RAZORPAY_PLAN_ID_TEAM", "team"},
-		{"RAZORPAY_PLAN_ID_TEAM_YEARLY", "team"},
+		{"RAZORPAY_PLAN_ID_TEAM_ANNUAL", "team"},
 	}
 
 	for _, tc := range cases {
@@ -134,6 +136,35 @@ func TestBillingReconcilerPlanIDToTier_EnvMapped(t *testing.T) {
 	}
 }
 
+// TestBillingReconcilerPlanEnvNamesMatchAPI pins the worker's Razorpay plan-id
+// env-var names to the canonical set the api reads + the live `instant-secrets`
+// k8s Secret. The 2026-05-15 bug was a `_YEARLY` vs `_ANNUAL` suffix mismatch:
+// the worker read `_YEARLY` keys that resolve to "" in prod, so yearly-Pro/Team
+// teams that missed an upgrade webhook were reconciled DOWN to hobby. Every
+// yearly plan id MUST use `_ANNUAL` to match api/internal/config/config.go.
+func TestBillingReconcilerPlanEnvNamesMatchAPI(t *testing.T) {
+	// expected is the exact set the api's config.go reads (2026-05-15+).
+	expected := map[string]bool{
+		"RAZORPAY_PLAN_ID_HOBBY":             true,
+		"RAZORPAY_PLAN_ID_HOBBY_ANNUAL":      true,
+		"RAZORPAY_PLAN_ID_HOBBY_PLUS":        true,
+		"RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL": true,
+		"RAZORPAY_PLAN_ID_PRO":               true,
+		"RAZORPAY_PLAN_ID_PRO_ANNUAL":        true,
+		"RAZORPAY_PLAN_ID_TEAM":              true,
+		"RAZORPAY_PLAN_ID_TEAM_ANNUAL":       true,
+	}
+	got := jobs.BillingReconcilerPlanEnvKeys()
+	if len(got) != len(expected) {
+		t.Fatalf("plan env key count: got %d, want %d (%v)", len(got), len(expected), got)
+	}
+	for _, k := range got {
+		if !expected[k] {
+			t.Errorf("unexpected plan env key %q — must match api/internal/config/config.go (use the `_ANNUAL` suffix for yearly plans)", k)
+		}
+	}
+}
+
 func TestBillingReconcilerPlanIDToTier_EmptyFallsBackToHobby(t *testing.T) {
 	if got := jobs.BillingReconcilerPlanIDToTier(""); got != "hobby" {
 		t.Errorf("empty planID: got %q, want %q", got, "hobby")
@@ -143,10 +174,10 @@ func TestBillingReconcilerPlanIDToTier_EmptyFallsBackToHobby(t *testing.T) {
 func TestBillingReconcilerPlanIDToTier_UnknownFallsBackToHobby(t *testing.T) {
 	// Clear all plan id env vars to guarantee "unknown".
 	for _, key := range []string{
-		"RAZORPAY_PLAN_ID_HOBBY", "RAZORPAY_PLAN_ID_HOBBY_YEARLY",
+		"RAZORPAY_PLAN_ID_HOBBY", "RAZORPAY_PLAN_ID_HOBBY_ANNUAL",
 		"RAZORPAY_PLAN_ID_HOBBY_PLUS", "RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL",
-		"RAZORPAY_PLAN_ID_PRO", "RAZORPAY_PLAN_ID_PRO_YEARLY",
-		"RAZORPAY_PLAN_ID_TEAM", "RAZORPAY_PLAN_ID_TEAM_YEARLY",
+		"RAZORPAY_PLAN_ID_PRO", "RAZORPAY_PLAN_ID_PRO_ANNUAL",
+		"RAZORPAY_PLAN_ID_TEAM", "RAZORPAY_PLAN_ID_TEAM_ANNUAL",
 	} {
 		t.Setenv(key, "") // t.Setenv restores on cleanup
 		os.Unsetenv(key)

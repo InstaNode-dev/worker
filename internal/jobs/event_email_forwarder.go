@@ -36,6 +36,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -81,13 +82,13 @@ const eventEmailIdempotencyPrefix = "audit-"
 // internal/models.email_events.go so the worker doesn't import the api
 // module. Keep these values in sync across the two repos.
 //
-//   eventEmailSuppressionBounceDecay: how long a hard bounce / spam
-//   complaint stays in the suppression set. After this window the
-//   forwarder will attempt sends to the address again — bounces decay
-//   because a previously-bouncing inbox may have been fixed.
+//	eventEmailSuppressionBounceDecay: how long a hard bounce / spam
+//	complaint stays in the suppression set. After this window the
+//	forwarder will attempt sends to the address again — bounces decay
+//	because a previously-bouncing inbox may have been fixed.
 //
-//   Unsubscribes intentionally do NOT decay — see
-//   suppressionUnsubscribeDecaysNever for the rationale.
+//	Unsubscribes intentionally do NOT decay — see
+//	suppressionUnsubscribeDecaysNever for the rationale.
 const eventEmailSuppressionBounceDecay = 365 * 24 * time.Hour
 
 // suppressionEventTypesDecaying is the set of event_type values that obey
@@ -100,17 +101,33 @@ var suppressionEventTypesDecaying = []string{"bounce", "spam_complaint"}
 // can't silently keep nudging an unsubscribed user.
 const suppressionEventTypeUnsubscribe = "unsubscribe"
 
+// errUnsubscribeLookupFailed is returned by hasSuppression when the
+// DB error occurred specifically in the UNSUBSCRIBE lookup (path 1).
+//
+// The fail posture is split by event class:
+//
+//   - Bounce / spam_complaint lookup failure → fail-OPEN. A duplicate
+//     send to a bouncing inbox during a DB blip only costs sender
+//     reputation; pinning the queue is worse.
+//   - Unsubscribe lookup failure → fail-CLOSED. Emailing a user who
+//     unsubscribed during a DB brownout is a CAN-SPAM / GDPR compliance
+//     violation, not a reputation cost. We skip the send and DO NOT
+//     advance the cursor, so the row is retried once the DB recovers.
+//
+// Work() distinguishes the two by checking errors.Is(err,
+// errUnsubscribeLookupFailed).
+var errUnsubscribeLookupFailed = errors.New("event_email_forwarder: unsubscribe suppression lookup failed (fail-closed)")
+
 // suppressionChecker is the seam the forwarder uses to ask "should I
 // skip this recipient?". Production wires a real Postgres-backed
 // implementation (sqlSuppressionChecker below); tests supply an
 // in-memory map so the forwarder spec stays hermetic.
 //
-// Returns (true, nil) when the recipient has a suppression row, (false,
-// nil) when they don't, and (false, err) on a DB error. The forwarder
-// fail-OPENS on errors (treats them as "not suppressed") so a Redis or
-// Postgres blip doesn't stall the queue. The downside — sending a
-// duplicate to a bouncing inbox during a DB outage — is preferable to
-// the alternative — pinning the queue behind a transient failure.
+// Returns (true, nil) when the recipient has a suppression row and
+// (false, nil) when they don't. On a DB error the error is wrapped:
+// an unsubscribe-lookup failure wraps errUnsubscribeLookupFailed (Work
+// fails CLOSED — skips without advancing the cursor); a bounce/spam
+// lookup failure is a plain error (Work fails OPEN — sends anyway).
 type suppressionChecker interface {
 	hasSuppression(ctx context.Context, emailAddr string) (bool, error)
 }
@@ -131,6 +148,10 @@ func (s *sqlSuppressionChecker) hasSuppression(ctx context.Context, emailAddr st
 
 	// Path 1: unsubscribes. No decay window — once a user unsubscribes
 	// we stay unsubscribed until they re-opt-in.
+	//
+	// A DB error here wraps errUnsubscribeLookupFailed so Work() can
+	// fail CLOSED — emailing an unsubscribed user during a DB brownout
+	// is a CAN-SPAM / GDPR violation, not a recoverable reputation cost.
 	var found int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT 1
@@ -142,7 +163,7 @@ func (s *sqlSuppressionChecker) hasSuppression(ctx context.Context, emailAddr st
 		return true, nil
 	}
 	if err != sql.ErrNoRows {
-		return false, fmt.Errorf("hasSuppression unsubscribe: %w", err)
+		return false, fmt.Errorf("hasSuppression unsubscribe: %w: %v", errUnsubscribeLookupFailed, err)
 	}
 
 	// Path 2: bounces + spam complaints with the 365d decay window.
@@ -353,15 +374,39 @@ batchLoop:
 		// Suppression check — before any send, verify the recipient hasn't
 		// already told us "stop". Bounces decay after 365d (the inbox may
 		// have been fixed), unsubscribes never decay. See
-		// sqlSuppressionChecker for the query shape; on DB errors the
-		// checker fails-OPEN so we don't pin the queue.
+		// sqlSuppressionChecker for the query shape.
+		//
+		// SPLIT FAIL POSTURE:
+		//   - Unsubscribe lookup failure (errUnsubscribeLookupFailed) →
+		//     fail-CLOSED. Skip the send and DO NOT advance the cursor, so
+		//     the row is retried next tick once the DB recovers. Emailing
+		//     an unsubscribed user during a DB brownout is a CAN-SPAM /
+		//     GDPR compliance violation.
+		//   - Bounce / spam_complaint lookup failure → fail-OPEN. A
+		//     duplicate to a bouncing inbox only costs sender reputation;
+		//     pinning the queue is worse.
 		suppressed, supErr := w.suppression.hasSuppression(ctx, row.OwnerEmail)
+		if supErr != nil && errors.Is(supErr, errUnsubscribeLookupFailed) {
+			// Fail-CLOSED: can't prove the recipient is NOT unsubscribed.
+			// Skip without advancing the cursor — the row retries when the
+			// DB recovers. This intentionally halts forward progress on
+			// this row rather than risk an illegal send.
+			slog.Warn("jobs.event_email_forwarder.unsubscribe_check_failed_failclosed",
+				"audit_id", row.ID,
+				"kind", row.Kind,
+				"error", supErr,
+				"note", "fail-closed: skipping send, cursor NOT advanced — retries when DB recovers",
+			)
+			skipped++
+			continue
+		}
 		if supErr != nil {
-			// Log + treat as "not suppressed" — see fail-open rationale.
+			// Bounce/spam lookup failure — fail-OPEN: treat as "not
+			// suppressed" so a transient DB blip doesn't pin the queue.
 			slog.Warn("jobs.event_email_forwarder.suppression_check_failed",
 				"audit_id", row.ID,
 				"error", supErr,
-				"note", "fail-open: continuing as if recipient is sendable",
+				"note", "fail-open: bounce/spam lookup error — continuing as if recipient is sendable",
 			)
 		}
 		if suppressed {
