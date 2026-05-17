@@ -36,3 +36,37 @@ func TestReconcileInsertOpts_BindsToReconcileQueue(t *testing.T) {
 		t.Errorf("reconcileInsertOpts().Queue resolved to %q; the dedicated queue config in workers.go is keyed by the literal \"reconcile\", so the helper must produce that string verbatim.", opts.Queue)
 	}
 }
+
+// TestQueueBillingConst guards the dedicated billing queue name (P1-L).
+//
+// Background: the billing reconciler sweep runs ~17 min (≈100 teams × 2
+// Razorpay calls × 100ms stagger). It used to run on queueReconcile, where
+// it occupied both worker slots for the whole sweep and starved the fast
+// reconcilers (deploy-status every 30s, custom-domain every 5min). The fix
+// gave it its own queue. A typo here would silently route the billing sweep
+// back onto a shared queue and reintroduce the starvation.
+func TestQueueBillingConst(t *testing.T) {
+	if queueBilling != "billing" {
+		t.Errorf("queueBilling = %q; want %q. The QueueConfig entry in workers.go is keyed by this literal; renaming without updating it strands the billing reconciler.", queueBilling, "billing")
+	}
+	if queueBilling == queueReconcile {
+		t.Fatalf("queueBilling (%q) must NOT equal queueReconcile (%q) — the whole point of P1-L is that the long billing sweep runs on an ISOLATED queue so it cannot starve the fast reconcilers.", queueBilling, queueReconcile)
+	}
+}
+
+// TestBillingInsertOpts_BindsToBillingQueue verifies the billing-reconciler
+// periodic-job closure routes to the dedicated billing queue, not the
+// reconcile queue (P1-L). If billingInsertOpts ever drifts back to
+// queueReconcile, the ~17-min billing sweep starves deploy-status again.
+func TestBillingInsertOpts_BindsToBillingQueue(t *testing.T) {
+	opts := billingInsertOpts()
+	if opts == nil {
+		t.Fatal("billingInsertOpts() returned nil — the billing sweep would default to QueueDefault")
+	}
+	if opts.Queue != queueBilling {
+		t.Errorf("billingInsertOpts().Queue = %q; want %q (the dedicated billing queue).", opts.Queue, queueBilling)
+	}
+	if opts.Queue == queueReconcile {
+		t.Errorf("billingInsertOpts().Queue = %q — that is the FAST-reconciler queue. The billing sweep must be isolated from it (P1-L), otherwise the ~17-min sweep starves deploy-status/custom-domain reconcilers.", opts.Queue)
+	}
+}

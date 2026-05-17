@@ -29,11 +29,30 @@ import (
 // worker slot.
 const queueReconcile = "reconcile"
 
-// reconcileInsertOpts is the InsertOpts every reconciler periodic-job builder
-// must return. Extracted so a test can exercise the exact production value
-// (asserting the closures embed the right Queue) without scraping source code.
+// queueBilling is the dedicated queue for the billing reconciler (P1-L).
+//
+// The billing reconciler is itself a "reconciler" but it is NOT fast: a full
+// sweep staggers ~100 teams × 2 Razorpay calls × 100ms ≈ 17 minutes, during
+// which it occupied both queueReconcile worker slots. That starved the fast
+// reconcilers (deploy-status every 30s, custom-domain every 5min) — deploy
+// status stayed "building" for the whole billing sweep. Putting the billing
+// sweep on its own single-worker queue keeps it fully isolated: it can run
+// as long as it likes without ever touching queueReconcile's capacity.
+const queueBilling = "billing"
+
+// reconcileInsertOpts is the InsertOpts the fast-reconciler periodic-job
+// builders must return. Extracted so a test can exercise the exact
+// production value (asserting the closures embed the right Queue) without
+// scraping source code.
 func reconcileInsertOpts() *river.InsertOpts {
 	return &river.InsertOpts{Queue: queueReconcile}
+}
+
+// billingInsertOpts is the InsertOpts the billing-reconciler periodic-job
+// builder must return — routes the long billing sweep to queueBilling so it
+// cannot starve the fast reconcilers on queueReconcile (P1-L).
+func billingInsertOpts() *river.InsertOpts {
+	return &river.InsertOpts{Queue: queueBilling}
 }
 
 // Workers wraps a running River client.
@@ -888,14 +907,15 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		// Billing reconciler (P1 Wave-3 Cluster-B Slice 4) — every 15 min
 		// (override via BILLING_RECONCILE_INTERVAL). RunOnStart=true so a
 		// worker restart immediately sweeps for any gaps that opened during
-		// the downtime. Routed to the reconcile queue so a default-queue
-		// fan-out (weekly_digest) cannot starve the billing safety net.
+		// the downtime. Routed to the DEDICATED billing queue (P1-L): the
+		// sweep takes ~17 min and previously occupied both queueReconcile
+		// slots, starving the fast reconcilers (deploy-status, custom-domain).
 		//
 		// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.
 		river.NewPeriodicJob(
 			river.PeriodicInterval(BillingReconcileInterval()),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return BillingReconcilerArgs{}, reconcileInsertOpts()
+				return BillingReconcilerArgs{}, billingInsertOpts()
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
@@ -912,6 +932,12 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			// custom-domain every 5min). 2 workers is enough because each
 			// invocation does one batched DB query + per-row k8s GETs.
 			queueReconcile: {MaxWorkers: 2},
+			// Dedicated to the billing reconciler (P1-L). The billing sweep
+			// runs ~17 min; isolating it on its own queue means it can never
+			// occupy a queueReconcile slot and starve the fast reconcilers.
+			// 1 worker is enough — the sweep is a single periodic job and
+			// must not run concurrently with itself.
+			queueBilling: {MaxWorkers: 1},
 		},
 		Workers:      workers,
 		PeriodicJobs: periodicJobs,
@@ -932,7 +958,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	}
 
 	slog.Info("jobs.workers.started",
-		"queues", fmt.Sprintf("%v", []string{river.QueueDefault, queueReconcile}),
+		"queues", fmt.Sprintf("%v", []string{river.QueueDefault, queueReconcile, queueBilling}),
 		"max_workers", 5,
 	)
 
