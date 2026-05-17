@@ -132,11 +132,13 @@ func main() {
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 	srv := &http.Server{Addr: ":8091", Handler: mux}
-	go func() {
+	// Routed through jobs.SafeGo so a panic in the liveness server (or its
+	// handlers) is recovered + counted instead of crashing the worker.
+	jobs.SafeGo("main.liveness_server", func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("worker.liveness_server_failed", "error", err)
 		}
-	}()
+	})
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

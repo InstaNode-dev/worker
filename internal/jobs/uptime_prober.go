@@ -179,6 +179,16 @@ func (w *UptimeProberWorker) Work(ctx context.Context, _ *river.Job[UptimeProber
 	for _, fn := range probes {
 		fn := fn
 		go func() {
+			// Panic boundary (P1-B): a panic in a probe would otherwise
+			// crash the worker pod AND leave the collector below blocked
+			// waiting on resCh. On panic emit a sentinel unhealthy result
+			// so every collector iteration still receives a value.
+			defer func() {
+				if r := recover(); r != nil {
+					resCh <- result{slug: "", healthy: false, latencyMs: nil}
+					LogRecoveredPanic("uptime_prober.probe", r)
+				}
+			}()
 			resCh <- fn(ctx)
 		}()
 	}

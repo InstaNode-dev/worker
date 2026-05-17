@@ -188,7 +188,9 @@ func emitDeployExpiredAudit(db *sql.DB, r deployExpirerRow) {
 		"expires_at": r.expiresAt.UTC().Format(time.RFC3339),
 		"ttl_policy": r.ttlPolicy,
 	})
-	go func() {
+	// Fire-and-forget audit emit — routed through SafeGo (P1-B) so a panic
+	// in the INSERT path is recovered + counted instead of crashing the pod.
+	SafeGo("deployment_expirer.audit", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		teamUUID, parseErr := uuid.Parse(r.teamID)
@@ -205,5 +207,5 @@ func emitDeployExpiredAudit(db *sql.DB, r deployExpirerRow) {
 			slog.Warn("jobs.deployment_expirer.audit.insert_failed",
 				"deploy_id", r.id, "error", err)
 		}
-	}()
+	})
 }
