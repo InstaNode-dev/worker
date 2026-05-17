@@ -59,9 +59,10 @@ func (s *stubFetcher) FetchSubscriptionForReconciler(_ context.Context, _ string
 
 // stubGrace implements gracePeriodOpener for tests.
 type stubGrace struct {
-	hasActive bool
-	openCalls int
-	openErr   error
+	hasActive     bool
+	hasTerminated bool // P1-F(b): a prior grace period reached a terminal status
+	openCalls     int
+	openErr       error
 }
 
 func (g *stubGrace) GetActiveGracePeriod(_ context.Context, _ uuid.UUID) (bool, error) {
@@ -71,6 +72,10 @@ func (g *stubGrace) GetActiveGracePeriod(_ context.Context, _ uuid.UUID) (bool, 
 func (g *stubGrace) OpenGracePeriod(_ context.Context, _ uuid.UUID, _ string) error {
 	g.openCalls++
 	return g.openErr
+}
+
+func (g *stubGrace) HasTerminatedGracePeriod(_ context.Context, _ uuid.UUID, _ string) (bool, error) {
+	return g.hasTerminated, nil
 }
 
 // teamRowCols are the columns the billing reconciler SELECT returns.
@@ -191,14 +196,44 @@ func TestBillingReconcilerPlanIDToTier_UnknownFallsBackToHobby(t *testing.T) {
 
 // ── §3: tierRank ordering ─────────────────────────────────────────────────────
 
+// canonicalTierOrder is the single source of truth for tier ranking, taken
+// verbatim from api/plans.yaml. The worker cannot import the api module, so
+// its billingTierRankMap is a hand-maintained mirror — this slice is the
+// contract the mirror must satisfy. P1-F(a): the bug-hunt flagged a
+// growth/pro inversion between api and worker; this test pins the worker's
+// table to the canonical order so any future drift fails here.
+var canonicalTierOrder = []string{
+	"anonymous", "free", "hobby", "hobby_plus", "pro", "growth", "team",
+}
+
+// TestBillingTierRank_Ordering verifies every adjacent pair in the canonical
+// order is strictly increasing in the worker's rank table — in particular
+// that pro < growth (NOT the inverted growth < pro the bug-hunt found on the
+// api side).
 func TestBillingTierRank_Ordering(t *testing.T) {
-	tiers := []string{"anonymous", "free", "hobby", "hobby_plus", "pro", "growth", "team"}
-	for i := 1; i < len(tiers); i++ {
-		lo, hi := tiers[i-1], tiers[i]
+	for i := 1; i < len(canonicalTierOrder); i++ {
+		lo, hi := canonicalTierOrder[i-1], canonicalTierOrder[i]
 		if jobs.BillingTierRank(lo) >= jobs.BillingTierRank(hi) {
-			t.Errorf("tierRank(%q) = %d should be < tierRank(%q) = %d",
+			t.Errorf("tierRank(%q) = %d should be < tierRank(%q) = %d — "+
+				"the worker rank table must follow the canonical plans.yaml order",
 				lo, jobs.BillingTierRank(lo), hi, jobs.BillingTierRank(hi))
 		}
+	}
+}
+
+// TestBillingTierRank_ProBelowGrowth is the targeted P1-F(a) regression
+// guard: it asserts the exact pair the bug-hunt found inverted. growth is a
+// strictly higher tier than pro ($99 vs $49); if the worker rank table ever
+// flips them, a real growth→? reconcile would mis-classify an upgrade as a
+// no-op (or vice versa).
+func TestBillingTierRank_ProBelowGrowth(t *testing.T) {
+	if jobs.BillingTierRank("pro") >= jobs.BillingTierRank("growth") {
+		t.Fatalf("tierRank(pro)=%d must be < tierRank(growth)=%d — growth is the higher-priced, higher tier (P1-F(a)).",
+			jobs.BillingTierRank("pro"), jobs.BillingTierRank("growth"))
+	}
+	if jobs.BillingTierRank("hobby") >= jobs.BillingTierRank("hobby_plus") {
+		t.Fatalf("tierRank(hobby)=%d must be < tierRank(hobby_plus)=%d.",
+			jobs.BillingTierRank("hobby"), jobs.BillingTierRank("hobby_plus"))
 	}
 }
 
@@ -352,6 +387,85 @@ func TestBillingReconciler_HaltedSubscription_ActiveGrace_NoOp(t *testing.T) {
 	}
 	if grace.openCalls != 0 {
 		t.Errorf("grace.OpenGracePeriod called %d times, want 0 (already active)", grace.openCalls)
+	}
+}
+
+// ── §7b: P1-F(b) — no grace re-open after terminal grace ─────────────────────
+
+// TestBillingReconciler_HaltedSubscription_TerminatedGrace_NoReopen is the
+// P1-F(b) regression guard. After a grace period expires the team is
+// terminated, but Razorpay keeps reporting halted/paused for a while. The
+// reconciler must NOT open a FRESH grace period in that window — doing so
+// restarts the 7-day dunning-email cycle indefinitely. With a terminal
+// grace period on record, OpenGracePeriod must NOT be called.
+func TestBillingReconciler_HaltedSubscription_TerminatedGrace_NoReopen(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	subID := "sub_test_terminated_grace"
+
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols).
+			AddRow(teamID, subID, "hobby")) // already downgraded post-termination
+
+	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
+		Status: "halted", PlanID: "", PaidCount: 1,
+	}}
+	// No ACTIVE grace, but a prior grace period already reached a terminal
+	// status — the team has been through grace and was terminated.
+	grace := &stubGrace{hasActive: false, hasTerminated: true}
+
+	w := jobs.NewBillingReconcilerWorker(db, fetcher, grace)
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if grace.openCalls != 0 {
+		t.Errorf("grace.OpenGracePeriod called %d times, want 0 — the team already "+
+			"went through a terminated grace period; re-opening grace restarts the "+
+			"dunning-email cycle (P1-F(b)).", grace.openCalls)
+	}
+}
+
+// TestBillingReconciler_HaltedSubscription_NoTerminalGrace_StillOpens proves
+// the P1-F(b) guard is narrow: a halted team with NO prior grace at all
+// (neither active nor terminated) still gets a grace period opened — the
+// safety net for a genuinely missed charged_failed webhook is intact.
+func TestBillingReconciler_HaltedSubscription_NoTerminalGrace_StillOpens(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	subID := "sub_test_first_grace"
+
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols).
+			AddRow(teamID, subID, "pro"))
+
+	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
+		Status: "halted", PlanID: "", PaidCount: 2,
+	}}
+	grace := &stubGrace{hasActive: false, hasTerminated: false}
+
+	w := jobs.NewBillingReconcilerWorker(db, fetcher, grace)
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if grace.openCalls != 1 {
+		t.Errorf("grace.OpenGracePeriod called %d times, want 1 — a first-time "+
+			"halted team with no prior grace must still get a grace period.", grace.openCalls)
 	}
 }
 
