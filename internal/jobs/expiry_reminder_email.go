@@ -136,6 +136,19 @@ Details: {{ .ResourceURL }}
 You'll get at most 3 reminders per resource. After expiry it deletes automatically.
 `))
 
+// hourWord returns the correctly-pluralised noun for the "N hour(s)"
+// copy used in the renderAnonExpiryEmail fallback bodies. The primary
+// html/text templates use `{{ if .Plural }}s{{ end }}` inline; the
+// Sprintf fallback paths must match that, otherwise a 1-hour reminder
+// degrades to the grammatically-wrong "1 hours" (BugBash 2026-05-18 P3,
+// "anonExpiry plurality"). Plural is true unless HoursRemaining == "1".
+func hourWord(plural bool) string {
+	if plural {
+		return "hours"
+	}
+	return "hour"
+}
+
 // anonExpiryView is the (small) shape passed to both templates. Flat
 // struct (not the params map) so the template can use direct field
 // references and the compiler catches typos.
@@ -184,8 +197,8 @@ func renderAnonExpiryEmail(params map[string]string) (subject, html, text string
 		// forwarder logs every send.
 		htmlBuf.Reset()
 		htmlBuf.WriteString(fmt.Sprintf(
-			"<p>Your instanode %s resource expires in %s hours. Visit %s to keep it.</p>",
-			view.ResourceType, view.HoursRemaining, view.UpgradeURL,
+			"<p>Your instanode %s resource expires in %s %s. Visit %s to keep it.</p>",
+			view.ResourceType, view.HoursRemaining, hourWord(view.Plural), view.UpgradeURL,
 		))
 	}
 	html = htmlBuf.String()
@@ -194,8 +207,8 @@ func renderAnonExpiryEmail(params map[string]string) (subject, html, text string
 	if err := anonExpiryTextTmpl.Execute(&textBuf, view); err != nil {
 		textBuf.Reset()
 		textBuf.WriteString(fmt.Sprintf(
-			"Your instanode %s resource expires in %s hours. Visit %s to keep it.\n",
-			view.ResourceType, view.HoursRemaining, view.UpgradeURL,
+			"Your instanode %s resource expires in %s %s. Visit %s to keep it.\n",
+			view.ResourceType, view.HoursRemaining, hourWord(view.Plural), view.UpgradeURL,
 		))
 	}
 	text = textBuf.String()

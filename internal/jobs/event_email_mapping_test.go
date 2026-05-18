@@ -326,10 +326,15 @@ func TestEventEmail_FixIJKindsRegistered(t *testing.T) {
 
 // TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields verifies
 // the audit metadata flows the fields the Brevo email template's
-// substitution variables expect: deploy_name (app_id), deploy_url,
-// make_permanent_url, hours_remaining, reminder_index. A missing
-// deploy_url renders an empty link in the email body — broken UX even
-// though the send technically succeeded.
+// substitution variables expect: deploy_url, make_permanent_url,
+// hours_remaining, reminder_index. A missing deploy_url renders an empty
+// link in the email body — broken UX even though the send technically
+// succeeded.
+//
+// BugBash 2026-05-18 W3 T3: the builder deliberately does NOT map app_id
+// into deploy_name — app_id is an opaque hex slug, not a human-readable
+// name, and the deployments table has no name column. deploy_name must
+// stay unset so the renderer falls back to "your deployment".
 func TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields(t *testing.T) {
 	row := auditRow{
 		ID:         "x",
@@ -338,8 +343,8 @@ func TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields(t *testing.
 		OwnerEmail: "u@example.com",
 		Metadata: []byte(`{
 			"deploy_id":"deploy-1",
-			"app_id":"myapp",
-			"deploy_url":"https://myapp.deployment.instanode.dev",
+			"app_id":"6fffcc21",
+			"deploy_url":"https://6fffcc21.deployment.instanode.dev",
 			"make_permanent_url":"https://api.instanode.dev/api/v1/deployments/deploy-1/make-permanent",
 			"hours_remaining":4,
 			"expires_at":"2026-05-14T12:00:00Z",
@@ -350,10 +355,13 @@ func TestEventEmail_BuildDeployExpiringSoonHasAllEmailTemplateFields(t *testing.
 	if !ok {
 		t.Fatal("builder returned ok=false unexpectedly")
 	}
-	if params["deploy_name"] != "myapp" {
-		t.Errorf("deploy_name = %q; want myapp (template body references {{ params.deploy_name }})", params["deploy_name"])
+	// deploy_name MUST NOT be populated from the app_id slug — see the
+	// deploy_name NOTE in event_email_mapping.go. An "6fffcc21" deploy_name
+	// would render "Your deployment 6fffcc21 expires..." to the customer.
+	if _, present := params["deploy_name"]; present {
+		t.Errorf("deploy_name = %q; want UNSET — the app_id slug is not a human-readable name, the renderer must fall back to \"your deployment\"", params["deploy_name"])
 	}
-	if params["deploy_url"] != "https://myapp.deployment.instanode.dev" {
+	if params["deploy_url"] != "https://6fffcc21.deployment.instanode.dev" {
 		t.Errorf("deploy_url = %q; want full https URL", params["deploy_url"])
 	}
 	if params["make_permanent_url"] != "https://api.instanode.dev/api/v1/deployments/deploy-1/make-permanent" {

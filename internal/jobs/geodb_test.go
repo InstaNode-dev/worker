@@ -125,36 +125,61 @@ func TestExtractGeoLite2MMDB_NotGzip(t *testing.T) {
 
 // ── P1-D: GeoLite2 refresh freshness gate ─────────────────────────────────────
 
-// TestGeoDBIsFresh_RecentFileIsFresh proves a file modified within
-// GeoLite2MaxAge is reported fresh — so Work() skips the MaxMind download on
-// a routine worker restart instead of refetching every time.
-func TestGeoDBIsFresh_RecentFileIsFresh(t *testing.T) {
+// TestGeoDBIsFresh_RecentMarkerIsFresh proves that when a fetch marker
+// written within GeoLite2MaxAge sits beside the .mmdb, the DB is reported
+// fresh — so Work() skips the MaxMind download on a routine worker restart
+// instead of refetching every time.
+//
+// BugBash 2026-05-18 P3: freshness is now keyed on the worker-written fetch
+// marker, not the .mmdb file's own mtime.
+func TestGeoDBIsFresh_RecentMarkerIsFresh(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
 	if err := os.WriteFile(path, []byte("mmdb"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	if !jobs.GeoDBIsFresh(path, now) {
-		t.Error("a just-written file must be reported fresh; otherwise every worker restart refetches from MaxMind")
+	if err := os.WriteFile(path+".fetched", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !jobs.GeoDBIsFresh(path, time.Now()) {
+		t.Error("a .mmdb with a just-written fetch marker must be reported fresh; otherwise every worker restart refetches from MaxMind")
 	}
 }
 
-// TestGeoDBIsFresh_StaleFileIsNotFresh proves a file older than
-// GeoLite2MaxAge is reported NOT fresh — so Work() proceeds with the refresh.
-// This is the core P1-D guarantee: the geo DB does NOT stay the stale
-// baked-in copy forever.
-func TestGeoDBIsFresh_StaleFileIsNotFresh(t *testing.T) {
+// TestGeoDBIsFresh_BakedInDBWithoutMarkerIsNotFresh is the core BugBash
+// 2026-05-18 P3 guarantee: a recently-modified .mmdb with NO fetch marker
+// (the copy baked into the worker image — its mtime is the image build
+// time, not the MaxMind publish time) is reported NOT fresh, so the first
+// run after a deploy actually refetches.
+func TestGeoDBIsFresh_BakedInDBWithoutMarkerIsNotFresh(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
 	if err := os.WriteFile(path, []byte("mmdb"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Backdate the mtime well past the freshness window.
+	// No marker file — this is exactly the baked-in-image state.
+	if jobs.GeoDBIsFresh(path, time.Now()) {
+		t.Error("a recently-written .mmdb with NO fetch marker is the baked-in image copy; it must NOT be reported fresh — the first refresh after deploy must run")
+	}
+}
+
+// TestGeoDBIsFresh_StaleMarkerIsNotFresh proves a fetch marker older than
+// GeoLite2MaxAge is reported NOT fresh — so Work() proceeds with the
+// refresh. The geo DB does NOT stay stale forever on a long-lived worker.
+func TestGeoDBIsFresh_StaleMarkerIsNotFresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
+	if err := os.WriteFile(path, []byte("mmdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := path + ".fetched"
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate the marker mtime well past the freshness window.
 	old := time.Now().Add(-2 * jobs.GeoLite2MaxAge)
-	if err := os.Chtimes(path, old, old); err != nil {
+	if err := os.Chtimes(marker, old, old); err != nil {
 		t.Fatal(err)
 	}
 	if jobs.GeoDBIsFresh(path, time.Now()) {
-		t.Errorf("a file older than GeoLite2MaxAge (%s) must NOT be fresh — Work() must refresh it", jobs.GeoLite2MaxAge)
+		t.Errorf("a fetch marker older than GeoLite2MaxAge (%s) must NOT be fresh — Work() must refresh it", jobs.GeoLite2MaxAge)
 	}
 }
 
