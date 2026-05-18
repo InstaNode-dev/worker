@@ -162,6 +162,51 @@ func TestExpireAnonymousWorker_ExpiresPausedAndSuspended(t *testing.T) {
 	}
 }
 
+// TestExpireAnonymousWorker_SelectsFreeTierResources is the regression guard
+// for P1-W3-06: a tier='free' claimed-but-unpaid resource has a non-null
+// team_id and a 24h expires_at. The old SELECT predicate (team_id IS NULL
+// only) excluded every free row, so claimed-but-unpaid infra leaked
+// continuously — the customer DB / Redis ACL user / Mongo user was never
+// dropped and the row never reached 'deleted'.
+//
+// This test asserts the SELECT predicate now matches the
+// (team_id IS NULL AND tier='anonymous') OR tier='free' shape, and that a
+// free-tier expired row is carried all the way through: the mark-deleted
+// UPDATE fires for it. The free path is identical to the anonymous one —
+// teardown is keyed on resource_type + token + provider_resource_id.
+func TestExpireAnonymousWorker_SelectsFreeTierResources(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// The SELECT must reach both the anonymous and the free tier classes.
+	// A regex on the exact predicate fails loudly if a future edit narrows
+	// it back to team_id IS NULL only.
+	mock.ExpectQuery(`\(\(team_id IS NULL AND tier = 'anonymous'\) OR tier = 'free'\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
+			AddRow("id-free", "tok-free", "postgres", "db_tok_free").
+			AddRow("id-anon", "tok-anon", "redis", "usr_tok_anon"))
+
+	// Both rows (the free one and the anonymous one) must transition to
+	// 'deleted' — proving the free row is not dropped mid-pipeline.
+	for i := 0; i < 2; i++ {
+		mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+	}
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // TestExpireAnonymousWorker_StorageExpiry_DeletesObjects proves a storage
 // resource's objects are actually deleted on expiry via the wired
 // S3-compatible object deleter — regression for the bug where the storage

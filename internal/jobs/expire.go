@@ -77,16 +77,35 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 
 	start := time.Now()
 
-	// Step 1: Find all anonymous resources that have passed their TTL.
-	// TTL must win over lifecycle state: a paused/suspended anonymous resource
-	// whose 24h TTL has elapsed is still an expired resource. Filtering on
-	// status='active' alone leaks paused/suspended rows past their TTL — the
-	// physical DB/ACL/Mongo user is never dropped and the row never reaches
-	// 'deleted'. Expire any non-terminal status past TTL.
+	// Step 1: Find all expired anonymous AND free-tier resources past their TTL.
+	//
+	// TTL must win over lifecycle state: a paused/suspended resource whose 24h
+	// TTL has elapsed is still an expired resource. Filtering on status='active'
+	// alone leaks paused/suspended rows past their TTL — the physical
+	// DB/ACL/Mongo user is never dropped and the row never reaches 'deleted'.
+	// Expire any non-terminal status past TTL.
+	//
+	// Two expiry classes share this reaper:
+	//   - tier='anonymous': never-claimed resources; team_id IS NULL.
+	//   - tier='free':      claimed-but-unpaid resources; they DO carry a
+	//     non-null team_id and a 24h expires_at. 'free' is the modal "claimed
+	//     but didn't pay" outcome. The old predicate (team_id IS NULL only)
+	//     excluded every free row, so claimed-but-unpaid infra leaked
+	//     continuously — the customer DB / Redis ACL user / Mongo user was
+	//     never dropped and the row never reached 'deleted'. The free path is
+	//     identical to the anonymous one below: deprovision is keyed purely on
+	//     resource_type + token + provider_resource_id (free rows have a real
+	//     provider_resource_id), so it resolves the right backing infra
+	//     regardless of whether team_id is set.
+	//
+	// NOTE: api-side models.ExpireAnonymousResources covers both tiers in SQL
+	// but has zero non-test callers (dead code) and only flips the DB row — it
+	// never calls the provisioner. It should be removed from the api repo
+	// (out of scope here); this worker is the sole live reaper.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id::text, token::text, resource_type, COALESCE(provider_resource_id, '')
 		FROM resources
-		WHERE team_id IS NULL
+		WHERE ((team_id IS NULL AND tier = 'anonymous') OR tier = 'free')
 		  AND status IN ('active', 'paused', 'suspended')
 		  AND expires_at IS NOT NULL
 		  AND expires_at < now()
@@ -146,6 +165,14 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 				deprovisionMinIOUser(ctx, w.minioClient, r.token, r.id, job.ID)
 			}
 		default:
+			// Physical teardown is keyed purely on resource_type + token +
+			// provider_resource_id — it makes no distinction between an
+			// 'anonymous' row (team_id IS NULL) and a claimed-but-unpaid
+			// 'free' row (team_id set). A free row carries a real
+			// provider_resource_id, so DeprovisionResource resolves the
+			// same backing infra (DROP DATABASE / DROP USER / etc.) and
+			// the credentials become invalid immediately, exactly as for
+			// the anonymous case.
 			if w.provisioner != nil {
 				resType := expireResourceTypeToProto(r.resourceType)
 				if resType != commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED {
