@@ -1,6 +1,9 @@
 package jobs
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestQueueReconcileConst guards the queue name so a typo in the
 // periodic-job closures doesn't silently route reconcilers back to the
@@ -25,7 +28,7 @@ func TestQueueReconcileConst(t *testing.T) {
 // literal was edited in isolation. With the helper, periodic-job builders
 // share a single call site that this test exercises directly.
 func TestReconcileInsertOpts_BindsToReconcileQueue(t *testing.T) {
-	opts := reconcileInsertOpts()
+	opts := reconcileInsertOpts(30 * time.Second)
 	if opts == nil {
 		t.Fatal("reconcileInsertOpts() returned nil — closures would default to QueueDefault, reintroducing starvation")
 	}
@@ -34,6 +37,11 @@ func TestReconcileInsertOpts_BindsToReconcileQueue(t *testing.T) {
 	}
 	if opts.Queue != "reconcile" {
 		t.Errorf("reconcileInsertOpts().Queue resolved to %q; the dedicated queue config in workers.go is keyed by the literal \"reconcile\", so the helper must produce that string verbatim.", opts.Queue)
+	}
+	// W1 (P1-W3-07): the helper must also carry the UniqueOpts guard so a
+	// replicas:2 cluster doesn't enqueue every reconcile tick twice.
+	if !opts.UniqueOpts.ByArgs || opts.UniqueOpts.ByPeriod != 30*time.Second {
+		t.Errorf("reconcileInsertOpts(30s).UniqueOpts = %+v; want ByArgs=true ByPeriod=30s — without it both worker pods enqueue the same sweep", opts.UniqueOpts)
 	}
 }
 
@@ -59,7 +67,7 @@ func TestQueueBillingConst(t *testing.T) {
 // reconcile queue (P1-L). If billingInsertOpts ever drifts back to
 // queueReconcile, the ~17-min billing sweep starves deploy-status again.
 func TestBillingInsertOpts_BindsToBillingQueue(t *testing.T) {
-	opts := billingInsertOpts()
+	opts := billingInsertOpts(15 * time.Minute)
 	if opts == nil {
 		t.Fatal("billingInsertOpts() returned nil — the billing sweep would default to QueueDefault")
 	}
@@ -68,5 +76,11 @@ func TestBillingInsertOpts_BindsToBillingQueue(t *testing.T) {
 	}
 	if opts.Queue == queueReconcile {
 		t.Errorf("billingInsertOpts().Queue = %q — that is the FAST-reconciler queue. The billing sweep must be isolated from it (P1-L), otherwise the ~17-min sweep starves deploy-status/custom-domain reconcilers.", opts.Queue)
+	}
+	// W1 (P1-W3-07): the billing sweep is the costliest periodic job to
+	// double-run (extra Razorpay API spend), so the UniqueOpts guard matters
+	// most here.
+	if !opts.UniqueOpts.ByArgs || opts.UniqueOpts.ByPeriod != 15*time.Minute {
+		t.Errorf("billingInsertOpts(15m).UniqueOpts = %+v; want ByArgs=true ByPeriod=15m", opts.UniqueOpts)
 	}
 }

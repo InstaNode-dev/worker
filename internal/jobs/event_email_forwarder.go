@@ -427,9 +427,16 @@ batchLoop:
 			continue
 		}
 
+		// W3 (P1-W3-10): the recipient is resolveRecipient(row), not
+		// row.OwnerEmail — anonymous teams have no users row, so OwnerEmail
+		// is empty for them and the address lives in metadata.email.
+		// fetchBatch already COALESCEs this at the SQL layer, so OwnerEmail
+		// is normally populated; resolveRecipient keeps the recipient
+		// correct even for a row that reached here without that COALESCE
+		// (and matches what requireEmail accepted in the builder).
 		evt := email.EventEmail{
 			Kind:           row.Kind,
-			Recipient:      row.OwnerEmail,
+			Recipient:      resolveRecipient(row),
 			RecipientName:  "", // we don't store a display name today
 			Params:         params,
 			IdempotencyKey: eventEmailIdempotencyPrefix + row.ID,
@@ -503,10 +510,24 @@ batchLoop:
 }
 
 // fetchBatch pulls the next eventEmailBatchLimit audit rows after the cursor
-// whose kind matches the supported set. Joins users(team_id) to resolve the
-// team's primary email for the EventEmail recipient. The LEFT JOIN means
-// rows without a registered email still surface — the builder returns
-// ok=false and the forwarder advances past them.
+// whose kind matches the supported set. Resolves the recipient email for the
+// EventEmail. The recipient is COALESCEd in priority order:
+//
+//	1. u.email          — the team's primary user row (is_primary = true).
+//	2. a.metadata->>'email' — W3 (P1-W3-10): anonymous teams have NO users
+//	   row, so the LEFT JOIN yields NULL. The producers of the highest-volume
+//	   free-funnel emails (anon.expiry_warning, digest.weekly, …) stash the
+//	   recipient address in the audit row's metadata. Without this fallback
+//	   every anonymous-tier email was structurally undeliverable — the
+//	   builder saw an empty OwnerEmail and the forwarder advanced past it.
+//	3. ''               — genuinely no recipient; the builder returns
+//	   ok=false and the forwarder advances past the row.
+//
+// W4 (P1-W3-11): the users join is filtered to is_primary = true (migration
+// 029 added the column for exactly this). The ORDER BY created_at ASC is
+// kept only as a legacy tiebreaker for rows predating the is_primary
+// backfill — without the is_primary filter a team with multiple users could
+// send the lifecycle email to whoever happened to sign up first.
 //
 // Cursor predicate: (created_at, id) > ($1, $2). On a fresh start (zero
 // cursor) we pass the time.Time zero value + empty string, which sorts
@@ -521,12 +542,13 @@ func (w *EventEmailForwarderWorker) fetchBatch(ctx context.Context, c eventCurso
 			a.summary,
 			a.metadata,
 			a.created_at,
-			COALESCE(u.email, '') AS owner_email
+			COALESCE(u.email, a.metadata->>'email', '') AS owner_email
 		FROM audit_log a
 		LEFT JOIN LATERAL (
 			SELECT email
 			FROM users
 			WHERE team_id = a.team_id
+			  AND is_primary = true
 			ORDER BY created_at ASC
 			LIMIT 1
 		) u ON true

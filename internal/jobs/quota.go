@@ -394,7 +394,7 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 			}
 		}
 
-		_, updateErr := w.db.ExecContext(ctx, `
+		suspendRes, updateErr := w.db.ExecContext(ctx, `
 			UPDATE resources SET status = $1
 			WHERE id = $2 AND status = $3
 		`, resourceStatusSuspended, id, resourceStatusActive)
@@ -402,6 +402,20 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 			slog.Error("jobs.enforce_storage_quota.suspend_failed",
 				"resource_id", id,
 				"error", updateErr,
+			)
+			continue
+		}
+		// W6 (P1-W3-08): the UPDATE is a CAS (status='active' → 'suspended').
+		// Under replicas:2 both pods' enforce_storage_quota ticks can race on
+		// the same over-quota row; only one wins the CAS. The loser matched
+		// 0 rows — emitting the audit row + appending to suspendedIDs anyway
+		// would produce a duplicate "your resource was suspended" audit_log
+		// row and a duplicate customer email. Skip the emit when this tick
+		// didn't actually flip the row.
+		if n, raErr := suspendRes.RowsAffected(); raErr == nil && n == 0 {
+			slog.Info("jobs.enforce_storage_quota.suspend_noop",
+				"resource_id", id,
+				"note", "row already suspended by a concurrent tick — skipping audit/email emit",
 			)
 			continue
 		}
