@@ -100,6 +100,34 @@ const (
 	// sub-second; 5s is generous.
 	k8sGetTimeout = 5 * time.Second
 
+	// maxAutopsiesPerTick caps how many failure-autopsy captures the
+	// reconciler runs in a single sweep (BugBash 2026-05-18 W3 T3:
+	// "autopsy synchronous in-sweep → tick overrun").
+	//
+	// captureDeploymentAutopsy runs synchronously and each one can do a
+	// pod-log-tail call with its own multi-second timeout. A cluster with
+	// a large batch of simultaneously-failed deployments would otherwise
+	// chain N × (log-tail timeout) of synchronous work into one tick and
+	// blow well past the 30s reconcile interval, starving the status
+	// transitions that share the same loop.
+	//
+	// The capture is idempotent (deployment_events ON CONFLICT DO UPDATE),
+	// so a failed deployment whose autopsy is deferred past the cap this
+	// tick is simply captured on the next tick — at worst a 30s delay on
+	// the "failure" object appearing in the api response. The status
+	// transition itself is NOT capped: every row still gets its status
+	// reconciled every tick; only the heavier autopsy side-effect is
+	// rate-limited.
+	maxAutopsiesPerTick = 8
+
+	// autopsyBudgetPerTick bounds the total wall-clock the autopsy
+	// captures may consume in one sweep. Once exceeded, remaining failed
+	// rows defer their autopsy to the next tick even if the per-tick
+	// count cap has not been hit — a belt-and-braces guard for the case
+	// where individual log-tail calls run long. Sized to leave headroom
+	// inside the 30s interval for the status-transition UPDATEs.
+	autopsyBudgetPerTick = 20 * time.Second
+
 	// Status strings — verbatim copies of the canonical set in
 	// api/internal/models/deployment.go and the k8s compute provider's
 	// deploymentStatus() helper. Duplicated here because the worker module
@@ -271,7 +299,15 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 		transitions int
 		errors      int
 		skipped     int
+		// autopsiesThisTick counts failure-autopsy captures performed in
+		// this sweep; deferred counts failed rows whose autopsy was
+		// skipped because a per-tick cap was reached (BugBash 2026-05-18
+		// W3 T3). A deferred autopsy is re-attempted on the next tick —
+		// the capture is idempotent so nothing is lost, only delayed.
+		autopsiesThisTick int
+		autopsiesDeferred int
 	)
+	autopsyDeadline := start.Add(autopsyBudgetPerTick)
 
 	for _, d := range deployments {
 		if d.providerID == "" {
@@ -316,12 +352,25 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 		// does not start polling the whole failed-row history.
 		//
 		// This runs synchronously in the sweep loop because the log-tail call
-		// has its own 10s timeout (k8sGetTimeout is reused per sub-call).
-		// The worst case is one 10s stall per failed pod, which is acceptable
-		// given the 30s reconcile interval and the small number of failed pods
-		// in a healthy cluster.
+		// has its own timeout. To keep a batch of simultaneously-failed
+		// deployments from chaining N synchronous log-tail calls into one
+		// tick and overrunning the 30s reconcile interval (BugBash
+		// 2026-05-18 W3 T3), the capture is bounded two ways per tick:
+		// a hard count cap (maxAutopsiesPerTick) and a wall-clock budget
+		// (autopsyBudgetPerTick). Once either is hit, remaining failed rows
+		// defer their autopsy to the next tick. The capture is idempotent
+		// (deployment_events ON CONFLICT DO UPDATE), so a deferred autopsy
+		// is simply re-attempted next sweep — at worst a one-interval delay
+		// on the "failure" object surfacing in the api response. The status
+		// transition below is NOT capped — every row still reconciles its
+		// status every tick.
 		if newStatus == deployStatusFailed {
-			captureDeploymentAutopsy(ctx, w.db, d.id, d.providerID, w.autopsyK8s)
+			if autopsiesThisTick >= maxAutopsiesPerTick || time.Now().After(autopsyDeadline) {
+				autopsiesDeferred++
+			} else {
+				captureDeploymentAutopsy(ctx, w.db, d.id, d.providerID, w.autopsyK8s)
+				autopsiesThisTick++
+			}
 		}
 
 		if newStatus == d.status {
@@ -342,11 +391,21 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 		transitions++
 	}
 
+	if autopsiesDeferred > 0 {
+		slog.Warn("jobs.deploy_status_reconcile.autopsies_deferred",
+			"deferred", autopsiesDeferred,
+			"captured", autopsiesThisTick,
+			"note", "per-tick autopsy cap/budget reached; deferred rows re-captured next tick (idempotent)",
+		)
+	}
+
 	slog.Info("jobs.deploy_status_reconcile.completed",
 		"total", len(deployments),
 		"transitions", transitions,
 		"errors", errors,
 		"skipped", skipped,
+		"autopsies", autopsiesThisTick,
+		"autopsies_deferred", autopsiesDeferred,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"job_id", job.ID,
 	)

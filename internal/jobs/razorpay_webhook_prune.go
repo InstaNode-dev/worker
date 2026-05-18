@@ -24,7 +24,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"strconv"
 
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
@@ -61,10 +60,16 @@ func (w *RazorpayWebhookPruneWorker) Work(ctx context.Context, _ *river.Job[Razo
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.razorpay_webhook_prune")
 	defer span.End()
 
+	// Retention window is bound as a parameter via make_interval rather
+	// than string-concatenated into the SQL text (BugBash 2026-05-18 P3,
+	// "interval-string concat"). The value is a compile-time int constant
+	// so injection was never possible — but a parameterised query is the
+	// codebase convention (CLAUDE.md: no scattered string literals in SQL)
+	// and keeps the prune EXPLAIN-stable.
 	res, err := w.db.ExecContext(ctx, `
 		DELETE FROM razorpay_webhook_events
-		WHERE received_at < now() - INTERVAL '`+strconv.Itoa(razorpayWebhookEventsRetentionDays)+` days'
-	`)
+		WHERE received_at < now() - make_interval(days => $1)
+	`, razorpayWebhookEventsRetentionDays)
 	if err != nil {
 		return fmt.Errorf("RazorpayWebhookPruneWorker: delete failed: %w", err)
 	}

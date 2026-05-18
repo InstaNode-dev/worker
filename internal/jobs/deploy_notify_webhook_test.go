@@ -106,7 +106,7 @@ func TestDeployNotifyWebhook_HappyPath_PostsAndAdvancesCursor(t *testing.T) {
 	// vault lookup returns the URL (plaintext bytes — default decryptor
 	// is the identity function).
 	mock.ExpectQuery(`FROM vault_secrets`).
-		WithArgs(teamID, deployNotifyVaultKey).
+		WithArgs(teamID, deployNotifyVaultEnv, deployNotifyVaultKey).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value"}).AddRow([]byte(publicURL)))
 
 	cursor := &memDeployNotifyCursor{}
@@ -158,7 +158,7 @@ func TestDeployNotifyWebhook_NoVaultEntry_AdvancesCursor(t *testing.T) {
 			AddRow(auditID, teamID, "deploy.created", []byte(`{}`), createdAt))
 
 	mock.ExpectQuery(`FROM vault_secrets`).
-		WithArgs(teamID, deployNotifyVaultKey).
+		WithArgs(teamID, deployNotifyVaultEnv, deployNotifyVaultKey).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value"})) // empty rowset → ErrNoRows path
 
 	cursor := &memDeployNotifyCursor{}
@@ -208,7 +208,7 @@ func TestDeployNotifyWebhook_AllAttemptsFail_EmitsDeliveryFailed(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "team_id", "kind", "metadata", "created_at"}).
 			AddRow(auditID, teamID, "deploy.failed", []byte(`{"deploy_id":"dep_99"}`), createdAt))
 	mock.ExpectQuery(`FROM vault_secrets`).
-		WithArgs(teamID, deployNotifyVaultKey).
+		WithArgs(teamID, deployNotifyVaultEnv, deployNotifyVaultKey).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value"}).AddRow([]byte(publicURL)))
 
 	// Expect the delivery_failed audit row to be inserted with the
@@ -268,7 +268,7 @@ func TestDeployNotifyWebhook_SSRFRejected_DoesNotPOST(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "team_id", "kind", "metadata", "created_at"}).
 			AddRow(auditID, teamID, "deploy.created", []byte(`{}`), createdAt))
 	mock.ExpectQuery(`FROM vault_secrets`).
-		WithArgs(teamID, deployNotifyVaultKey).
+		WithArgs(teamID, deployNotifyVaultEnv, deployNotifyVaultKey).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value"}).AddRow([]byte("https://internal-host.example.test/hook")))
 
 	cursor := &memDeployNotifyCursor{}
@@ -394,3 +394,47 @@ func redirectToServerTransport(srv *httptest.Server) http.RoundTripper {
 type roundTripFn func(*http.Request) (*http.Response, error)
 
 func (f roundTripFn) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestLookupWebhookURL_PinsProductionEnv is the BugBash 2026-05-18 W3 T3
+// regression guard: lookupWebhookURL MUST bind vault_secrets.env to
+// 'production'. Before the fix the query had no env predicate, so a team
+// that set DEPLOY_NOTIFY_WEBHOOK_URL under more than one env could have a
+// cross-env URL surface via the version-DESC ordering.
+//
+// The mock's WithArgs asserts the exact (team_id, env, key) tuple — if a
+// future edit drops the env binding the arg count mismatches and this test
+// fails. We additionally assert deployNotifyVaultEnv is "production" so the
+// constant itself can't silently drift.
+func TestLookupWebhookURL_PinsProductionEnv(t *testing.T) {
+	if deployNotifyVaultEnv != "production" {
+		t.Fatalf("deployNotifyVaultEnv = %q, want \"production\" — the dispatcher must read the production vault bucket", deployNotifyVaultEnv)
+	}
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := "22222222-2222-2222-2222-222222222222"
+	wantURL := "https://notify.example.test/prod-hook"
+
+	// The mock only matches when all three args — team_id, env, key — are
+	// bound in that order. A query missing the env predicate would pass
+	// only 2 args and fail ExpectationsWereMet.
+	mock.ExpectQuery(`FROM vault_secrets`).
+		WithArgs(teamID, deployNotifyVaultEnv, deployNotifyVaultKey).
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value"}).AddRow([]byte(wantURL)))
+
+	w := newDeployNotifyWebhookWorkerForTest(db, &memDeployNotifyCursor{}, nil)
+	got, err := w.lookupWebhookURL(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("lookupWebhookURL: %v", err)
+	}
+	if got != wantURL {
+		t.Errorf("lookupWebhookURL = %q, want %q", got, wantURL)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (env predicate likely missing): %v", err)
+	}
+}

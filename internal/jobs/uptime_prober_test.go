@@ -167,7 +167,11 @@ func TestUptimeRetention_DeletesOldRows(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec(`DELETE FROM uptime_samples\s+WHERE sampled_at < now\(\) - INTERVAL '90 days'`).
+	// The retention window is bound as a parameter via make_interval
+	// (BugBash 2026-05-18 P3) — the 90-day count is passed as $1, not
+	// string-concatenated into the SQL text.
+	mock.ExpectExec(`DELETE FROM uptime_samples\s+WHERE sampled_at < now\(\) - make_interval\(days => \$1\)`).
+		WithArgs(90).
 		WillReturnResult(sqlmock.NewResult(0, 1234))
 
 	w := jobs.NewUptimeRetentionWorker(db)

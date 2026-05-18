@@ -27,7 +27,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -240,6 +239,14 @@ func (w *ResourceHeartbeatWorker) Work(ctx context.Context, job *river.Job[Resou
 	return nil
 }
 
+// (Removed: the dead errZeroRows sentinel — BugBash 2026-05-18 P3. It was
+// declared "for a symmetric refactor" and parked behind `var _ = errZeroRows`,
+// but had zero call sites and the markDegraded gate uses a RowsAffected probe
+// directly. A sentinel kept alive only by a blank-assignment is dead code that
+// misleads readers into thinking a tagged-error path exists. If a future change
+// wants typed zero-row signalling, reintroduce it at that point with a real
+// caller.)
+
 // probeOne runs the prober on a single candidate and applies the resulting
 // state change. Returns the probe outcome so the caller can tally.
 func (w *ResourceHeartbeatWorker) probeOne(ctx context.Context, c heartbeatCandidate) ProbeOutcome {
@@ -412,10 +419,3 @@ func resourceHeartbeatPeriodicInterval(env string) time.Duration {
 	}
 	return resourceHeartbeatDevInterval
 }
-
-// errZeroRows is sentinel for "UPDATE matched no rows" used internally.
-// Kept here so a future change can switch the markDegraded gate from a
-// gross RowsAffected probe to a tagged error path.
-var errZeroRows = errors.New("no rows updated")
-
-var _ = errZeroRows // currently unused — preserve for symmetric refactor

@@ -82,6 +82,20 @@ const deployNotifyCursorKey = "worker:deploy_notify:last_audit_cursor"
 // either side surfaces at compile time, not silently at runtime.
 const deployNotifyVaultKey = "DEPLOY_NOTIFY_WEBHOOK_URL"
 
+// deployNotifyVaultEnv is the vault_secrets.env value the dispatcher
+// reads the notify webhook URL from. vault_secrets is keyed on
+// (team_id, env, key, version); without an env predicate the
+// MAX(version) projection could pick a row from ANY env — a customer
+// who set DEPLOY_NOTIFY_WEBHOOK_URL under both 'staging' and
+// 'production' would get a non-deterministic, possibly cross-env URL
+// (BugBash 2026-05-18 W3 T3 "lookupWebhookURL ignores env"). We pin to
+// 'production' — vault entries default to env='production' (migration
+// 008) and the audit_log rows the dispatcher drains carry no env field
+// to disambiguate against. A per-env notify URL would need the producer
+// to stamp env on the audit row first; until then 'production' is the
+// single deterministic bucket.
+const deployNotifyVaultEnv = "production"
+
 // Audit kinds the dispatcher reads. Forward-compatible: this list is
 // the exact set the producer side must emit to. Centralised here
 // because the worker module does not import the api models package.
@@ -469,24 +483,26 @@ func (w *DeployNotifyWebhookWorker) fetchBatch(ctx context.Context, c deployNoti
 // lookupWebhookURL fetches the team's latest DEPLOY_NOTIFY_WEBHOOK_URL
 // vault entry. Returns ("", nil) when the team has no entry. Returns
 // the decrypted plaintext URL otherwise. The (team_id, env, key,
-// version) UNIQUE constraint plus the MAX(version) projection gives us
+// version) UNIQUE constraint plus the version-DESC projection gives us
 // the latest row.
 //
-// We pick the 'production' env by convention — vault entries default to
-// env='production' and the notify URL is environment-agnostic from the
-// customer's perspective. A follow-up could let the customer pick per-env
-// URLs by widening the schema; today the producer doesn't carry env on
-// the audit row so we can't disambiguate anyway.
+// The query pins env = deployNotifyVaultEnv ('production'). Previously
+// the env predicate was absent, so on a team with the same key set in
+// more than one env the version-DESC ordering could surface a row from
+// the wrong env (BugBash 2026-05-18 W3 T3 cross-env vault bleed). The
+// env predicate also lets the planner use idx_vault_secrets_lookup
+// (team_id, env, key) instead of a partial-key scan.
 func (w *DeployNotifyWebhookWorker) lookupWebhookURL(ctx context.Context, teamID string) (string, error) {
 	var enc []byte
 	err := w.db.QueryRowContext(ctx, `
 		SELECT encrypted_value
 		FROM vault_secrets
 		WHERE team_id = $1::uuid
-		  AND key = $2
+		  AND env = $2
+		  AND key = $3
 		ORDER BY version DESC
 		LIMIT 1
-	`, teamID, deployNotifyVaultKey).Scan(&enc)
+	`, teamID, deployNotifyVaultEnv, deployNotifyVaultKey).Scan(&enc)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

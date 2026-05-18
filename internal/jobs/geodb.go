@@ -61,18 +61,69 @@ const geoLite2MaxAge = 7 * 24 * time.Hour
 // per freshness window.
 const geoLite2RefreshInterval = 7 * 24 * time.Hour
 
-// geoDBIsFresh reports whether the file at path exists and was modified
-// within geoLite2MaxAge. A missing/unstattable file is treated as NOT fresh
-// so the refresh proceeds. now is injected for deterministic tests.
+// geoLite2FetchMarkerSuffix is appended to the DBPath to form the
+// fetch-marker filename (e.g. /app/GeoLite2-City.mmdb.fetched). The marker
+// is written ONLY by a successful download in Work(); its mtime records
+// when this worker last actually pulled a fresh copy from MaxMind.
+//
+// BugBash 2026-05-18 P3 ("geodb freshness keyed on mtime"): the previous
+// freshness gate stat'd the .mmdb file itself. The .mmdb shipped baked into
+// the worker image has an mtime equal to the *image build time*, not the
+// MaxMind publish time — so a freshly-deployed worker carrying a months-old
+// baked-in DB sees a recent mtime and skips the refresh, leaving stale geo
+// data permanently in place. Keying freshness on a marker the worker writes
+// itself fixes that: a baked-in image has no marker, so the gate reports
+// "not fresh" and the download proceeds on first run.
+//
+// A full content checksum (verifying the .mmdb bytes against MaxMind's
+// published SHA256) needs a persistent record of the last-fetched digest —
+// a fetch-state store this worker does not have. That remains a follow-up;
+// the marker approach is the achievable mechanical fix and closes the
+// "baked-in DB looks fresh" hole on its own.
+const geoLite2FetchMarkerSuffix = ".fetched"
+
+// geoDBIsFresh reports whether this worker has successfully fetched the
+// GeoLite2 DB within geoLite2MaxAge. Freshness is keyed on the fetch-marker
+// file (path + geoLite2FetchMarkerSuffix), NOT on the .mmdb file's own
+// mtime — see geoLite2FetchMarkerSuffix for why. A missing marker, a
+// missing .mmdb, or an unstattable file is treated as NOT fresh so the
+// refresh proceeds. now is injected for deterministic tests.
 func geoDBIsFresh(path string, now time.Time) bool {
 	if path == "" {
 		return false
 	}
-	info, err := os.Stat(path)
+	// The .mmdb itself must exist — a fresh marker with no DB beside it is
+	// meaningless (e.g. the DB was deleted out of band).
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	info, err := os.Stat(geoDBFetchMarkerPath(path))
 	if err != nil {
+		// No marker → this worker has never fetched; the .mmdb present is
+		// the baked-in image copy. Treat as stale so the download runs.
 		return false
 	}
 	return now.Sub(info.ModTime()) < geoLite2MaxAge
+}
+
+// geoDBFetchMarkerPath returns the fetch-marker path for a given DBPath.
+func geoDBFetchMarkerPath(dbPath string) string {
+	return dbPath + geoLite2FetchMarkerSuffix
+}
+
+// touchGeoDBFetchMarker creates/updates the fetch-marker file so its mtime
+// records this successful fetch. Best-effort: a marker write failure is
+// logged but does not fail the job — the worst case is the next run
+// refetches an already-fresh DB, which is harmless.
+func touchGeoDBFetchMarker(dbPath string) {
+	markerPath := geoDBFetchMarkerPath(dbPath)
+	f, err := os.Create(markerPath)
+	if err != nil {
+		slog.Warn("jobs.refresh_geodb.fetch_marker_write_failed",
+			"path", markerPath, "error", err)
+		return
+	}
+	_ = f.Close()
 }
 
 // Work downloads the latest GeoLite2 City MMDB and atomically replaces the existing file.
@@ -127,6 +178,11 @@ func (w *RefreshGeoDBWorker) Work(ctx context.Context, job *river.Job[RefreshGeo
 		os.Remove(tmpPath)
 		return fmt.Errorf("RefreshGeoDBWorker: rename failed: %w", err)
 	}
+
+	// Stamp the fetch marker so geoDBIsFresh keys the next freshness check
+	// on this actual download rather than the .mmdb file's mtime — see
+	// geoLite2FetchMarkerSuffix (BugBash 2026-05-18 P3).
+	touchGeoDBFetchMarker(job.Args.DBPath)
 
 	slog.Info("jobs.refresh_geodb.completed",
 		"path", job.Args.DBPath,

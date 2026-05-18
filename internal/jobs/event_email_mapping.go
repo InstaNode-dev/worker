@@ -637,6 +637,16 @@ func buildChurnRiskFlagged(row auditRow) (map[string]string, bool) {
 // {{ params.deploy_url }}, {{ params.make_permanent_url }} so the same
 // RESOURCE_EXPIRING template can render copy that's specific to a deploy
 // vs a postgres/redis/mongo resource.
+//
+// deploy_name NOTE (BugBash 2026-05-18 W3 T3): the deploy TTL builders
+// deliberately do NOT populate `deploy_name`. The `deployments` table has
+// no human-facing name column — `app_id` is an opaque hex slug (e.g.
+// "6fffcc21") used only for the subdomain. Mapping `app_id` into
+// `deploy_name` produced emails reading "Your deployment 6fffcc21 expires
+// in 1h", which looks like a bug to the customer. Leaving `deploy_name`
+// unset lets the renderer's orDefault(params["deploy_name"], "your
+// deployment") fall through to readable copy. If a real deployment name
+// column is added later, populate `deploy_name` from THAT column.
 
 func buildDeployExpiringSoon(row auditRow) (map[string]string, bool) {
 	if !requireEmail(row) {
@@ -645,7 +655,7 @@ func buildDeployExpiringSoon(row auditRow) (map[string]string, bool) {
 	meta := decodeMeta(row.Metadata)
 	params := baseParams(row)
 	copyMetaStr(params, meta, "deploy_id", "deploy_id")
-	copyMetaStr(params, meta, "app_id", "deploy_name")
+	// Intentionally NOT copying app_id → deploy_name — see deploy_name NOTE.
 	copyMetaStr(params, meta, "deploy_url", "deploy_url")
 	copyMetaStr(params, meta, "make_permanent_url", "make_permanent_url")
 	copyMetaStr(params, meta, "hours_remaining", "hours_remaining")
@@ -661,7 +671,7 @@ func buildDeployExpired(row auditRow) (map[string]string, bool) {
 	meta := decodeMeta(row.Metadata)
 	params := baseParams(row)
 	copyMetaStr(params, meta, "deploy_id", "deploy_id")
-	copyMetaStr(params, meta, "app_id", "deploy_name")
+	// Intentionally NOT copying app_id → deploy_name — see deploy_name NOTE.
 	copyMetaStr(params, meta, "expires_at", "expires_at")
 	copyMetaStr(params, meta, "ttl_policy", "ttl_policy")
 	return params, true

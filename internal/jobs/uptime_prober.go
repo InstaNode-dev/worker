@@ -41,7 +41,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -402,10 +401,15 @@ func (w *UptimeRetentionWorker) Work(ctx context.Context, _ *river.Job[UptimeRet
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.uptime_retention")
 	defer span.End()
 
+	// Retention window bound as a parameter via make_interval rather than
+	// string-concatenated into the SQL text (BugBash 2026-05-18 P3,
+	// "interval-string concat"). uptimeRetentionDays is a compile-time int
+	// constant so injection was never possible — but parameterised SQL is
+	// the codebase convention and keeps the prune's plan stable.
 	res, err := w.db.ExecContext(ctx, `
 		DELETE FROM uptime_samples
-		WHERE sampled_at < now() - INTERVAL '`+strconv.Itoa(uptimeRetentionDays)+` days'
-	`)
+		WHERE sampled_at < now() - make_interval(days => $1)
+	`, uptimeRetentionDays)
 	if err != nil {
 		return fmt.Errorf("UptimeRetentionWorker: delete failed: %w", err)
 	}
