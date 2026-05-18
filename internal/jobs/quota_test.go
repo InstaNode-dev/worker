@@ -205,6 +205,71 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 	}
 }
 
+// ── W6 (P1-W3-08) regression: suspend CAS that matches 0 rows emits nothing ──
+//
+// The suspend UPDATE is a CAS (status='active' → 'suspended'). The worker
+// runs at replicas:2; both pods' enforce_storage_quota ticks can race on the
+// same over-quota row and only one wins the CAS — the loser's UPDATE matches
+// 0 rows. Before the fix the worker discarded RowsAffected() and emitted the
+// audit_log row + appended to suspendedIDs unconditionally, producing a
+// DUPLICATE "your resource was suspended" audit row and a duplicate customer
+// email on the losing tick.
+//
+// This test makes the suspend UPDATE return RowsAffected()=0 and asserts NO
+// audit_log INSERT is issued. mock.ExpectationsWereMet() fails if the worker
+// issues an unexpected INSERT.
+func TestEnforceStorageQuotaWorker_SuspendCASLoses_NoAuditRow(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resourceID := "22222222-2222-2222-2222-222222222222"
+	token := "tok_raced"
+	resourceType := "postgres"
+	tier := "anonymous"
+	providerResourceID := "usr_tok_raced"
+	storageBytes := int64(11 * 1024 * 1024) // 11 MB, over the 10 MB limit
+	limitMB := 10
+	teamID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	name := "raced-db"
+
+	// Suspend loop query — one over-quota row.
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("active").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols).
+			AddRow(resourceID, token, resourceType, tier, storageBytes, providerResourceID, teamID, name))
+	// checkStorageQuota inner query.
+	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(storageBytes))
+	// The suspend CAS — but a concurrent tick already flipped the row, so
+	// this UPDATE matches 0 rows (NewResult(0, 0) → RowsAffected()=0).
+	mock.ExpectExec(`UPDATE resources SET status = \$1`).
+		WithArgs("suspended", resourceID, "active").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// NO INSERT INTO audit_log is expected — the W6 fix `continue`s before
+	// emitQuotaAuditRow when RowsAffected()==0.
+
+	// Unsuspend loop query — empty.
+	mock.ExpectQuery(`SELECT id, token`).
+		WithArgs("suspended").
+		WillReturnRows(sqlmock.NewRows(quotaScanCols))
+
+	revoker := &mockResourceInfraRevoker{}
+	plans := &mockPlanRegistry{limitMB: limitMB}
+	w := jobs.NewEnforceStorageQuotaWorker(db, plans, revoker)
+	if err := w.Work(context.Background(), fakeJob[jobs.EnforceStorageQuotaArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// If the worker emitted an audit_log INSERT despite RowsAffected()==0,
+	// sqlmock reports the unexpected call here.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("W6 regression: expected NO audit_log INSERT after a 0-row suspend CAS, but: %v", err)
+	}
+}
+
 // ── P0-4 regression: auto-unsuspend when usage drops below limit ──────────────
 //
 // Proves the unsuspend loop fires and re-grants infra access + flips status

@@ -304,6 +304,83 @@ func TestEventForwarder_NoOwnerEmailAdvances(t *testing.T) {
 	}
 }
 
+// TestEventForwarder_AnonRowDeliversViaMetadataEmail is the W3 (P1-W3-10)
+// regression guard. An anonymous team has no users row, so the LEFT JOIN
+// yields a NULL owner_email; the recipient lives only in the audit row's
+// metadata.email. Before the fix the builder saw an empty OwnerEmail,
+// returned ok=false, and the forwarder advanced past the row — the
+// highest-volume free-funnel email (anon.expiry_warning) was structurally
+// undeliverable.
+//
+// Here the mocked row carries owner_email="" but a metadata.email — the
+// shape an anonymous-tier row has. The forwarder MUST still SendEvent, and
+// the EventEmail.Recipient MUST be the metadata address.
+func TestEventForwarder_AnonRowDeliversViaMetadataEmail(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Date(2026, 5, 18, 9, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("anon-row-1", "anon-team", auditKindAnonExpiryWarning, "postgres", "anon resource expiring",
+				[]byte(`{"email":"anon@example.com","resource_type":"postgres","hours_remaining":3}`),
+				createdAt, "")) // owner_email empty — anonymous team, no users row
+
+	provider := &fakeProvider{}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if got := provider.callCount(); got != 1 {
+		t.Fatalf("W3: expected 1 SendEvent for an anon row with a metadata.email, got %d — the anon expiry email was dropped", got)
+	}
+	if provider.lastEvt.Recipient != "anon@example.com" {
+		t.Errorf("W3: EventEmail.Recipient = %q; want anon@example.com (metadata.email fallback)", provider.lastEvt.Recipient)
+	}
+}
+
+// TestEventForwarder_FetchBatchQueryWiring is the W4 (P1-W3-11) + W3
+// guard on the fetchBatch SQL itself. sqlmock's regexp matcher does not
+// verify the query body, so this test asserts the two structural fixes are
+// present in the SQL string the forwarder runs:
+//
+//	W4: the users join filters on `is_primary = true` (migration 029),
+//	    so a team with multiple users emails its PRIMARY user — not
+//	    whoever signed up first.
+//	W3: the recipient COALESCE includes `metadata->>'email'`, so an
+//	    anonymous team with no users row still resolves a recipient.
+//
+// The query text is a private const inside fetchBatch; we capture it by
+// running fetchBatch against a sqlmock that records the SQL it was asked
+// to run.
+func TestEventForwarder_FetchBatchQueryWiring(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// W4: assert the is_primary filter is in the join.
+	mock.ExpectQuery(`is_primary\s*=\s*true`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols))
+	w := newEventEmailForwarderWorkerForTest(db, &memCursor{}, &fakeProvider{})
+	if _, err := w.fetchBatch(context.Background(), eventCursor{}); err != nil {
+		t.Fatalf("W4: fetchBatch query does not contain `is_primary = true` — a multi-user team would email a non-primary user: %v", err)
+	}
+
+	// W3: assert the recipient COALESCE includes the metadata.email fallback.
+	mock.ExpectQuery(`COALESCE\(u\.email,\s*a\.metadata->>'email'`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols))
+	if _, err := w.fetchBatch(context.Background(), eventCursor{}); err != nil {
+		t.Fatalf("W3: fetchBatch query does not COALESCE metadata->>'email' — anonymous-tier rows resolve no recipient: %v", err)
+	}
+}
+
 // TestEventForwarder_BatchLimitIsHonored verifies the SQL passes the
 // eventEmailBatchLimit constant — protects against a refactor that drops
 // the LIMIT clause and tries to drain millions of rows per tick.

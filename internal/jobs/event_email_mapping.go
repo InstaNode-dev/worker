@@ -124,6 +124,64 @@ const (
 	// resource.expiry_imminent builder reads.
 	auditKindResourceQuotaSuspended   = quotaSuspendedKind
 	auditKindResourceQuotaUnsuspended = quotaUnsuspendedKind
+
+	// ── W2 (P1-W2-01/02, P2-W2-13/14) — kinds whose audit rows were being
+	// ── written but had NO email path (missing from supportedAuditKinds +
+	// ── eventEmailBuilders + eventEmailBodyRenderers). The rows were emitted,
+	// ── the dashboard showed them, but no customer email was ever sent.
+	//
+	// Payment dunning lifecycle. A customer whose card fails currently gets
+	// ZERO notification before their subscription terminates. The four kinds
+	// below are the dunning emails.
+	//
+	//   started    — billing.go::emitPaymentGraceStartedAudit. Metadata:
+	//                subscription_id, grace_id, started_at, expires_at,
+	//                attempted_amount (paise, may be null).
+	//   reminder   — payment_grace_reminder.go. Metadata: grace_id,
+	//                hours_remaining, grace_ends_at.
+	//   recovered  — billing.go::emitPaymentGraceRecoveredAudit. Metadata:
+	//                subscription_id, grace_id, started_at, recovered_at.
+	//   terminated — payment_grace_terminator.go. Metadata: grace_id,
+	//                grace_ends_at.
+	//
+	// grace_started / grace_recovered have no pre-existing worker constant
+	// (their producer is the api side); reminder + terminated DO — reuse
+	// those byte-for-byte so the SQL filter matches the producer's literal
+	// (CLAUDE rule 16: single source of the string).
+	auditKindPaymentGraceStarted   = "payment.grace_started"
+	auditKindPaymentGraceRecovered = "payment.grace_recovered"
+	// auditKindPaymentGraceReminderEmail / auditKindPaymentGraceTerminatedEmail
+	// alias the existing producer-side constants so the email pipeline reads
+	// from the SAME literal the worker writes to audit_log.
+	auditKindPaymentGraceReminderEmail   = auditKindPaymentGraceReminder
+	auditKindPaymentGraceTerminatedEmail = auditKindPaymentGraceTerminated
+
+	// Admin-initiated cancellation. The api emits this distinct kind (instead
+	// of the customer-initiated subscription.canceled) specifically so the
+	// email reads "canceled by support" — admin_customers.go on the demote
+	// path. Metadata: cancel_attempted, cancel_succeeded, cancel_error.
+	auditKindSubscriptionCanceledByAdmin = "subscription.canceled_by_admin"
+
+	// Backup / restore lifecycle. The customer-backup pipeline emits these on
+	// terminal failure / success. Reuse the producer-side constants from
+	// backup_audit.go byte-for-byte.
+	//
+	//   backup.failed     — customer_backup_runner.go::markFailed. Metadata:
+	//                       backup_id, error_summary, duration_seconds, tier.
+	//   restore.succeeded — customer_restore_runner.go. Metadata: restore_id,
+	//                       backup_id, duration_seconds.
+	//   restore.failed    — customer_restore_runner.go::markRestoreFailed.
+	//                       Metadata: restore_id, backup_id, error_summary,
+	//                       duration_seconds.
+	auditKindBackupFailedEmail     = auditKindBackupFailed
+	auditKindRestoreSucceededEmail = auditKindRestoreSucceeded
+	auditKindRestoreFailedEmail    = auditKindRestoreFailed
+
+	// Deploy failure. The api emits deploy.failed on a terminal build/rollout
+	// failure. Reuse the producer-side constant from deploy_notify_webhook.go.
+	// Metadata: deploy_id, team_id, failure_stage (build|rollout),
+	// error_summary.
+	auditKindDeployFailedEmail = auditKindDeployFailed
 )
 
 // auditRow is the projection of audit_log + users used by the forwarder.
@@ -188,6 +246,18 @@ var supportedAuditKinds = []string{
 	// in the SQL filter the forwarder never fetches the rows quota.go emits.
 	auditKindResourceQuotaSuspended,
 	auditKindResourceQuotaUnsuspended,
+	// W2 (P1-W2-01/02, P2-W2-13/14) — payment dunning, admin-cancel,
+	// backup/restore, deploy-failure. Same omission class as 49639e7: the
+	// rows are written but were absent from the SQL filter, so no email.
+	auditKindPaymentGraceStarted,
+	auditKindPaymentGraceReminderEmail,
+	auditKindPaymentGraceRecovered,
+	auditKindPaymentGraceTerminatedEmail,
+	auditKindSubscriptionCanceledByAdmin,
+	auditKindBackupFailedEmail,
+	auditKindRestoreSucceededEmail,
+	auditKindRestoreFailedEmail,
+	auditKindDeployFailedEmail,
 }
 
 // auditKindDeployTTLSet and auditKindTeamSettingsChanged are emitted by the
@@ -268,6 +338,18 @@ var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
 	// Storage-quota suspend/unsuspend (follow-up to 49639e7).
 	auditKindResourceQuotaSuspended:   renderResourceQuotaSuspended,
 	auditKindResourceQuotaUnsuspended: renderResourceQuotaUnsuspended,
+	// W2 (P1-W2-01/02, P2-W2-13/14) — dunning, admin-cancel, backup/restore,
+	// deploy-failure. Go-rendered like every other kind (no shared Brevo
+	// dashboard template — see lifecycle_emails.go header).
+	auditKindPaymentGraceStarted:         renderPaymentGraceStarted,
+	auditKindPaymentGraceReminderEmail:   renderPaymentGraceReminder,
+	auditKindPaymentGraceRecovered:       renderPaymentGraceRecovered,
+	auditKindPaymentGraceTerminatedEmail: renderPaymentGraceTerminated,
+	auditKindSubscriptionCanceledByAdmin: renderSubscriptionCanceledByAdmin,
+	auditKindBackupFailedEmail:           renderBackupFailed,
+	auditKindRestoreSucceededEmail:       renderRestoreSucceeded,
+	auditKindRestoreFailedEmail:          renderRestoreFailed,
+	auditKindDeployFailedEmail:           renderDeployFailed,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
@@ -300,6 +382,17 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	// Storage-quota suspend/unsuspend (follow-up to 49639e7).
 	auditKindResourceQuotaSuspended:   buildResourceQuotaSuspended,
 	auditKindResourceQuotaUnsuspended: buildResourceQuotaUnsuspended,
+	// W2 (P1-W2-01/02, P2-W2-13/14) — dunning, admin-cancel, backup/restore,
+	// deploy-failure.
+	auditKindPaymentGraceStarted:         buildPaymentGraceStarted,
+	auditKindPaymentGraceReminderEmail:   buildPaymentGraceReminder,
+	auditKindPaymentGraceRecovered:       buildPaymentGraceRecovered,
+	auditKindPaymentGraceTerminatedEmail: buildPaymentGraceTerminated,
+	auditKindSubscriptionCanceledByAdmin: buildSubscriptionCanceledByAdmin,
+	auditKindBackupFailedEmail:           buildBackupFailed,
+	auditKindRestoreSucceededEmail:       buildRestoreSucceeded,
+	auditKindRestoreFailedEmail:          buildRestoreFailed,
+	auditKindDeployFailedEmail:           buildDeployFailed,
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────
@@ -342,11 +435,33 @@ func copyMetaStr(params map[string]string, meta map[string]interface{}, key, out
 	params[outKey] = fmt.Sprint(v)
 }
 
-// requireEmail returns ok=false when row.OwnerEmail is empty.
-// Used by every builder — an event email with no recipient is malformed
-// (the forwarder logs and advances past it).
+// resolveRecipient returns the recipient email for an audit row, falling
+// back to the metadata `email` field when the joined users row produced
+// nothing. W3 (P1-W3-10): anonymous teams have no users row, so
+// auditRow.OwnerEmail is empty for them; the producers stash the address
+// in metadata.email. fetchBatch already COALESCEs this at the SQL layer —
+// this builder-side fallback is belt-and-braces for any row that reaches a
+// builder without the SQL COALESCE (e.g. a hand-constructed row in a test,
+// or a future caller). Returns "" when neither source has an address.
+func resolveRecipient(row auditRow) string {
+	if row.OwnerEmail != "" {
+		return row.OwnerEmail
+	}
+	meta := decodeMeta(row.Metadata)
+	if v, ok := meta["email"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// requireEmail returns ok=false when the row has no resolvable recipient
+// (neither a joined users-row email nor a metadata.email fallback). Used by
+// every builder — an event email with no recipient is malformed (the
+// forwarder logs and advances past it).
 func requireEmail(row auditRow) bool {
-	return row.OwnerEmail != ""
+	return resolveRecipient(row) != ""
 }
 
 // ── Per-kind builders ─────────────────────────────────────────────────────
@@ -716,5 +831,129 @@ func buildResourceQuotaUnsuspended(row auditRow) (map[string]string, bool) {
 	}
 	copyMetaStr(params, meta, "resource_id", "resource_id")
 	copyMetaStr(params, meta, "name", "name")
+	return params, true
+}
+
+// ── W2 builders — payment dunning, admin-cancel, backup/restore, deploy ───
+//
+// Each follows the established shape: bail on no recipient, decode
+// metadata, start from baseParams, copy the per-kind keys the renderer
+// reads. See the W2 constant block for each kind's metadata shape.
+
+func buildPaymentGraceStarted(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "grace_id", "grace_id")
+	copyMetaStr(params, meta, "expires_at", "expires_at")
+	copyMetaStr(params, meta, "attempted_amount", "attempted_amount")
+	return params, true
+}
+
+func buildPaymentGraceReminder(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "grace_id", "grace_id")
+	copyMetaStr(params, meta, "hours_remaining", "hours_remaining")
+	copyMetaStr(params, meta, "grace_ends_at", "grace_ends_at")
+	return params, true
+}
+
+func buildPaymentGraceRecovered(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "grace_id", "grace_id")
+	copyMetaStr(params, meta, "recovered_at", "recovered_at")
+	return params, true
+}
+
+func buildPaymentGraceTerminated(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "grace_id", "grace_id")
+	copyMetaStr(params, meta, "grace_ends_at", "grace_ends_at")
+	return params, true
+}
+
+func buildSubscriptionCanceledByAdmin(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "cancel_attempted", "cancel_attempted")
+	copyMetaStr(params, meta, "cancel_succeeded", "cancel_succeeded")
+	return params, true
+}
+
+func buildBackupFailed(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	if row.ResourceType != "" {
+		params["resource_type"] = row.ResourceType
+	} else {
+		copyMetaStr(params, meta, "resource_type", "resource_type")
+	}
+	copyMetaStr(params, meta, "backup_id", "backup_id")
+	copyMetaStr(params, meta, "error_summary", "error_summary")
+	return params, true
+}
+
+func buildRestoreSucceeded(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	if row.ResourceType != "" {
+		params["resource_type"] = row.ResourceType
+	} else {
+		copyMetaStr(params, meta, "resource_type", "resource_type")
+	}
+	copyMetaStr(params, meta, "restore_id", "restore_id")
+	copyMetaStr(params, meta, "backup_id", "backup_id")
+	return params, true
+}
+
+func buildRestoreFailed(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	if row.ResourceType != "" {
+		params["resource_type"] = row.ResourceType
+	} else {
+		copyMetaStr(params, meta, "resource_type", "resource_type")
+	}
+	copyMetaStr(params, meta, "restore_id", "restore_id")
+	copyMetaStr(params, meta, "backup_id", "backup_id")
+	copyMetaStr(params, meta, "error_summary", "error_summary")
+	return params, true
+}
+
+func buildDeployFailed(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "deploy_id", "deploy_id")
+	copyMetaStr(params, meta, "failure_stage", "failure_stage")
+	copyMetaStr(params, meta, "error_summary", "error_summary")
 	return params, true
 }

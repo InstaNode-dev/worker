@@ -92,6 +92,16 @@ func representativeParams(kind string) map[string]string {
 		auditKindResourceExpiryImminent:  {"resource_type": "redis", "hours_remaining": "6", "expires_at": "2026-05-16T00:00:00Z", "reminder_index": "1", "token_prefix": "ist_xyz9", "upgrade_url": "https://instanode.dev/pricing", "resource_url": "https://instanode.dev/dashboard"},
 		auditKindResourceQuotaSuspended:   {"resource_type": "postgres", "name": "prod-db", "resource_id": "res-1", "audit_kind": "resource.quota_suspended"},
 		auditKindResourceQuotaUnsuspended: {"resource_type": "postgres", "name": "prod-db", "resource_id": "res-1", "audit_kind": "resource.quota_unsuspended"},
+		// W2 kinds.
+		auditKindPaymentGraceStarted:         {"grace_id": "g-1", "expires_at": "2026-05-22T00:00:00Z", "attempted_amount": "4900"},
+		auditKindPaymentGraceReminderEmail:   {"grace_id": "g-1", "hours_remaining": "48", "grace_ends_at": "2026-05-22T00:00:00Z"},
+		auditKindPaymentGraceRecovered:       {"grace_id": "g-1", "recovered_at": "2026-05-18T00:00:00Z"},
+		auditKindPaymentGraceTerminatedEmail: {"grace_id": "g-1", "grace_ends_at": "2026-05-22T00:00:00Z"},
+		auditKindSubscriptionCanceledByAdmin: {"cancel_attempted": "true", "cancel_succeeded": "true"},
+		auditKindBackupFailedEmail:           {"resource_type": "postgres", "backup_id": "bk-1", "error_summary": "pg_dump exited 1"},
+		auditKindRestoreSucceededEmail:       {"resource_type": "postgres", "restore_id": "rs-1", "backup_id": "bk-1"},
+		auditKindRestoreFailedEmail:          {"resource_type": "postgres", "restore_id": "rs-1", "backup_id": "bk-1", "error_summary": "pg_restore exited 1"},
+		auditKindDeployFailedEmail:           {"deploy_id": "dp-1", "failure_stage": "build", "error_summary": "kaniko build failed"},
 	}
 	for k, v := range per[kind] {
 		common[k] = v

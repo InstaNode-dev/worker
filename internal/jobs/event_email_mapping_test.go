@@ -7,6 +7,146 @@ import (
 	"testing"
 )
 
+// TestEventEmail_EverySupportedKindFullyWired is the W2 (P1-W2-01/02,
+// P2-W2-13/14) registry-iterating coverage test mandated by CLAUDE.md
+// rule 18. It iterates the LIVE supportedAuditKinds slice — the SQL filter
+// the forwarder actually queries with — and asserts every kind has BOTH an
+// eventEmailBuilders entry AND an eventEmailBodyRenderers entry.
+//
+// This is the structural guard against the modal failure of this codebase:
+// an audit kind whose rows are emitted by a producer but never sent as an
+// email because it was missing from one of the three registries. It caught
+// payment.grace_*, subscription.canceled_by_admin, backup.failed,
+// restore.{succeeded,failed}, and deploy.failed — all rows written, none
+// emailed. A future kind half-registered (added to supportedAuditKinds and
+// a builder but no renderer, or vice versa) fails CI here instead of
+// silently dropping a customer email in prod.
+func TestEventEmail_EverySupportedKindFullyWired(t *testing.T) {
+	for _, kind := range supportedAuditKinds {
+		if _, ok := eventEmailBuilders[kind]; !ok {
+			t.Errorf("supportedAuditKinds includes %q but eventEmailBuilders has NO entry — the "+
+				"forwarder fetches the row, hits no_builder_for_kind, and advances past it: the "+
+				"customer email is silently dropped.", kind)
+		}
+		if _, ok := eventEmailBodyRenderers[kind]; !ok {
+			t.Errorf("supportedAuditKinds includes %q but eventEmailBodyRenderers has NO entry — the "+
+				"kind falls through to the legacy broken Brevo dashboard-template path (the root cause "+
+				"of three consecutive expiry-email regressions).", kind)
+		}
+	}
+}
+
+// TestEventEmail_W2KindsRegistered pins the W2 fix: the nine audit kinds
+// whose rows were being written by a producer but had NO email path. A
+// paying customer whose card fails (payment.grace_*) previously got ZERO
+// notification. Each MUST be in supportedAuditKinds, have a builder, and
+// have a renderer.
+//
+// FAILS on master (kinds weren't registered). PASSES post-W2.
+func TestEventEmail_W2KindsRegistered(t *testing.T) {
+	w2Kinds := []string{
+		auditKindPaymentGraceStarted,
+		auditKindPaymentGraceReminderEmail,
+		auditKindPaymentGraceRecovered,
+		auditKindPaymentGraceTerminatedEmail,
+		auditKindSubscriptionCanceledByAdmin,
+		auditKindBackupFailedEmail,
+		auditKindRestoreSucceededEmail,
+		auditKindRestoreFailedEmail,
+		auditKindDeployFailedEmail,
+	}
+	supportedSet := map[string]bool{}
+	for _, k := range supportedAuditKinds {
+		supportedSet[k] = true
+	}
+	for _, k := range w2Kinds {
+		if !supportedSet[k] {
+			t.Errorf("W2: %q missing from supportedAuditKinds — the forwarder's SQL filter never fetches the row, so no email is sent", k)
+		}
+		if _, ok := eventEmailBuilders[k]; !ok {
+			t.Errorf("W2: %q has no eventEmailBuilders entry — forwarder hits no_builder_for_kind and skips the row", k)
+		}
+		if _, ok := eventEmailBodyRenderers[k]; !ok {
+			t.Errorf("W2: %q has no eventEmailBodyRenderers entry — falls through to the broken dashboard-template path", k)
+		}
+		// Exercise the builder end-to-end with a valid email.
+		if b := eventEmailBuilders[k]; b != nil {
+			params, ok := b(auditRow{ID: "a-1", TeamID: "t-1", Kind: k, OwnerEmail: "u@example.com"})
+			if !ok {
+				t.Errorf("W2: builder for %q returned ok=false with a valid owner email", k)
+			} else if params["team_id"] != "t-1" {
+				t.Errorf("W2: builder for %q did not set base team_id param", k)
+			}
+		}
+	}
+}
+
+// TestEventEmail_W2KindsMatchProducerConstants pins the cross-file contract
+// (CLAUDE rule 16): the email-pipeline aliases for the backup/restore/
+// deploy/grace kinds MUST equal the producer-side constants byte-for-byte.
+// If they drift, the SQL filter queries a literal no producer ever writes
+// and the email is silently never sent.
+func TestEventEmail_W2KindsMatchProducerConstants(t *testing.T) {
+	cases := []struct{ alias, producer, name string }{
+		{auditKindPaymentGraceReminderEmail, auditKindPaymentGraceReminder, "payment.grace_reminder"},
+		{auditKindPaymentGraceTerminatedEmail, auditKindPaymentGraceTerminated, "payment.grace_terminated"},
+		{auditKindBackupFailedEmail, auditKindBackupFailed, "backup.failed"},
+		{auditKindRestoreSucceededEmail, auditKindRestoreSucceeded, "restore.succeeded"},
+		{auditKindRestoreFailedEmail, auditKindRestoreFailed, "restore.failed"},
+		{auditKindDeployFailedEmail, auditKindDeployFailed, "deploy.failed"},
+	}
+	for _, c := range cases {
+		if c.alias != c.producer {
+			t.Errorf("%s: email-pipeline alias %q != producer constant %q — the SQL filter would never match the producer's audit row", c.name, c.alias, c.producer)
+		}
+	}
+	// The grace_started/recovered literals have no worker-side producer
+	// constant (the api emits them); pin the exact strings the api uses.
+	if auditKindPaymentGraceStarted != "payment.grace_started" {
+		t.Errorf("auditKindPaymentGraceStarted = %q; want \"payment.grace_started\" (api models.AuditKindPaymentGraceStarted)", auditKindPaymentGraceStarted)
+	}
+	if auditKindPaymentGraceRecovered != "payment.grace_recovered" {
+		t.Errorf("auditKindPaymentGraceRecovered = %q; want \"payment.grace_recovered\"", auditKindPaymentGraceRecovered)
+	}
+	if auditKindSubscriptionCanceledByAdmin != "subscription.canceled_by_admin" {
+		t.Errorf("auditKindSubscriptionCanceledByAdmin = %q; want \"subscription.canceled_by_admin\"", auditKindSubscriptionCanceledByAdmin)
+	}
+}
+
+// TestEventEmail_AnonRecipientFallback is the W3 (P1-W3-10) regression
+// guard: anonymous teams have no users row, so a builder's only recipient
+// source is the audit row's metadata.email. requireEmail / resolveRecipient
+// must accept that fallback — otherwise the highest-volume free-funnel
+// email (anon.expiry_warning) is structurally undeliverable.
+func TestEventEmail_AnonRecipientFallback(t *testing.T) {
+	// Row with NO OwnerEmail (the LEFT JOIN found no users row) but an
+	// email in metadata — exactly the anonymous-tier shape.
+	row := auditRow{
+		ID:         "a-1",
+		TeamID:     "t-1",
+		Kind:       auditKindAnonExpiryWarning,
+		OwnerEmail: "", // anonymous team — no users row
+		Metadata:   []byte(`{"email":"anon@example.com","resource_type":"postgres","hours_remaining":3}`),
+	}
+	if got := resolveRecipient(row); got != "anon@example.com" {
+		t.Errorf("resolveRecipient fell back wrong: got %q; want anon@example.com (metadata.email)", got)
+	}
+	if !requireEmail(row) {
+		t.Error("requireEmail returned false for an anonymous row whose recipient is in metadata.email — the anon expiry email would be dropped")
+	}
+	params, ok := buildAnonExpiryWarning(row)
+	if !ok {
+		t.Fatal("buildAnonExpiryWarning returned ok=false for a row with a metadata.email recipient — W3 not fixed")
+	}
+	if params == nil {
+		t.Fatal("buildAnonExpiryWarning returned nil params")
+	}
+	// A row with neither source still produces no recipient.
+	if resolveRecipient(auditRow{ID: "a-2", Kind: auditKindAnonExpiryWarning}) != "" {
+		t.Error("resolveRecipient must return \"\" when neither OwnerEmail nor metadata.email is present")
+	}
+}
+
 // TestEventEmail_AllSupportedKindsHaveBuilder is the schema invariant: every
 // kind in the SQL filter MUST have a builder, otherwise the forwarder
 // hits the "no_builder_for_kind" log path and advances past real events.

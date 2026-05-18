@@ -40,19 +40,51 @@ const queueReconcile = "reconcile"
 // as long as it likes without ever touching queueReconcile's capacity.
 const queueBilling = "billing"
 
+// periodicUniqueOpts is the UniqueOpts EVERY periodic job must carry
+// (P1-W3-07 / P1-W4-06 / P2-W5-05). The worker runs at replicas:2 — without
+// a uniqueness guard, both pods' River clients independently enqueue the
+// same periodic sweep on every tick, so the job runs TWICE per period
+// (double lifecycle emails, double audit_log rows, double Razorpay spend).
+//
+// ByArgs:   uniqueness is scoped to the specific encoded args. The periodic
+//           sweep jobs all use a zero-field args struct, so this is mostly a
+//           belt-and-braces guard for any future job that varies its args.
+// ByPeriod: a job is unique within one rounded period window — exactly the
+//           "one run per tick, not one per replica" guarantee we need. The
+//           period passed in is the job's own scheduling interval.
+//
+// River's default ByState set (available/completed/running/retryable/
+// scheduled) is intentionally kept — a tick that has already completed in
+// the current window still blocks a duplicate insert from the sibling pod.
+func periodicUniqueOpts(period time.Duration) river.UniqueOpts {
+	return river.UniqueOpts{ByArgs: true, ByPeriod: period}
+}
+
+// periodicInsertOpts is the InsertOpts builder for a default-queue periodic
+// job. Every periodic job that previously returned `nil` InsertOpts (and so
+// carried no uniqueness guard) now routes through here. queue is left empty
+// → River QueueDefault.
+func periodicInsertOpts(period time.Duration) *river.InsertOpts {
+	return &river.InsertOpts{UniqueOpts: periodicUniqueOpts(period)}
+}
+
 // reconcileInsertOpts is the InsertOpts the fast-reconciler periodic-job
 // builders must return. Extracted so a test can exercise the exact
 // production value (asserting the closures embed the right Queue) without
-// scraping source code.
-func reconcileInsertOpts() *river.InsertOpts {
-	return &river.InsertOpts{Queue: queueReconcile}
+// scraping source code. period is the job's scheduling interval — it feeds
+// the UniqueOpts.ByPeriod window so a replicas:2 cluster runs each
+// reconcile tick once, not once per pod.
+func reconcileInsertOpts(period time.Duration) *river.InsertOpts {
+	return &river.InsertOpts{Queue: queueReconcile, UniqueOpts: periodicUniqueOpts(period)}
 }
 
 // billingInsertOpts is the InsertOpts the billing-reconciler periodic-job
 // builder must return — routes the long billing sweep to queueBilling so it
-// cannot starve the fast reconcilers on queueReconcile (P1-L).
-func billingInsertOpts() *river.InsertOpts {
-	return &river.InsertOpts{Queue: queueBilling}
+// cannot starve the fast reconcilers on queueReconcile (P1-L). Carries the
+// same UniqueOpts guard so a replicas:2 cluster runs the ~17min sweep once
+// per window, not twice (double Razorpay API spend).
+func billingInsertOpts(period time.Duration) *river.InsertOpts {
+	return &river.InsertOpts{Queue: queueBilling, UniqueOpts: periodicUniqueOpts(period)}
 }
 
 // Workers wraps a running River client.
@@ -105,6 +137,16 @@ func (a entitlementRegraderAdapter) RegradeResource(ctx context.Context, token, 
 		SkipReason:       res.SkipReason,
 	}, nil
 }
+
+// weeklyPeriod / dailyPeriod are the nominal scheduling periods of the
+// cron-style schedules below (mondayAt8UTCSchedule, dailyAt2/3UTCSchedule).
+// river.PeriodicSchedule has no period accessor, so we name the periods
+// here to feed UniqueOpts.ByPeriod — without that window a replicas:2
+// cluster enqueues the cron job once per pod (P1-W3-07).
+const (
+	weeklyPeriod = 7 * 24 * time.Hour
+	dailyPeriod  = 24 * time.Hour
+)
 
 // mondayAt8UTCSchedule implements river.PeriodicSchedule for every Monday 08:00 UTC.
 type mondayAt8UTCSchedule struct{}
@@ -498,8 +540,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewProvisionerReconcilerWorker(db, rdb, nil), nrApp))
 	// Resource-heartbeat (W5-A). Hourly (dev: 1min) probe of every active
 	// resource. Sets degraded=true on probe failure, emits state-change
-	// audit rows. Same NoopProber default.
-	river.AddWorker(workers, WithObservability(NewResourceHeartbeatWorker(db, nil), nrApp))
+	// audit rows.
+	//
+	// P1-W5-09: this previously passed nil → NoopProber, so degraded
+	// detection was a permanent no-op in production — every probe returned
+	// ProbeSkip and no resource was ever flagged degraded. Wire the real
+	// prober (real_prober.go): it dispatches per resource_type (postgres
+	// SELECT 1, redis PING, mongo ping, storage/queue HTTP probe) and
+	// decrypts connection_url with cfg.AESKey when set, falling back to
+	// plaintext when it isn't. NewRealProber never returns nil.
+	river.AddWorker(workers, WithObservability(NewResourceHeartbeatWorker(db, NewRealProber(cfg)), nrApp))
 	// Uptime prober (W11). Per-minute liveness probe of every public
 	// component (api, provisioner, worker, deploys, marketing). Writes
 	// one uptime_samples row per component per tick. Consumed by the
@@ -563,381 +613,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	billingFetcher = WrapFetcherWithBreaker(billingFetcher, billingBreakerInst)
 	river.AddWorker(workers, WithObservability(NewBillingReconcilerWorker(db, billingFetcher, nil), nrApp))
 
-	periodicJobs := []*river.PeriodicJob{
-		river.NewPeriodicJob(
-			river.PeriodicInterval(1*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ExpireAnonymousArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		river.NewPeriodicJob(
-			river.PeriodicInterval(1*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ExpireStacksArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// GeoLite2 refresh (P1-D). RunOnStart=true: a frequently-redeployed
-		// worker would otherwise reset the long periodic timer on every
-		// restart and the job would never fire — the geo DB stayed the
-		// stale baked-in copy forever. The job itself is cheap on a fresh
-		// worker: geodb.Work() skips the MaxMind download when the on-disk
-		// MMDB is still within geoLite2MaxAge (7d). The interval is a
-		// backstop for the rare long-lived worker that never restarts.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(geoLite2RefreshInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return RefreshGeoDBArgs{
-					LicenseKey: cfg.MaxMindLicenseKey,
-					DBPath:     cfg.GeoLite2DBPath,
-				}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// TrialExpiry periodic job removed in FOLLOWUP-5 (2026-05-14) —
-		// see deletion note above on TrialExpiryWorker. No-trial policy is
-		// enforced by `project_no_trial_pay_day_one.md`.
-		river.NewPeriodicJob(
-			mondayAt8UTCSchedule{},
-			func() (river.JobArgs, *river.InsertOpts) {
-				return WeeklyDigestArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		river.NewPeriodicJob(
-			river.PeriodicInterval(6*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return UpdateStorageBytesArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		river.NewPeriodicJob(
-			river.PeriodicInterval(6*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return EnforceStorageQuotaArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Quota-wall nudge — Track U1. Runs every 30 minutes; the 24h
-		// dedupe in the job guarantees at most one audit row per team
-		// per day no matter how many ticks see the same condition.
-		// RunOnStart=false: a worker restart doesn't need to immediately
-		// re-scan — the previous run's nudges are still inside the 24h
-		// dedupe window and the dashboard banner will still render.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(quotaWallNudgeInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return QuotaWallNudgeArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Expiry reminder — hourly sweep that emails owners of claimed-but-unpaid
-		// (tier='free') resources whose expires_at is inside the next 4 hours.
-		// Dedupe lives in the DB (resources.expiry_reminded_at) so one row gets
-		// at most one email no matter how many ticks see it. See expiry_reminder.go.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(1*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ExpiryReminderArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Resource-expiry-imminent — every 10 minutes, write a
-		// resource.expiry_imminent audit row for any authenticated
-		// resource whose expires_at falls inside the next hour. Dedupe
-		// is enforced inside the candidate query (12h window on the
-		// audit_log table) so the dispatch cadence is independent of
-		// the per-resource email frequency. See expire_imminent.go for
-		// the freshness-window rationale.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(expireImminentInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ExpireImminentArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Custom-domain reconciler runs every 5 minutes — see
-		// customDomainReconcileInterval in custom_domain_reconcile.go.
-		// RunOnStart=true so a worker restart immediately picks up domains
-		// that became verifiable while we were down.
-		// Routed to the "reconcile" queue so a backlog on the default queue
-		// (e.g. a weekly_digest fan-out) cannot starve it.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(customDomainReconcileInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return CustomDomainReconcileArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Deploy-status reconciler runs every 30s — see
-		// deployStatusReconcileInterval in deploy_status_reconcile.go.
-		// RunOnStart=true so a worker restart immediately reconciles any
-		// deployments stuck in "building" or "deploying" from the last cycle.
-		// On the "reconcile" queue for the same starvation-protection reason.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(deployStatusReconcileInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return DeployStatusReconcileArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// GitHub auto-deploy dispatcher — every 30s. RunOnStart=true so a
-		// worker restart drains rows that piled up while the worker was
-		// down. Same starvation-protection queue as the other reconcilers.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(githubDispatcherInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return GitHubDeployDispatcherArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Magic-link reconciler — every 60s. RunOnStart=true so a worker
-		// restart immediately drains rows whose first send failed while
-		// the worker was down (we have a 15-min TTL window to retry, so
-		// the cost of a full sweep at boot is small). Routed to the
-		// reconcile queue so a weekly_digest fan-out on the default
-		// queue can't starve magic-link reliability — auth being slow is
-		// the most visible reliability surface this platform has.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(magicLinkReconcilerInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return MagicLinkReconcilerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Pending-deletion expirer (Wave FIX-I, api migration 044) —
-		// every 60s. RunOnStart=true so a worker restart immediately
-		// vacates the dedup index for any rows that overshot their TTL
-		// while we were down. Same starvation-protection queue as the
-		// other reconcilers.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(pendingDeletionExpirerInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return PendingDeletionExpirerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Event-email forwarder runs every eventEmailForwarderInterval (60s).
-		// RunOnStart=false: a worker restart should pick up the cursor on
-		// the next tick, not race to fire a duplicate batch. See
-		// event_email_forwarder.go for the cursor / idempotency contract.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(eventEmailForwarderInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return EventEmailForwarderArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Deploy TTL reminder (Wave FIX-J) — every 60s. RunOnStart=false:
-		// the 2h cooldown CAS guarantees a worker restart can't fire
-		// spurious reminders, so there's no urgency to scan immediately
-		// after boot. The next scheduled tick within 60s catches us up.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(60*time.Second),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return DeploymentReminderArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Deploy TTL expirer (Wave FIX-J) — every 60s. RunOnStart=true so
-		// a worker restart immediately picks up deploys that crossed their
-		// expires_at while the worker was down. The guarded UPDATE
-		// (status NOT IN ('deleted','expired')) prevents re-processing
-		// already-expired rows.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(60*time.Second),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return DeploymentExpirerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Churn predictor — runs daily at 03:00 UTC. The 30-day dedupe
-		// guarantees at most one churn.risk_flagged row per team per
-		// month regardless of restart cadence. RunOnStart=false: a
-		// worker restart in the middle of the day shouldn't immediately
-		// re-scan — wait for the next scheduled 03:00 slot so the
-		// scan happens during quiet hours.
-		river.NewPeriodicJob(
-			dailyAt3UTCSchedule{},
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ChurnPredictorArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Deploy-notify webhook dispatcher (A2) — every 30s, drain
-		// deploy.* audit_log rows to customer webhook URLs.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(deployNotifyWebhookInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return DeployNotifyWebhookArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Payment grace reminder (A2) — every 6h. RunOnStart=false.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(paymentGraceReminderInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return PaymentGraceReminderArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Payment grace terminator (A2) — every 1h. RunOnStart=true.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(paymentGraceTerminatorInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return PaymentGraceTerminatorArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Customer backup scheduler — every hour, sweeps active
-		// postgres/vector resources and INSERTs a 'pending' row for any
-		// tier that's due this hour (pro/team/growth every hour; hobby
-		// once per day at the team's daily slot). RunOnStart=true so a
-		// worker restart immediately covers any hour-bucket that fell
-		// inside the downtime; the in-job 50min dedupe lookback
-		// prevents double-inserts.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(1*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return CustomerBackupSchedulerArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Customer backup runner — every 30 seconds, picks up pending
-		// rows (whether inserted by the scheduler above or by the api's
-		// POST /resources/:id/backup) and streams pg_dump → gzip → S3.
-		// RunOnStart=true so a restart drains any rows that were
-		// 'pending' during the downtime. Routed to the reconcile queue
-		// so a fan-out on the default queue (weekly_digest) can't
-		// starve customer-facing backup latency.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(30*time.Second),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return CustomerBackupRunnerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Customer restore runner — every 30 seconds, picks up pending
-		// resource_restores rows and pg_restores from S3 into the same
-		// resource. Smaller per-tick batch (5) than the backup runner
-		// because pg_restore is heavier and holds DB locks.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(30*time.Second),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return CustomerRestoreRunnerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Platform-DB backup — runs daily at 02:00 UTC. RunOnStart=false:
-		// a worker restart should not trigger an immediate dump (the
-		// previous successful run is still within the NR "< 26h" KPI
-		// window) — wait for the next scheduled 02:00 slot. The advisory
-		// lock inside the worker guards against a multi-pod cluster
-		// running concurrent dumps if all pods happen to wake on the
-		// same second.
-		river.NewPeriodicJob(
-			dailyAt2UTCSchedule{},
-			func() (river.JobArgs, *river.InsertOpts) {
-				return PlatformDBBackupArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Team deletion executor — runs daily at 03:00 UTC, after the
-		// platform-DB backup at 02:00 UTC (so today's tombstoned data
-		// IS captured in tonight's backup before destruction).
-		// RunOnStart=false: a worker restart should NOT immediately tear
-		// down customer data — wait for the next 03:00 slot so the run
-		// happens during quiet hours and the operator has a chance to
-		// notice anything anomalous in the logs first.
-		river.NewPeriodicJob(
-			dailyAt3UTCSchedule{},
-			func() (river.JobArgs, *river.InsertOpts) {
-				return TeamDeletionExecutorArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Provisioner-reconciler (W5-A) — every 2min, reconcile queue.
-		// RunOnStart=true.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(provisionerReconcilerInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ProvisionerReconcilerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Resource-heartbeat (W5-A) — 1h prod / 1min dev. RunOnStart=false.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(resourceHeartbeatPeriodicInterval(cfg.Environment)),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return ResourceHeartbeatArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Uptime prober (W11) — every minute, writes one uptime_samples
-		// row per component. Routed to the reconcile queue so a default-
-		// queue backlog (weekly_digest fan-out) can't starve the status
-		// page during exactly the moment we want it to be honest.
-		// RunOnStart=true so a worker restart immediately writes a row
-		// for "we are up RIGHT NOW".
-		river.NewPeriodicJob(
-			river.PeriodicInterval(uptimeProberInterval),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return UptimeProberArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Uptime retention sweep — daily prune of uptime_samples > 90d.
-		// RunOnStart=false: a restart shouldn't immediately scan; wait
-		// for the next 24h slot.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(24*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return UptimeRetentionArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Razorpay webhook-events prune — daily DELETE of dedup rows > 30d.
-		// RunOnStart=false: a restart shouldn't immediately scan; the table
-		// grows slowly (one row per webhook delivery) so a day's delay before
-		// the first prune after a restart is harmless. Wait for the next 24h
-		// slot.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(24*time.Hour),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return RazorpayWebhookPruneArgs{}, nil
-			},
-			&river.PeriodicJobOpts{RunOnStart: false},
-		),
-		// Entitlement reconciler — cadence from ENTITLEMENT_RECONCILE_INTERVAL
-		// (Go duration string; default 5m). Detects + fixes upgrade drift on
-		// postgres connection caps. Routed to the reconcile queue so a
-		// default-queue fan-out can't starve it. RunOnStart=true so a worker
-		// restart immediately re-checks any resources that were upgraded
-		// while the worker was down.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(EntitlementReconcileInterval()),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return EntitlementReconcilerArgs{}, reconcileInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-		// Billing reconciler (P1 Wave-3 Cluster-B Slice 4) — every 15 min
-		// (override via BILLING_RECONCILE_INTERVAL). RunOnStart=true so a
-		// worker restart immediately sweeps for any gaps that opened during
-		// the downtime. Routed to the DEDICATED billing queue (P1-L): the
-		// sweep takes ~17 min and previously occupied both queueReconcile
-		// slots, starving the fast reconcilers (deploy-status, custom-domain).
-		//
-		// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.
-		river.NewPeriodicJob(
-			river.PeriodicInterval(BillingReconcileInterval()),
-			func() (river.JobArgs, *river.InsertOpts) {
-				return BillingReconcilerArgs{}, billingInsertOpts()
-			},
-			&river.PeriodicJobOpts{RunOnStart: true},
-		),
-	}
+	periodicJobs := buildPeriodicJobs(cfg)
 
 	riverClient, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Queues: map[string]river.QueueConfig{
@@ -984,5 +660,395 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		client:  riverClient,
 		cancel:  cancel,
 		started: true,
+	}
+}
+
+// buildPeriodicJobs constructs the full set of periodic jobs the worker
+// schedules. Extracted from StartWorkers so a registry-iterating test
+// (TestPeriodicJobs_AllCarryUniqueOpts) can assert every periodic job
+// carries River UniqueOpts — without that guard a replicas:2 cluster runs
+// every sweep twice (P1-W3-07 / P1-W4-06 / P2-W5-05).
+//
+// The job set depends only on cfg (MaxMind license key + GeoLite2 path for
+// the geo refresh job, Environment for the resource-heartbeat cadence) so
+// the test can pass a minimal config.
+func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
+	return []*river.PeriodicJob{
+		river.NewPeriodicJob(
+			river.PeriodicInterval(1*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ExpireAnonymousArgs{}, periodicInsertOpts(1 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		river.NewPeriodicJob(
+			river.PeriodicInterval(1*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ExpireStacksArgs{}, periodicInsertOpts(1 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// GeoLite2 refresh (P1-D). RunOnStart=true: a frequently-redeployed
+		// worker would otherwise reset the long periodic timer on every
+		// restart and the job would never fire — the geo DB stayed the
+		// stale baked-in copy forever. The job itself is cheap on a fresh
+		// worker: geodb.Work() skips the MaxMind download when the on-disk
+		// MMDB is still within geoLite2MaxAge (7d). The interval is a
+		// backstop for the rare long-lived worker that never restarts.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(geoLite2RefreshInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return RefreshGeoDBArgs{
+					LicenseKey: cfg.MaxMindLicenseKey,
+					DBPath:     cfg.GeoLite2DBPath,
+				}, periodicInsertOpts(geoLite2RefreshInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// TrialExpiry periodic job removed in FOLLOWUP-5 (2026-05-14) —
+		// see deletion note above on TrialExpiryWorker. No-trial policy is
+		// enforced by `project_no_trial_pay_day_one.md`.
+		river.NewPeriodicJob(
+			mondayAt8UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				// Cron schedule (Mon 08:00 UTC) — the nominal period is one
+				// week, so a sibling pod's tick inside the same week is
+				// deduped.
+				return WeeklyDigestArgs{}, periodicInsertOpts(weeklyPeriod)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		river.NewPeriodicJob(
+			river.PeriodicInterval(6*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return UpdateStorageBytesArgs{}, periodicInsertOpts(6 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		river.NewPeriodicJob(
+			river.PeriodicInterval(6*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return EnforceStorageQuotaArgs{}, periodicInsertOpts(6 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Quota-wall nudge — Track U1. Runs every 30 minutes; the 24h
+		// dedupe in the job guarantees at most one audit row per team
+		// per day no matter how many ticks see the same condition.
+		// RunOnStart=false: a worker restart doesn't need to immediately
+		// re-scan — the previous run's nudges are still inside the 24h
+		// dedupe window and the dashboard banner will still render.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(quotaWallNudgeInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return QuotaWallNudgeArgs{}, periodicInsertOpts(quotaWallNudgeInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Expiry reminder — hourly sweep that emails owners of claimed-but-unpaid
+		// (tier='free') resources whose expires_at is inside the next 4 hours.
+		// Dedupe lives in the DB (resources.expiry_reminded_at) so one row gets
+		// at most one email no matter how many ticks see it. See expiry_reminder.go.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(1*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ExpiryReminderArgs{}, periodicInsertOpts(1 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Resource-expiry-imminent — every 10 minutes, write a
+		// resource.expiry_imminent audit row for any authenticated
+		// resource whose expires_at falls inside the next hour. Dedupe
+		// is enforced inside the candidate query (12h window on the
+		// audit_log table) so the dispatch cadence is independent of
+		// the per-resource email frequency. See expire_imminent.go for
+		// the freshness-window rationale.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(expireImminentInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ExpireImminentArgs{}, periodicInsertOpts(expireImminentInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Custom-domain reconciler runs every 5 minutes — see
+		// customDomainReconcileInterval in custom_domain_reconcile.go.
+		// RunOnStart=true so a worker restart immediately picks up domains
+		// that became verifiable while we were down.
+		// Routed to the "reconcile" queue so a backlog on the default queue
+		// (e.g. a weekly_digest fan-out) cannot starve it.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(customDomainReconcileInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomDomainReconcileArgs{}, reconcileInsertOpts(customDomainReconcileInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Deploy-status reconciler runs every 30s — see
+		// deployStatusReconcileInterval in deploy_status_reconcile.go.
+		// RunOnStart=true so a worker restart immediately reconciles any
+		// deployments stuck in "building" or "deploying" from the last cycle.
+		// On the "reconcile" queue for the same starvation-protection reason.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(deployStatusReconcileInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeployStatusReconcileArgs{}, reconcileInsertOpts(deployStatusReconcileInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// GitHub auto-deploy dispatcher — every 30s. RunOnStart=true so a
+		// worker restart drains rows that piled up while the worker was
+		// down. Same starvation-protection queue as the other reconcilers.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(githubDispatcherInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return GitHubDeployDispatcherArgs{}, reconcileInsertOpts(githubDispatcherInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Magic-link reconciler — every 60s. RunOnStart=true so a worker
+		// restart immediately drains rows whose first send failed while
+		// the worker was down (we have a 15-min TTL window to retry, so
+		// the cost of a full sweep at boot is small). Routed to the
+		// reconcile queue so a weekly_digest fan-out on the default
+		// queue can't starve magic-link reliability — auth being slow is
+		// the most visible reliability surface this platform has.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(magicLinkReconcilerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return MagicLinkReconcilerArgs{}, reconcileInsertOpts(magicLinkReconcilerInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Pending-deletion expirer (Wave FIX-I, api migration 044) —
+		// every 60s. RunOnStart=true so a worker restart immediately
+		// vacates the dedup index for any rows that overshot their TTL
+		// while we were down. Same starvation-protection queue as the
+		// other reconcilers.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(pendingDeletionExpirerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PendingDeletionExpirerArgs{}, reconcileInsertOpts(pendingDeletionExpirerInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Event-email forwarder runs every eventEmailForwarderInterval (60s).
+		// RunOnStart=false: a worker restart should pick up the cursor on
+		// the next tick, not race to fire a duplicate batch. See
+		// event_email_forwarder.go for the cursor / idempotency contract.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(eventEmailForwarderInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return EventEmailForwarderArgs{}, periodicInsertOpts(eventEmailForwarderInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Deploy TTL reminder (Wave FIX-J) — every 60s. RunOnStart=false:
+		// the 2h cooldown CAS guarantees a worker restart can't fire
+		// spurious reminders, so there's no urgency to scan immediately
+		// after boot. The next scheduled tick within 60s catches us up.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(60*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeploymentReminderArgs{}, reconcileInsertOpts(60 * time.Second)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Deploy TTL expirer (Wave FIX-J) — every 60s. RunOnStart=true so
+		// a worker restart immediately picks up deploys that crossed their
+		// expires_at while the worker was down. The guarded UPDATE
+		// (status NOT IN ('deleted','expired')) prevents re-processing
+		// already-expired rows.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(60*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeploymentExpirerArgs{}, reconcileInsertOpts(60 * time.Second)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Churn predictor — runs daily at 03:00 UTC. The 30-day dedupe
+		// guarantees at most one churn.risk_flagged row per team per
+		// month regardless of restart cadence. RunOnStart=false: a
+		// worker restart in the middle of the day shouldn't immediately
+		// re-scan — wait for the next scheduled 03:00 slot so the
+		// scan happens during quiet hours.
+		river.NewPeriodicJob(
+			dailyAt3UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ChurnPredictorArgs{}, periodicInsertOpts(dailyPeriod)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Deploy-notify webhook dispatcher (A2) — every 30s, drain
+		// deploy.* audit_log rows to customer webhook URLs.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(deployNotifyWebhookInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeployNotifyWebhookArgs{}, reconcileInsertOpts(deployNotifyWebhookInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Payment grace reminder (A2) — every 6h. RunOnStart=false.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(paymentGraceReminderInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PaymentGraceReminderArgs{}, periodicInsertOpts(paymentGraceReminderInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Payment grace terminator (A2) — every 1h. RunOnStart=true.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(paymentGraceTerminatorInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PaymentGraceTerminatorArgs{}, periodicInsertOpts(paymentGraceTerminatorInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Customer backup scheduler — every hour, sweeps active
+		// postgres/vector resources and INSERTs a 'pending' row for any
+		// tier that's due this hour (pro/team/growth every hour; hobby
+		// once per day at the team's daily slot). RunOnStart=true so a
+		// worker restart immediately covers any hour-bucket that fell
+		// inside the downtime; the in-job 50min dedupe lookback
+		// prevents double-inserts.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(1*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomerBackupSchedulerArgs{}, periodicInsertOpts(1 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Customer backup runner — every 30 seconds, picks up pending
+		// rows (whether inserted by the scheduler above or by the api's
+		// POST /resources/:id/backup) and streams pg_dump → gzip → S3.
+		// RunOnStart=true so a restart drains any rows that were
+		// 'pending' during the downtime. Routed to the reconcile queue
+		// so a fan-out on the default queue (weekly_digest) can't
+		// starve customer-facing backup latency.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(30*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomerBackupRunnerArgs{}, reconcileInsertOpts(30 * time.Second)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Customer restore runner — every 30 seconds, picks up pending
+		// resource_restores rows and pg_restores from S3 into the same
+		// resource. Smaller per-tick batch (5) than the backup runner
+		// because pg_restore is heavier and holds DB locks.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(30*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CustomerRestoreRunnerArgs{}, reconcileInsertOpts(30 * time.Second)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Platform-DB backup — runs daily at 02:00 UTC. RunOnStart=false:
+		// a worker restart should not trigger an immediate dump (the
+		// previous successful run is still within the NR "< 26h" KPI
+		// window) — wait for the next scheduled 02:00 slot. The advisory
+		// lock inside the worker guards against a multi-pod cluster
+		// running concurrent dumps if all pods happen to wake on the
+		// same second.
+		river.NewPeriodicJob(
+			dailyAt2UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PlatformDBBackupArgs{}, periodicInsertOpts(dailyPeriod)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Team deletion executor — runs daily at 03:00 UTC, after the
+		// platform-DB backup at 02:00 UTC (so today's tombstoned data
+		// IS captured in tonight's backup before destruction).
+		// RunOnStart=false: a worker restart should NOT immediately tear
+		// down customer data — wait for the next 03:00 slot so the run
+		// happens during quiet hours and the operator has a chance to
+		// notice anything anomalous in the logs first.
+		river.NewPeriodicJob(
+			dailyAt3UTCSchedule{},
+			func() (river.JobArgs, *river.InsertOpts) {
+				return TeamDeletionExecutorArgs{}, periodicInsertOpts(dailyPeriod)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Provisioner-reconciler (W5-A) — every 2min, reconcile queue.
+		// RunOnStart=true.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(provisionerReconcilerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ProvisionerReconcilerArgs{}, reconcileInsertOpts(provisionerReconcilerInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Resource-heartbeat (W5-A) — 1h prod / 1min dev. RunOnStart=false.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(resourceHeartbeatPeriodicInterval(cfg.Environment)),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return ResourceHeartbeatArgs{}, reconcileInsertOpts(resourceHeartbeatPeriodicInterval(cfg.Environment))
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Uptime prober (W11) — every minute, writes one uptime_samples
+		// row per component. Routed to the reconcile queue so a default-
+		// queue backlog (weekly_digest fan-out) can't starve the status
+		// page during exactly the moment we want it to be honest.
+		// RunOnStart=true so a worker restart immediately writes a row
+		// for "we are up RIGHT NOW".
+		river.NewPeriodicJob(
+			river.PeriodicInterval(uptimeProberInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return UptimeProberArgs{}, reconcileInsertOpts(uptimeProberInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Uptime retention sweep — daily prune of uptime_samples > 90d.
+		// RunOnStart=false: a restart shouldn't immediately scan; wait
+		// for the next 24h slot.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(24*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return UptimeRetentionArgs{}, periodicInsertOpts(24 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Razorpay webhook-events prune — daily DELETE of dedup rows > 30d.
+		// RunOnStart=false: a restart shouldn't immediately scan; the table
+		// grows slowly (one row per webhook delivery) so a day's delay before
+		// the first prune after a restart is harmless. Wait for the next 24h
+		// slot.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(24*time.Hour),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return RazorpayWebhookPruneArgs{}, periodicInsertOpts(24 * time.Hour)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Entitlement reconciler — cadence from ENTITLEMENT_RECONCILE_INTERVAL
+		// (Go duration string; default 5m). Detects + fixes upgrade drift on
+		// postgres connection caps. Routed to the reconcile queue so a
+		// default-queue fan-out can't starve it. RunOnStart=true so a worker
+		// restart immediately re-checks any resources that were upgraded
+		// while the worker was down.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(EntitlementReconcileInterval()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return EntitlementReconcilerArgs{}, reconcileInsertOpts(EntitlementReconcileInterval())
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Billing reconciler (P1 Wave-3 Cluster-B Slice 4) — every 15 min
+		// (override via BILLING_RECONCILE_INTERVAL). RunOnStart=true so a
+		// worker restart immediately sweeps for any gaps that opened during
+		// the downtime. Routed to the DEDICATED billing queue (P1-L): the
+		// sweep takes ~17 min and previously occupied both queueReconcile
+		// slots, starving the fast reconcilers (deploy-status, custom-domain).
+		//
+		// NR alert: billing.reconciler.gap_detected > 3 in 15m → PagerDuty P2.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(BillingReconcileInterval()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return BillingReconcilerArgs{}, billingInsertOpts(BillingReconcileInterval())
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
 	}
 }

@@ -219,6 +219,62 @@ var (
   <tr><td style="color:#666;">Status</td><td><strong>active</strong></td></tr>
 </table>
 <p style="margin:0 0 4px;color:#555;font-size:14px;">No action is needed. To avoid another suspension, keep usage below the limit or upgrade for more headroom.</p>`))
+
+	// ── W2 body templates — dunning, admin-cancel, backup/restore, deploy ──
+
+	bodyPaymentGraceStarted = template.Must(template.New("b_gstart").Parse(
+		`<p style="margin:0 0 14px;">We couldn't process your most recent instanode payment. Your account has entered a 7-day grace period{{ if .ExpiresAt }}, ending {{ .ExpiresAt }} UTC{{ end }}.</p>
+<p style="margin:0 0 4px;">Update your payment method before the grace period ends to keep your resources running. If the grace period expires without a successful payment, your subscription will be terminated.</p>`))
+
+	bodyPaymentGraceReminder = template.Must(template.New("b_gremind").Parse(
+		`<p style="margin:0 0 14px;">Your instanode account is still in a payment grace period{{ if .HoursRemaining }} — about {{ .HoursRemaining }} hour(s) remain{{ end }}{{ if .GraceEndsAt }} (ends {{ .GraceEndsAt }} UTC){{ end }}.</p>
+<p style="margin:0 0 4px;">Update your payment method now to avoid termination of your subscription and your resources.</p>`))
+
+	bodyPaymentGraceRecovered = template.Must(template.New("b_grecov").Parse(
+		`<p style="margin:0 0 14px;">Good news — your instanode payment went through and your account is back in good standing{{ if .RecoveredAt }} as of {{ .RecoveredAt }} UTC{{ end }}.</p>
+<p style="margin:0 0 4px;color:#555;font-size:14px;">No further action is needed. Thanks for staying with instanode.</p>`))
+
+	bodyPaymentGraceTerminated = template.Must(template.New("b_gterm").Parse(
+		`<p style="margin:0 0 14px;">Your instanode subscription has been terminated because the payment grace period ended{{ if .GraceEndsAt }} ({{ .GraceEndsAt }} UTC){{ end }} without a successful payment.</p>
+<p style="margin:0 0 4px;">You can resubscribe at any time to restore access. Resubscribe soon — terminated resources are subject to deletion.</p>`))
+
+	bodySubscriptionCanceledByAdmin = template.Must(template.New("b_admincancel").Parse(
+		`<p style="margin:0 0 14px;">Your instanode subscription has been cancelled by our support team.</p>
+<p style="margin:0 0 4px;color:#555;font-size:14px;">Your data isn't deleted immediately — you can resubscribe any time to restore full access. If you didn't request this, reply to this email and we'll look into it.</p>`))
+
+	bodyBackupFailed = template.Must(template.New("b_bkfail").Parse(
+		`<p style="margin:0 0 14px;">A backup of your {{ if .ResourceType }}{{ .ResourceType }} {{ end }}resource failed to complete.</p>
+<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  {{ if .BackupID }}<tr><td style="color:#666;width:140px;">Backup</td><td><code>{{ .BackupID }}</code></td></tr>{{ end }}
+  {{ if .ErrorSummary }}<tr><td style="color:#666;">Error</td><td>{{ .ErrorSummary }}</td></tr>{{ end }}
+</table>
+<p style="margin:0 0 4px;">No data was lost — only the backup did not complete. You can trigger a new backup from your dashboard. If this keeps happening, reply to this email.</p>`))
+
+	bodyRestoreSucceeded = template.Must(template.New("b_rsok").Parse(
+		`<p style="margin:0 0 14px;">A restore of your {{ if .ResourceType }}{{ .ResourceType }} {{ end }}resource completed successfully.</p>
+<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  {{ if .RestoreID }}<tr><td style="color:#666;width:140px;">Restore</td><td><code>{{ .RestoreID }}</code></td></tr>{{ end }}
+  {{ if .BackupID }}<tr><td style="color:#666;">From backup</td><td><code>{{ .BackupID }}</code></td></tr>{{ end }}
+</table>
+<p style="margin:0 0 4px;color:#555;font-size:14px;">Your resource is back to the restored state. No further action is needed.</p>`))
+
+	bodyRestoreFailed = template.Must(template.New("b_rsfail").Parse(
+		`<p style="margin:0 0 14px;">A restore of your {{ if .ResourceType }}{{ .ResourceType }} {{ end }}resource failed to complete.</p>
+<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  {{ if .RestoreID }}<tr><td style="color:#666;width:140px;">Restore</td><td><code>{{ .RestoreID }}</code></td></tr>{{ end }}
+  {{ if .BackupID }}<tr><td style="color:#666;">From backup</td><td><code>{{ .BackupID }}</code></td></tr>{{ end }}
+  {{ if .ErrorSummary }}<tr><td style="color:#666;">Error</td><td>{{ .ErrorSummary }}</td></tr>{{ end }}
+</table>
+<p style="margin:0 0 4px;">Your resource was not modified. You can retry the restore from your dashboard. If this keeps happening, reply to this email.</p>`))
+
+	bodyDeployFailed = template.Must(template.New("b_depfail").Parse(
+		`<p style="margin:0 0 14px;">Your instanode deployment failed{{ if .FailureStage }} at the {{ .FailureStage }} stage{{ end }}.</p>
+<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  {{ if .DeployID }}<tr><td style="color:#666;width:140px;">Deployment</td><td><code>{{ .DeployID }}</code></td></tr>{{ end }}
+  {{ if .FailureStage }}<tr><td style="color:#666;">Stage</td><td>{{ .FailureStage }}</td></tr>{{ end }}
+  {{ if .ErrorSummary }}<tr><td style="color:#666;">Error</td><td>{{ .ErrorSummary }}</td></tr>{{ end }}
+</table>
+<p style="margin:0 0 4px;">Open your dashboard for the full build log, fix the issue, and redeploy.</p>`))
 )
 
 // ── Body view structs — flat, compiler-checked field references ───────────
@@ -240,6 +296,15 @@ type viewDeployMadePermanent struct{ Source string }
 type viewDeployDeletionConfirmed struct{ FreedAt string }
 type viewDigestWeekly struct{ TeamName, TotalActiveResources string }
 type viewResourceQuota struct{ ResourceType, Name string }
+
+// ── W2 view structs ───────────────────────────────────────────────────────
+type viewPaymentGraceStarted struct{ ExpiresAt string }
+type viewPaymentGraceReminder struct{ HoursRemaining, GraceEndsAt string }
+type viewPaymentGraceRecovered struct{ RecoveredAt string }
+type viewPaymentGraceTerminated struct{ GraceEndsAt string }
+type viewBackupFailed struct{ ResourceType, BackupID, ErrorSummary string }
+type viewRestoreResult struct{ ResourceType, RestoreID, BackupID, ErrorSummary string }
+type viewDeployFailed struct{ DeployID, FailureStage, ErrorSummary string }
 
 // ── Render helpers ────────────────────────────────────────────────────────
 
@@ -670,6 +735,191 @@ func renderResourceQuotaUnsuspended(params map[string]string) (string, string, s
 		Heading: heading,
 		Body: "Your " + rtype + " resource " + name + " is active again — storage usage is back under its limit " +
 			"and access has been restored. No action is needed.",
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// ── W2 renderers — dunning, admin-cancel, backup/restore, deploy ──────────
+//
+// Each pairs with the builder of the same kind in event_email_mapping.go.
+// None is an expiry kind — the subjects say what actually happened.
+
+// renderPaymentGraceStarted — pairs with buildPaymentGraceStarted
+// (payment.grace_started). The first dunning email — a customer whose card
+// failed previously got NO notification at all (P1-W2-01).
+func renderPaymentGraceStarted(params map[string]string) (string, string, string) {
+	subject := "Action needed — your instanode payment failed"
+	heading := "We couldn't process your payment"
+	body := renderBody(bodyPaymentGraceStarted, viewPaymentGraceStarted{
+		ExpiresAt: params["expires_at"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Update payment method", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "We couldn't process your most recent instanode payment. Your account has entered a 7-day grace period. Update your payment method before it ends to keep your resources running.",
+		CTALabel: "Update payment method", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderPaymentGraceReminder — pairs with buildPaymentGraceReminder
+// (payment.grace_reminder).
+func renderPaymentGraceReminder(params map[string]string) (string, string, string) {
+	subject := "Reminder — update your instanode payment method"
+	heading := "Your payment is still pending"
+	body := renderBody(bodyPaymentGraceReminder, viewPaymentGraceReminder{
+		HoursRemaining: params["hours_remaining"], GraceEndsAt: params["grace_ends_at"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Update payment method", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "Your instanode account is still in a payment grace period. Update your payment method now to avoid termination of your subscription and your resources.",
+		CTALabel: "Update payment method", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderPaymentGraceRecovered — pairs with buildPaymentGraceRecovered
+// (payment.grace_recovered).
+func renderPaymentGraceRecovered(params map[string]string) (string, string, string) {
+	subject := "Your instanode payment went through"
+	heading := "You're back in good standing"
+	body := renderBody(bodyPaymentGraceRecovered, viewPaymentGraceRecovered{
+		RecoveredAt: params["recovered_at"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "Good news — your instanode payment went through and your account is back in good standing. No further action is needed.",
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderPaymentGraceTerminated — pairs with buildPaymentGraceTerminated
+// (payment.grace_terminated).
+func renderPaymentGraceTerminated(params map[string]string) (string, string, string) {
+	subject := "Your instanode subscription has been terminated"
+	heading := "Your subscription was terminated"
+	body := renderBody(bodyPaymentGraceTerminated, viewPaymentGraceTerminated{
+		GraceEndsAt: params["grace_ends_at"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Resubscribe", CTAURL: pricingURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "Your instanode subscription has been terminated because the payment grace period ended without a successful payment. You can resubscribe at any time to restore access.",
+		CTALabel: "Resubscribe", CTAURL: pricingURL,
+	})
+	return subject, html, text
+}
+
+// renderSubscriptionCanceledByAdmin — pairs with buildSubscriptionCanceledByAdmin
+// (subscription.canceled_by_admin). Distinct from the customer-initiated
+// subscription.canceled email — this copy says "by support" (P1-W2-02).
+func renderSubscriptionCanceledByAdmin(params map[string]string) (string, string, string) {
+	subject := "Your instanode subscription was cancelled by support"
+	heading := "Subscription cancelled by support"
+	body := renderBody(bodySubscriptionCanceledByAdmin, struct{}{})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Resubscribe", CTAURL: pricingURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "Your instanode subscription has been cancelled by our support team. Your data isn't deleted immediately — you can resubscribe any time. If you didn't request this, reply to this email.",
+		CTALabel: "Resubscribe", CTAURL: pricingURL,
+	})
+	return subject, html, text
+}
+
+// renderBackupFailed — pairs with buildBackupFailed (backup.failed).
+func renderBackupFailed(params map[string]string) (string, string, string) {
+	rtype := orDefault(params["resource_type"], "resource")
+	subject := "An instanode backup of your " + rtype + " failed"
+	heading := "Backup failed"
+	body := renderBody(bodyBackupFailed, viewBackupFailed{
+		ResourceType: params["resource_type"], BackupID: params["backup_id"], ErrorSummary: params["error_summary"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "A backup of your " + rtype + " resource failed to complete. No data was lost — only the backup did not complete. You can trigger a new backup from your dashboard.",
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderRestoreSucceeded — pairs with buildRestoreSucceeded (restore.succeeded).
+func renderRestoreSucceeded(params map[string]string) (string, string, string) {
+	rtype := orDefault(params["resource_type"], "resource")
+	subject := "Your instanode " + rtype + " restore completed"
+	heading := "Restore completed"
+	body := renderBody(bodyRestoreSucceeded, viewRestoreResult{
+		ResourceType: params["resource_type"], RestoreID: params["restore_id"], BackupID: params["backup_id"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "A restore of your " + rtype + " resource completed successfully. Your resource is back to the restored state. No further action is needed.",
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderRestoreFailed — pairs with buildRestoreFailed (restore.failed).
+func renderRestoreFailed(params map[string]string) (string, string, string) {
+	rtype := orDefault(params["resource_type"], "resource")
+	subject := "An instanode restore of your " + rtype + " failed"
+	heading := "Restore failed"
+	body := renderBody(bodyRestoreFailed, viewRestoreResult{
+		ResourceType: params["resource_type"], RestoreID: params["restore_id"],
+		BackupID: params["backup_id"], ErrorSummary: params["error_summary"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "A restore of your " + rtype + " resource failed to complete. Your resource was not modified. You can retry the restore from your dashboard.",
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderDeployFailed — pairs with buildDeployFailed (deploy.failed).
+func renderDeployFailed(params map[string]string) (string, string, string) {
+	subject := "Your instanode deployment failed"
+	heading := "Deployment failed"
+	body := renderBody(bodyDeployFailed, viewDeployFailed{
+		DeployID: params["deploy_id"], FailureStage: params["failure_stage"], ErrorSummary: params["error_summary"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "Your instanode deployment failed. Open your dashboard for the full build log, fix the issue, and redeploy.",
 		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
 	})
 	return subject, html, text
