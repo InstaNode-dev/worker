@@ -184,38 +184,42 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 		// the last 50 minutes. The hourly cron tick PLUS RunOnStart=true
 		// can fire two ticks back-to-back at worker startup — without this
 		// guard a restart would double-insert.
-		var existed bool
-		if dedupErr := w.db.QueryRowContext(ctx, `
-			SELECT EXISTS (
+		//
+		// P2-W4 (BugBash 2026-05-18): the prior code did a separate
+		// SELECT EXISTS … check followed by an unconditional INSERT — a
+		// check-then-act TOCTOU. Two ticks (or two worker pods before the
+		// River UniqueOpts guard, or RunOnStart racing the periodic tick)
+		// could both observe existed=false and both INSERT, scheduling a
+		// duplicate backup. The fix folds the dedupe into the INSERT
+		// itself: `INSERT … SELECT … WHERE NOT EXISTS (…)`. The whole
+		// statement is one atomic round-trip — Postgres evaluates the
+		// NOT EXISTS and the INSERT under a single snapshot, so a losing
+		// concurrent tick inserts 0 rows. RETURNING + RowsAffected tells
+		// us which arm won. A query-level failure still fails open by
+		// design: we log and skip the row (no insert) rather than risk an
+		// unbounded retry pile-up.
+		res, insErr := w.db.ExecContext(ctx, `
+			INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup)
+			SELECT $1, 'pending', 'scheduled', $2
+			WHERE NOT EXISTS (
 				SELECT 1 FROM resource_backups
 				WHERE resource_id = $1
 				  AND backup_kind = 'scheduled'
 				  AND created_at > now() - INTERVAL '50 minutes'
 			)
-		`, rid).Scan(&existed); dedupErr != nil {
-			slog.Warn("jobs.customer_backup_scheduler.dedup_check_failed",
-				"resource_id", c.id,
-				"error", dedupErr,
-			)
-			// On dedup-check failure we fail open by inserting — duplicate
-			// backups are wasteful but not data-corrupting. The runner
-			// will pick up both rows; the retention sweep will drop the
-			// extra eventually.
-		}
-		if existed {
-			skippedDedup++
-			continue
-		}
-
-		if _, insErr := w.db.ExecContext(ctx, `
-			INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup)
-			VALUES ($1, 'pending', 'scheduled', $2)
-		`, rid, c.tier); insErr != nil {
+		`, rid, c.tier)
+		if insErr != nil {
 			slog.Error("jobs.customer_backup_scheduler.insert_failed",
 				"resource_id", c.id,
 				"tier", c.tier,
 				"error", insErr,
 			)
+			continue
+		}
+		// RowsAffected == 0 means the NOT EXISTS arm matched — a recent
+		// scheduled row already exists, so this tick is a deduped no-op.
+		if n, raErr := res.RowsAffected(); raErr == nil && n == 0 {
+			skippedDedup++
 			continue
 		}
 		inserted++

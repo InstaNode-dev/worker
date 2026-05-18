@@ -745,14 +745,24 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),
-		// Expiry reminder — hourly sweep that emails owners of claimed-but-unpaid
-		// (tier='free') resources whose expires_at is inside the next 4 hours.
-		// Dedupe lives in the DB (resources.expiry_reminded_at) so one row gets
-		// at most one email no matter how many ticks see it. See expiry_reminder.go.
+		// Expiry reminder — 30-minute sweep that emails owners of
+		// claimed-but-unpaid (tier='free') resources whose expires_at is
+		// inside the 12h / 6h / 1h stage windows. Dedupe lives in the DB
+		// (resources.reminders_sent CAS) so one (resource, stage) gets at
+		// most one email no matter how many ticks see it.
+		//
+		// P2-11 (BugBash 2026-05-18): the cadence MUST be 30 min, not 1h.
+		// The tightest stage window is (1h, 0h] — exactly one hour wide.
+		// At an hourly tick a single missed/late tick (worker restart,
+		// River backlog) drops the final 1h urgent reminder entirely. A
+		// 30-minute cadence guarantees at least two ticks observe every
+		// stage window, so a single missed tick can't drop a stage. The
+		// 30-min reminderCooldown floor in expiry_reminder.go still
+		// prevents two ticks from double-firing the same resource.
 		river.NewPeriodicJob(
-			river.PeriodicInterval(1*time.Hour),
+			river.PeriodicInterval(expiryReminderInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return ExpiryReminderArgs{}, periodicInsertOpts(1 * time.Hour)
+				return ExpiryReminderArgs{}, periodicInsertOpts(expiryReminderInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
 		),

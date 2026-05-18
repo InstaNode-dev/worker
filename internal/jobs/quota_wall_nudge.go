@@ -366,6 +366,17 @@ func (w *QuotaWallNudgeWorker) evaluateTeam(ctx context.Context, teamID uuid.UUI
 // insertNearWallRow writes a single audit_log row with kind=near_quota_wall.
 // Summary text is rendered verbatim by the dashboard (audit.go contract),
 // so we keep it to known-safe values (tier, axis, integers).
+//
+// P2-W2-09 (BugBash 2026-05-18): the row MUST carry resource_type. The
+// prior INSERT omitted the column, so every near_quota_wall row landed
+// with resource_type=NULL — and the NR dashboards / api filters that
+// slice audit_log by resource_type silently dropped them. The storage
+// and connections axes are per-service (wallHit.Service is the
+// postgres/redis/mongodb type that hit the wall), so resource_type is
+// set from hit.Service. The provisions axis is service-agnostic
+// (Service==""), so it stays NULL there — a NULL on that axis is
+// correct, not a bug, and is written via NULLIF so the column is a
+// genuine NULL rather than an empty string the filters also miss.
 func (w *QuotaWallNudgeWorker) insertNearWallRow(ctx context.Context, teamID uuid.UUID, hit *wallHit) error {
 	metaBytes, err := json.Marshal(hit)
 	if err != nil {
@@ -376,9 +387,9 @@ func (w *QuotaWallNudgeWorker) insertNearWallRow(ctx context.Context, teamID uui
 		hit.PercentUsed, hit.Tier, hit.Axis,
 	)
 	_, err = w.db.ExecContext(ctx, `
-		INSERT INTO audit_log (team_id, actor, kind, summary, metadata)
-		VALUES ($1, $2, $3, $4, $5)
-	`, teamID, quotaWallActor, quotaWallKind, summary, metaBytes)
+		INSERT INTO audit_log (team_id, actor, kind, summary, metadata, resource_type)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
+	`, teamID, quotaWallActor, quotaWallKind, summary, metaBytes, hit.Service)
 	if err != nil {
 		return fmt.Errorf("insertNearWallRow exec: %w", err)
 	}

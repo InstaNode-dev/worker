@@ -129,6 +129,11 @@ func TestRunner_HappyPath(t *testing.T) {
 	plainConn := "postgres://u:p@host/db"
 	encConn := encryptForTest(t, plainConn)
 
+	// P2-W4: stuck-row recovery runs first every tick — reset orphaned
+	// 'running' rows back to 'pending'. Here it touches nothing.
+	mock.ExpectExec(`UPDATE resource_backups\s+SET status = 'pending'`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
 	// SELECT pending — one row.
 	mock.ExpectQuery(`SELECT b.id::text, b.resource_id::text, b.tier_at_backup`).
 		WithArgs(backupBatchSize).
@@ -255,6 +260,10 @@ func TestRunner_PgDumpFails_MarksFailed(t *testing.T) {
 	teamID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
 	encConn := encryptForTest(t, "postgres://u:p@host/db")
 
+	// P2-W4: stuck-row recovery runs first every tick.
+	mock.ExpectExec(`UPDATE resource_backups\s+SET status = 'pending'`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
 	mock.ExpectQuery(`SELECT b.id::text`).
 		WithArgs(backupBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -319,6 +328,10 @@ func TestRunner_ClaimRace_SkipsSilently(t *testing.T) {
 	teamID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
 	encConn := encryptForTest(t, "postgres://u:p@host/db")
 
+	// P2-W4: stuck-row recovery runs first every tick.
+	mock.ExpectExec(`UPDATE resource_backups\s+SET status = 'pending'`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
 	mock.ExpectQuery(`SELECT b.id::text`).
 		WithArgs(backupBatchSize).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -354,6 +367,58 @@ func TestRunner_ClaimRace_SkipsSilently(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRunner_RecoversStuckRunningRows pins BugBash P2-W4: every Work()
+// tick MUST first reset backup rows orphaned at status='running' (a
+// runner pod killed after the atomic claim but before finalize) back to
+// 'pending'. Without it the row is unreachable forever — the pending
+// sweep only selects status='pending' — and a manual backup is silently
+// lost. The recovery UPDATE is gated on started_at older than the
+// per-run timeout so a genuinely in-flight backup is never reclaimed.
+func TestRunner_RecoversStuckRunningRows(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// The stuck-row recovery UPDATE — reports it reset 2 orphaned rows.
+	// It MUST run before the pending-row SELECT.
+	mock.ExpectExec(`UPDATE resource_backups\s+SET status = 'pending'`).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+
+	// Pending sweep finds nothing else this tick.
+	mock.ExpectQuery(`SELECT b.id::text`).
+		WithArgs(backupBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "resource_id", "tier_at_backup", "backup_kind",
+			"token", "connection_url", "resource_type", "team_id",
+		}))
+
+	// Retention sweep still loops the five tier names.
+	for i := 0; i < 5; i++ {
+		mock.ExpectQuery(`SELECT id::text, s3_key\s+FROM resource_backups`).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "s3_key"}))
+	}
+
+	w := &CustomerBackupRunnerWorker{
+		db:      db,
+		store:   newFakeBackupStore(),
+		pgDump:  &fakePgDump{payload: []byte("x")},
+		bucket:  "instant-shared",
+		prefix:  "backups",
+		aesKey:  testAESKeyHex,
+		now:     time.Now,
+		timeout: time.Minute,
+		batchN:  backupBatchSize,
+	}
+	if err := w.Work(context.Background(), fakeRunnerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("stuck-row recovery did not run before the pending sweep — P2-W4 regressed: %v", err)
 	}
 }
 

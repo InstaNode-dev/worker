@@ -140,6 +140,16 @@ var deployNotifyResolver = func(host string) ([]net.IP, error) {
 	return net.LookupIP(host)
 }
 
+// errDeployNotifyTransient marks a validation failure that is NOT the
+// customer's fault and may succeed on a later tick — currently only a
+// DNS resolution failure. W3 T3 (BugBash 2026-05-18): a transient failure
+// must NOT advance the cursor (the row would be silently lost from the
+// backlog); a permanent failure (bad scheme, private-IP literal, no
+// hostname) advances the cursor so a misconfigured URL can't wedge the
+// queue forever. validateDeployNotifyURL wraps the DNS-failure error
+// with this sentinel; the dispatch loop checks errors.Is against it.
+var errDeployNotifyTransient = errors.New("deploy_notify URL validation failed transiently")
+
 // deployNotifyAuditRow is the projection the dispatcher reads — only the
 // columns we need to build the outbound payload.
 type deployNotifyAuditRow struct {
@@ -316,7 +326,23 @@ func (w *DeployNotifyWebhookWorker) Work(ctx context.Context, job *river.Job[Dep
 			continue
 		}
 
-		if vErr := validateDeployNotifyURL(webhookURL); vErr != nil {
+		vettedIPs, vErr := validateDeployNotifyURL(webhookURL)
+		if vErr != nil {
+			// W3 T3: a transient validation failure (DNS hiccup) must
+			// NOT advance the cursor — the URL is fine, the lookup just
+			// failed, and advancing would silently drop the row from the
+			// backlog. Leave the cursor put and retry next tick. A
+			// permanent rejection (bad scheme / private IP) DOES advance
+			// so a misconfigured URL can't wedge the queue forever.
+			if errors.Is(vErr, errDeployNotifyTransient) {
+				slog.Warn("jobs.deploy_notify_webhook.url_validation_transient",
+					"audit_id", row.ID,
+					"team_id", row.TeamID,
+					"error", vErr,
+					"note", "transient (DNS) failure — cursor held, will retry",
+				)
+				continue
+			}
 			slog.Warn("jobs.deploy_notify_webhook.url_rejected",
 				"audit_id", row.ID,
 				"team_id", row.TeamID,
@@ -357,7 +383,7 @@ func (w *DeployNotifyWebhookWorker) Work(ctx context.Context, job *river.Job[Dep
 			continue
 		}
 
-		sendErr := w.dispatch(ctx, webhookURL, row.ID, body)
+		sendErr := w.dispatch(ctx, webhookURL, vettedIPs, row.ID, body)
 		if sendErr != nil {
 			slog.Warn("jobs.deploy_notify_webhook.delivery_failed",
 				"audit_id", row.ID,
@@ -477,7 +503,34 @@ func (w *DeployNotifyWebhookWorker) lookupWebhookURL(ctx context.Context, teamID
 // dispatch performs the HTTP POST with retry + budget. Returns nil on a
 // 2xx response. Returns an error after deployNotifyMaxAttempts or after
 // deployNotifyTotalBudget elapses, whichever first.
-func (w *DeployNotifyWebhookWorker) dispatch(ctx context.Context, urlStr, auditID string, body []byte) error {
+//
+// vettedIPs are the addresses validateDeployNotifyURL resolved and
+// SSRF-checked. dispatch PINS the outbound connection to exactly those
+// IPs (W3 T3 SSRF-TOCTOU fix) so the http.Client cannot re-resolve the
+// hostname at connect time and get rebound onto a private address.
+//
+// The pin is installed only when the worker's httpCli carries the
+// default (nil) Transport — the production path. When a caller injected
+// a custom Transport (the test harness redirecting to an httptest
+// server), that Transport is preserved so the test's dial-hijack still
+// works; tests exercise the SSRF gate via validateDeployNotifyURL
+// directly and via deployNotifyResolver stubs.
+func (w *DeployNotifyWebhookWorker) dispatch(ctx context.Context, urlStr string, vettedIPs []net.IP, auditID string, body []byte) error {
+	pinnedCli := &http.Client{
+		Timeout:       w.httpCli.Timeout,
+		CheckRedirect: w.httpCli.CheckRedirect,
+	}
+	if w.httpCli.Transport != nil {
+		// A custom Transport was injected (test harness) — keep it as-is.
+		pinnedCli.Transport = w.httpCli.Transport
+	} else {
+		// Production path — pin the dialer to the SSRF-vetted IPs.
+		pinnedCli.Transport = &http.Transport{
+			DialContext:         pinnedIPDialContext(vettedIPs),
+			TLSHandshakeTimeout: deployNotifyPerAttemptTimeout,
+		}
+	}
+
 	deadline := time.Now().Add(deployNotifyTotalBudget)
 	var lastErr error
 	for attempt := 1; attempt <= deployNotifyMaxAttempts; attempt++ {
@@ -492,7 +545,7 @@ func (w *DeployNotifyWebhookWorker) dispatch(ctx context.Context, urlStr, auditI
 		req.Header.Set("Idempotency-Key", auditID)
 		req.Header.Set("User-Agent", "instanode-deploy-notify/1")
 
-		resp, doErr := w.httpCli.Do(req)
+		resp, doErr := pinnedCli.Do(req)
 		if doErr != nil {
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, doErr)
 		} else {
@@ -563,45 +616,84 @@ func metaString(raw []byte, key string) string {
 	return fmt.Sprint(v)
 }
 
-// validateDeployNotifyURL is the SSRF + scheme gate. Pure function
-// other than the DNS lookup via deployNotifyResolver. Mirrors
+// validateDeployNotifyURL is the SSRF + scheme gate. Mirrors
 // api/internal/handlers/deploy_webhook_notify.go::validateNotifyWebhookURL.
 // Re-applied at dispatch time so a vault entry that was edited after
 // the original write-time validation can't ride past us.
-func validateDeployNotifyURL(raw string) error {
+//
+// Returns the set of vetted IPs the host resolved to so the caller can
+// PIN the outbound connection to exactly those addresses — see
+// pinnedIPDialContext. W3 T3 (BugBash 2026-05-18): without pinning, the
+// gate resolves DNS once and dispatch's http.Client resolves it AGAIN at
+// connect time — a DNS-rebind attacker returns a public IP to the gate
+// and a private IP (169.254.169.254, a tenant DB pod) to the connect.
+// Pinning the dialer to the gate-vetted IPs closes that TOCTOU window.
+//
+// A DNS-resolution failure is wrapped with errDeployNotifyTransient so
+// the caller can avoid advancing the cursor on a correctable hiccup.
+func validateDeployNotifyURL(raw string) ([]net.IP, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("deploy_notify URL is not a valid URL")
+		return nil, fmt.Errorf("deploy_notify URL is not a valid URL")
 	}
 	if u.Scheme != "https" {
-		return fmt.Errorf("deploy_notify URL must use https:// (got %q)", u.Scheme)
+		return nil, fmt.Errorf("deploy_notify URL must use https:// (got %q)", u.Scheme)
 	}
 	host := u.Hostname()
 	if host == "" {
-		return fmt.Errorf("deploy_notify URL is missing a hostname")
+		return nil, fmt.Errorf("deploy_notify URL is missing a hostname")
 	}
 	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
-		return fmt.Errorf("deploy_notify hostname is not publicly routable")
+		return nil, fmt.Errorf("deploy_notify hostname is not publicly routable")
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		if isBlockedDeployNotifyIP(ip) {
-			return fmt.Errorf("deploy_notify IP is in a blocked range")
+			return nil, fmt.Errorf("deploy_notify IP is in a blocked range")
 		}
-		return nil
+		return []net.IP{ip}, nil
 	}
 	ips, err := deployNotifyResolver(host)
 	if err != nil {
-		return fmt.Errorf("deploy_notify hostname does not resolve")
+		// DNS hiccup — transient. Wrap so the caller leaves the cursor put.
+		return nil, fmt.Errorf("deploy_notify hostname does not resolve: %w", errDeployNotifyTransient)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("deploy_notify hostname has no A/AAAA records")
+		return nil, fmt.Errorf("deploy_notify hostname has no A/AAAA records")
 	}
 	for _, ip := range ips {
 		if isBlockedDeployNotifyIP(ip) {
-			return fmt.Errorf("deploy_notify hostname resolves to a private/loopback/link-local IP")
+			return nil, fmt.Errorf("deploy_notify hostname resolves to a private/loopback/link-local IP")
 		}
 	}
-	return nil
+	return ips, nil
+}
+
+// pinnedIPDialContext returns a DialContext that ignores DNS for the
+// connection and dials only the supplied (already-vetted) IPs, trying
+// each in turn. The original port from the address is preserved. This
+// is the SSRF-TOCTOU fix (W3 T3): dispatch connects to exactly the IPs
+// validateDeployNotifyURL vetted, so a between-check-and-connect DNS
+// rebind cannot redirect the POST to a private address.
+func pinnedIPDialContext(ips []net.IP) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("pinnedIPDialContext: bad addr %q: %w", addr, err)
+		}
+		d := net.Dialer{Timeout: deployNotifyPerAttemptTimeout}
+		var lastErr error
+		for _, ip := range ips {
+			conn, dErr := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if dErr == nil {
+				return conn, nil
+			}
+			lastErr = dErr
+		}
+		if lastErr == nil {
+			lastErr = errors.New("pinnedIPDialContext: no vetted IPs to dial")
+		}
+		return nil, lastErr
+	}
 }
 
 // isBlockedDeployNotifyIP returns true if ip is in any range we refuse
