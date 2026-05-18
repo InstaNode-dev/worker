@@ -197,6 +197,21 @@ func (w *UptimeProberWorker) Work(ctx context.Context, _ *river.Job[UptimeProber
 	// stuck dial won't hang here past uptimeProbeTimeout.
 	for i := 0; i < len(probes); i++ {
 		r := <-resCh
+		// P2-W5 (BugBash 2026-05-18): the panic-recovery branch above
+		// emits a sentinel result with slug == "" so the collector loop
+		// still receives a value for every probe. That sentinel must NOT
+		// be written to uptime_samples — component_slug has a foreign key
+		// to service_components, and "" matches no seeded component, so
+		// the INSERT fails with a FK violation. The failure was logged
+		// at WARN, which silently masked the underlying probe panic
+		// (the panic itself is already surfaced via LogRecoveredPanic).
+		// Skip the empty-slug sentinel: there is no real component to
+		// record a sample for.
+		if r.slug == "" {
+			slog.Warn("jobs.uptime_prober.probe_panicked_no_sample",
+				"note", "probe panicked — sentinel result skipped, no uptime_samples row written")
+			continue
+		}
 		if err := w.insertSample(ctx, r.slug, r.healthy, r.latencyMs); err != nil {
 			// Log but continue — losing one row this tick is
 			// recoverable; the next tick will write again.

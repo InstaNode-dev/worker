@@ -26,6 +26,12 @@ package jobs
 //   (6h,  1h]  → stage 2 ("Halfway, 6h to go")
 //   (1h,   0]  → stage 3 ("Final, 1h to go")
 //
+// The stage is chosen by TIME BUCKET, then the CAS fast-forwards
+// reminders_sent to that stage's index — so a short-TTL resource
+// created already inside a tighter window gets a correctly-labelled
+// reminder (and skips the earlier stages) rather than a mislabelled
+// "12h to go" email. See selectStage (P2-12, BugBash 2026-05-18).
+//
 // Email channel: this worker does NOT call the email provider
 // directly. It writes one anon.expiry_warning audit_log row per
 // stage. event_email_forwarder.go drains the row on its next 60s
@@ -64,30 +70,36 @@ func (ExpiryReminderArgs) Kind() string { return "expiry_reminder" }
 
 // reminderStage describes one bucket in the 12h/6h/1h schedule.
 type reminderStage struct {
-	index          int           // 1-based; matches reminder_index in the email
-	expiresWithin  time.Duration // resource fires this stage when expires_at <= now + expiresWithin
-	mustHaveSent   int           // CAS guard: only fire if reminders_sent == this value
-	label          string        // logging label, also flows into the email as stage_label
+	index         int           // 1-based; matches reminder_index in the email
+	expiresWithin time.Duration // resource fires this stage when expires_at <= now + expiresWithin
+	label         string        // logging label, also flows into the email as stage_label
 }
 
 // reminderSchedule is the canonical stage table. Ordered most-distant
-// to most-imminent so a single sweep can detect & advance every stage
-// a resource is eligible for. In practice one tick fires at most one
-// stage per resource because the sweep cadence (30 min) is denser
-// than the gap between stages.
+// to most-imminent. selectStage picks the MOST IMMINENT window the
+// resource currently falls in (time-bucket-first) — see P2-12 below.
 var reminderSchedule = []reminderStage{
-	{index: 1, expiresWithin: 12 * time.Hour, mustHaveSent: 0, label: "stage_12h"},
-	{index: 2, expiresWithin: 6 * time.Hour, mustHaveSent: 1, label: "stage_6h"},
-	{index: 3, expiresWithin: 1 * time.Hour, mustHaveSent: 2, label: "stage_1h"},
+	{index: 1, expiresWithin: 12 * time.Hour, label: "stage_12h"},
+	{index: 2, expiresWithin: 6 * time.Hour, label: "stage_6h"},
+	{index: 3, expiresWithin: 1 * time.Hour, label: "stage_1h"},
 }
 
 // reminderCooldown is the minimum wall-clock gap between two
 // dispatches on the same resource. Belt-and-braces — the CAS on
-// mustHaveSent is the primary dedupe surface. The cooldown only
-// kicks in if a TTL bump pushes a resource that already received
-// stage N back into stage N+1's window before enough time has
-// elapsed.
+// reminders_sent (`reminders_sent < stage.index`) is the primary
+// dedupe surface. The cooldown only kicks in if a TTL bump pushes a
+// resource that already received stage N back into stage N+1's window
+// before enough time has elapsed.
 const reminderCooldown = 30 * time.Minute
+
+// expiryReminderInterval is the periodic dispatch cadence for the
+// expiry-reminder sweep (workers.go). P2-11 (BugBash 2026-05-18): it
+// is deliberately 30 min — HALF the width of the tightest stage
+// window (1h, 0h]. At a 1h cadence that final stage was exactly one
+// tick wide, so a single missed tick dropped the urgent reminder. At
+// 30 min every stage window is seen by ≥2 ticks; the reminderCooldown
+// floor still prevents the second tick from double-firing.
+const expiryReminderInterval = 30 * time.Minute
 
 // ExpiryReminderWorker scans every sweep for free-tier resources
 // whose expires_at falls inside any of the configured stage
@@ -216,16 +228,43 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 
 		hoursRemaining := hoursLeft(r.expiresAt, now)
 
-		// CAS-advance: only stamp if reminders_sent is still at the
-		// expected predecessor value. Two concurrent sweeps can't both
-		// satisfy this for the same resource — exactly one wins.
+		// P2-14 (BugBash 2026-05-18): the recipient check MUST run BEFORE
+		// the CAS UPDATE. The prior order stamped reminders_sent first,
+		// then checked ownerEmail — so an owner-less team (no is_primary
+		// user) burned all 3 stages of its counter with zero emails sent.
+		// If an owner is later added to the team, every consumed stage is
+		// permanently unrecoverable because the CAS guard
+		// (`reminders_sent = mustHaveSent`) can never match again.
+		// Checking the recipient first means an owner-less resource is
+		// left untouched: the stage stays available for a future owner.
+		// A team with no primary user is a transient pre-signup / orphan
+		// state, not a terminal one — we must not consume reminder budget
+		// against an address that doesn't exist yet.
+		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
+			slog.Warn("jobs.expiry_reminder.no_owner_email",
+				"resource_id", r.resourceID.String(),
+				"stage", stage.label,
+				"note", "no email recipient — stage left unconsumed for a future owner",
+			)
+			skipped++
+			continue
+		}
+
+		// CAS-advance: fast-forward reminders_sent to the bucketed
+		// stage.index. P2-12 (BugBash 2026-05-18): the guard is
+		// `reminders_sent < $3` (not `= mustHaveSent`) so a short-TTL
+		// resource that jumped straight into stage 2 or 3 stamps the
+		// counter to the bucketed index, consuming the skipped earlier
+		// stages in one move. The `<` comparison still gives a clean CAS:
+		// two concurrent sweeps cannot both satisfy `reminders_sent < N`
+		// AND set it to N — exactly one wins, the loser matches 0 rows.
 		stampRes, stampErr := w.db.ExecContext(ctx, `
 			UPDATE resources
 			SET reminders_sent = $1,
 			    last_reminder_at = now(),
 			    expiry_reminded_at = COALESCE(expiry_reminded_at, now())
-			WHERE id = $2 AND reminders_sent = $3
-		`, stage.index, r.resourceID, stage.mustHaveSent)
+			WHERE id = $2 AND reminders_sent < $1
+		`, stage.index, r.resourceID)
 		if stampErr != nil {
 			slog.Error("jobs.expiry_reminder.stamp_failed",
 				"resource_id", r.resourceID.String(),
@@ -239,16 +278,6 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 			// Another worker advanced the counter between SELECT and
 			// UPDATE. Skip without logging an error — this is the CAS
 			// contract working correctly.
-			continue
-		}
-
-		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
-			slog.Warn("jobs.expiry_reminder.no_owner_email",
-				"resource_id", r.resourceID.String(),
-				"stage", stage.label,
-				"note", "stamp advanced; no email recipient available",
-			)
-			skipped++
 			continue
 		}
 
@@ -283,29 +312,56 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 	return nil
 }
 
-// selectStage picks the stage a row is currently eligible for, given
-// reminders_sent and time-to-expiry. Returns (stage, true) when a stage
-// matches, (_, false) otherwise.
+// selectStage picks the stage a row is currently eligible for.
 //
-// A row inside the (12h, 1h] window with reminders_sent=0 fires stage 1.
-// A row inside the (6h, 1h] window with reminders_sent=1 fires stage 2.
-// A row inside the (1h, 0] window with reminders_sent=2 fires stage 3.
-// A row inside (12h, 6h] with reminders_sent=1 is not eligible (stage 2
-// not yet reached); the next tick re-evaluates.
+// P2-12 (BugBash 2026-05-18): the stage is chosen by TIME BUCKET first,
+// then gated on reminders_sent — NOT the other way round. The prior
+// implementation required strict monotonic 0→1→2 progression
+// (`reminders_sent == mustHaveSent`), so a resource created less than
+// 6h before its TTL — already inside the (6h, 1h] or (1h, 0h] window
+// from the very first sweep — still fired stage 1 because that was the
+// only stage whose mustHaveSent matched reminders_sent=0. The email
+// then claimed "12h to go" while only ~50 min actually remained:
+// hours_remaining and stage_label disagreed.
+//
+// The fix: bucket the resource into the MOST IMMINENT stage window its
+// time-to-expiry falls in (schedule is most-distant → most-imminent, so
+// the last matching entry wins), then fire it only if reminders_sent is
+// still below that stage's index. The CAS in Work() fast-forwards
+// reminders_sent straight to stage.index, consuming any skipped earlier
+// stages. Result: a short-TTL resource gets exactly one correctly
+// labelled reminder ("1h to go"), not a mislabelled "12h" one.
+//
+// Examples:
+//   remaining 8h, reminders_sent 0 → stage 1 ("12h") — bucket (12h,6h]
+//   remaining 4h, reminders_sent 0 → stage 2 ("6h")  — skips stage 1
+//   remaining 40m, reminders_sent 0 → stage 3 ("1h") — skips 1 and 2
+//   remaining 4h, reminders_sent 2 → no stage (already past stage 2)
 func selectStage(r expiryReminderRow, now time.Time) (reminderStage, bool) {
 	remaining := r.expiresAt.Sub(now)
 	if remaining <= 0 {
 		return reminderStage{}, false
 	}
+	var bucket reminderStage
+	found := false
 	for _, s := range reminderSchedule {
-		if r.remindersSent != s.mustHaveSent {
-			continue
-		}
 		if remaining <= s.expiresWithin {
-			return s, true
+			// schedule is ordered most-distant → most-imminent, so
+			// later matches overwrite earlier ones — the final match
+			// is the tightest window the resource currently sits in.
+			bucket = s
+			found = true
 		}
 	}
-	return reminderStage{}, false
+	if !found {
+		// Outside even the widest (12h) window — too far from expiry.
+		return reminderStage{}, false
+	}
+	if r.remindersSent >= bucket.index {
+		// This stage (or a later one) was already sent — nothing to do.
+		return reminderStage{}, false
+	}
+	return bucket, true
 }
 
 // hoursLeft rounds the gap up to whole hours, with a floor of 1 so

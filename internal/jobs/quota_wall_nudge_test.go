@@ -74,8 +74,12 @@ func TestQuotaWallNudge_WritesAuditRowAtStorage80Percent(t *testing.T) {
 	// worker should not query those rows. Provisions disabled too.
 
 	// 6) audit_log INSERT — the exact write we're verifying happens.
-	mock.ExpectExec(`INSERT INTO audit_log`).
-		WithArgs(teamID, "system", "near_quota_wall", sqlmock.AnyArg(), sqlmock.AnyArg()).
+	// P2-W2-09: the row MUST carry resource_type. The storage axis fired
+	// on postgres, so the 6th arg (resource_type) is "postgres" — NULLIF
+	// keeps a real value here; only the service-agnostic provisions axis
+	// would pass "" and land NULL.
+	mock.ExpectExec(`INSERT INTO audit_log[\s\S]+resource_type`).
+		WithArgs(teamID, "system", "near_quota_wall", sqlmock.AnyArg(), sqlmock.AnyArg(), "postgres").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	plans := &mockWallPlanRegistry{

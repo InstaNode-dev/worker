@@ -142,6 +142,7 @@ type churnCandidateRow struct {
 	planTier            string
 	ownerEmail          sql.NullString
 	lastActivity        sql.NullTime
+	teamCreatedAt       time.Time
 	activeResourceCount int64
 }
 
@@ -179,12 +180,23 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 	// (MAX(activity), COUNT(resources)) plus an EXISTS NOT-clause for
 	// dedupe. The 30-day dedupe lives in the WHERE-NOT-EXISTS clause
 	// so the GROUP BY only includes teams we haven't recently flagged.
+	//
+	// P2-13 (BugBash 2026-05-18): the HAVING clause MUST tolerate a NULL
+	// MAX(a.created_at). A team that signed up and went silent on day one
+	// has ZERO matching activity rows, so MAX(a.created_at) is NULL.
+	// `NULL < $3` evaluates to NULL (treated as false) — the bare
+	// `MAX(a.created_at) < $3` predicate silently excluded the single
+	// most churn-prone cohort. The `OR MAX(a.created_at) IS NULL` arm
+	// keeps zero-activity teams in the result set; the per-row scan loop
+	// below already falls back to teams.created_at via the
+	// `lastActivity.Valid == false` branch.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT
 			t.id            AS team_id,
 			t.plan_tier     AS plan_tier,
 			COALESCE(u.email, '') AS owner_email,
 			MAX(a.created_at)     AS last_activity,
+			t.created_at          AS team_created_at,
 			COUNT(r.id)           AS active_resource_count
 		FROM teams t
 		LEFT JOIN users u ON u.team_id = t.id AND u.is_primary = true
@@ -204,8 +216,8 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 			  AND f.kind = $1
 			  AND f.created_at > $2
 		  )
-		GROUP BY t.id, t.plan_tier, u.email
-		HAVING MAX(a.created_at) < $3
+		GROUP BY t.id, t.plan_tier, t.created_at, u.email
+		HAVING (MAX(a.created_at) < $3 OR MAX(a.created_at) IS NULL)
 		  AND COUNT(r.id) > 0
 		ORDER BY MAX(a.created_at) ASC NULLS FIRST
 		LIMIT $4
@@ -219,7 +231,7 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 	for rows.Next() {
 		var r churnCandidateRow
 		var emailStr string
-		if scanErr := rows.Scan(&r.teamID, &r.planTier, &emailStr, &r.lastActivity, &r.activeResourceCount); scanErr != nil {
+		if scanErr := rows.Scan(&r.teamID, &r.planTier, &emailStr, &r.lastActivity, &r.teamCreatedAt, &r.activeResourceCount); scanErr != nil {
 			slog.Warn("jobs.churn_predictor.scan_failed", "error", scanErr)
 			continue
 		}
@@ -258,19 +270,24 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 			continue
 		}
 
-		// last_activity may be NULL — a team that has zero matching
-		// activity rows still falls past the inactivity cutoff (NULL <
-		// any timestamp is false in Postgres, so the HAVING clause
-		// would exclude these). Defensive: treat NULL as
-		// "never had activity" → very high days_since, but the SQL
-		// has already filtered them out, so this branch is essentially
-		// unreachable. Reachable only via a sqlmock test that asserts
-		// the metadata shape.
+		// last_activity may be NULL — a team that signed up and went
+		// silent on day one has zero matching activity rows, so
+		// MAX(a.created_at) is NULL. P2-13 (BugBash 2026-05-18): the
+		// HAVING clause now keeps these rows (`OR MAX(...) IS NULL`),
+		// so this branch IS reachable and must produce a sane number.
+		// Fall back to teams.created_at — "days since the team was
+		// created" is the correct inactivity measure for a team that
+		// never logged a single activity event. The prior code used
+		// the zero time.Time{}, yielding a nonsensical ~739000-day
+		// figure that leaked into the email metadata.
 		var daysSince float64
 		if r.lastActivity.Valid {
 			daysSince = math.Round(now.Sub(r.lastActivity.Time).Hours()/24*10) / 10
 		} else {
-			daysSince = math.Round(now.Sub(time.Time{}).Hours() / 24)
+			daysSince = math.Round(now.Sub(r.teamCreatedAt).Hours()/24*10) / 10
+		}
+		if daysSince < 0 {
+			daysSince = 0
 		}
 
 		summary := fmt.Sprintf(

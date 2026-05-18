@@ -40,8 +40,10 @@ const auditKindChurnRiskFlaggedLiteral = "churn.risk_flagged"
 
 // churnRowCols is the column order the worker's SELECT returns.
 // Keep in sync with churn_predictor.go::Work's SELECT projection.
+// team_created_at was added by BugBash P2-13 — it backs the
+// zero-activity-team days_since fallback.
 var churnRowCols = []string{
-	"team_id", "plan_tier", "owner_email", "last_activity", "active_resource_count",
+	"team_id", "plan_tier", "owner_email", "last_activity", "team_created_at", "active_resource_count",
 }
 
 // TestChurnPredictor_FlagsInactive8dTeam covers scenarios 1 + 7: a team
@@ -57,10 +59,11 @@ func TestChurnPredictor_FlagsInactive8dTeam(t *testing.T) {
 
 	teamID := uuid.New()
 	lastActivity := time.Now().UTC().Add(-8 * 24 * time.Hour)
+	teamCreated := time.Now().UTC().Add(-40 * 24 * time.Hour)
 
 	mock.ExpectQuery(`FROM teams t`).
 		WillReturnRows(sqlmock.NewRows(churnRowCols).
-			AddRow(teamID, "hobby", "owner@example.com", lastActivity, int64(3)))
+			AddRow(teamID, "hobby", "owner@example.com", lastActivity, teamCreated, int64(3)))
 
 	// Capture metadata via a custom argument matcher so we can decode +
 	// assert on the JSONB body.
@@ -195,10 +198,11 @@ func TestChurnPredictor_ReflagsAfter35dDedupePassed(t *testing.T) {
 
 	teamID := uuid.New()
 	lastActivity := time.Now().UTC().Add(-9 * 24 * time.Hour)
+	teamCreated := time.Now().UTC().Add(-50 * 24 * time.Hour)
 
 	mock.ExpectQuery(`FROM teams t`).
 		WillReturnRows(sqlmock.NewRows(churnRowCols).
-			AddRow(teamID, "pro", "owner@example.com", lastActivity, int64(7)))
+			AddRow(teamID, "pro", "owner@example.com", lastActivity, teamCreated, int64(7)))
 
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WithArgs(
@@ -255,12 +259,13 @@ func TestChurnPredictor_SkipsWhenNoOwnerEmail(t *testing.T) {
 
 	teamID := uuid.New()
 	lastActivity := time.Now().UTC().Add(-10 * 24 * time.Hour)
+	teamCreated := time.Now().UTC().Add(-60 * 24 * time.Hour)
 
 	// owner_email returns "" (LEFT JOIN with no user match → COALESCE
 	// emits empty string per the worker's SELECT projection).
 	mock.ExpectQuery(`FROM teams t`).
 		WillReturnRows(sqlmock.NewRows(churnRowCols).
-			AddRow(teamID, "hobby", "", lastActivity, int64(2)))
+			AddRow(teamID, "hobby", "", lastActivity, teamCreated, int64(2)))
 
 	// No INSERT expected — sqlmock strict mode fails if one fires.
 
@@ -270,6 +275,61 @@ func TestChurnPredictor_SkipsWhenNoOwnerEmail(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestChurnPredictor_FlagsZeroActivityTeam pins BugBash P2-13: a team
+// that signed up and went silent on day one has ZERO matching activity
+// rows, so the SELECT returns last_activity = NULL. The old HAVING clause
+// (`MAX(a.created_at) < $3`) silently excluded these because
+// `NULL < timestamp` is NULL/false in Postgres — dropping the single most
+// churn-prone cohort. The fixed HAVING (`OR MAX(...) IS NULL`) keeps the
+// row; the worker must flag it and compute days_since from teams.created_at
+// (not the zero time.Time{}, which produced a ~739000-day figure).
+//
+// sqlmock returns the row the (now-fixed) query would return; this test
+// asserts the worker handles a NULL last_activity row and emits a sane
+// last_activity_days_ago derived from team_created_at.
+func TestChurnPredictor_FlagsZeroActivityTeam(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	teamCreated := time.Now().UTC().Add(-20 * 24 * time.Hour)
+
+	// last_activity is NULL — the zero-activity cohort the fix targets.
+	mock.ExpectQuery(`HAVING \(MAX\(a\.created_at\) < \$3 OR MAX\(a\.created_at\) IS NULL\)`).
+		WillReturnRows(sqlmock.NewRows(churnRowCols).
+			AddRow(teamID, "hobby", "owner@example.com", nil, teamCreated, int64(2)))
+
+	var capturedMeta []byte
+	metaMatcher := &captureChurnBytesArg{out: &capturedMeta}
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(teamID, "system", auditKindChurnRiskFlaggedLiteral, sqlmock.AnyArg(), metaMatcher).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := jobs.NewChurnPredictorWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.ChurnPredictorArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("zero-activity team was not flagged — HAVING NULL fix regressed: %v", err)
+	}
+
+	var meta map[string]any
+	if err := json.Unmarshal(capturedMeta, &meta); err != nil {
+		t.Fatalf("metadata JSON unmarshal: %v (raw: %s)", err, capturedMeta)
+	}
+	days, ok := meta["last_activity_days_ago"].(float64)
+	if !ok {
+		t.Fatalf("metadata.last_activity_days_ago missing/wrong type: %T", meta["last_activity_days_ago"])
+	}
+	// Falls back to teams.created_at (~20 days ago), NOT the zero time.
+	if days < 19.5 || days > 20.5 {
+		t.Errorf("metadata.last_activity_days_ago = %v, want ~20.0 (from team_created_at fallback)", days)
 	}
 }
 
@@ -307,11 +367,12 @@ func TestChurnPredictor_FailOpenOnInsertError(t *testing.T) {
 	team1, team2 := uuid.New(), uuid.New()
 	la1 := time.Now().UTC().Add(-9 * 24 * time.Hour)
 	la2 := time.Now().UTC().Add(-12 * 24 * time.Hour)
+	tc := time.Now().UTC().Add(-60 * 24 * time.Hour)
 
 	mock.ExpectQuery(`FROM teams t`).
 		WillReturnRows(sqlmock.NewRows(churnRowCols).
-			AddRow(team1, "hobby", "a@example.com", la1, int64(1)).
-			AddRow(team2, "pro", "b@example.com", la2, int64(4)))
+			AddRow(team1, "hobby", "a@example.com", la1, tc, int64(1)).
+			AddRow(team2, "pro", "b@example.com", la2, tc, int64(4)))
 
 	// First INSERT fails — the second one must still happen.
 	mock.ExpectExec(`INSERT INTO audit_log`).

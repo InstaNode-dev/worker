@@ -328,26 +328,46 @@ func TestValidateDeployNotifyURL_BlocksPrivateAndScheme(t *testing.T) {
 	}
 
 	cases := []struct {
-		name      string
-		url       string
+		name string
+		url  string
+		// wantError: validation must fail.
 		wantError bool
+		// wantTransient: the failure must be classified transient
+		// (errDeployNotifyTransient) so the dispatch loop holds the
+		// cursor. Only meaningful when wantError is true.
+		wantTransient bool
+		// wantIPs: expected count of vetted IPs returned on success.
+		wantIPs int
 	}{
-		{"http rejected", "http://public.example.test/hook", true},
-		{"localhost literal rejected", "https://localhost/hook", true},
-		{"loopback ip literal rejected", "https://127.0.0.1/hook", true},
-		{"rfc1918 literal rejected", "https://10.0.0.1/hook", true},
-		{"link-local rejected", "https://169.254.169.254/hook", true},
-		{"private dns rejected", "https://private.example.test/hook", true},
-		{"metadata dns rejected", "https://metadata.example.test/hook", true},
-		{"mixed dns rejected", "https://mixed.example.test/hook", true},
-		{"public ok", "https://public.example.test/hook", false},
-		{"public ip literal ok", "https://8.8.8.8/hook", false},
+		{name: "http rejected", url: "http://public.example.test/hook", wantError: true},
+		{name: "localhost literal rejected", url: "https://localhost/hook", wantError: true},
+		{name: "loopback ip literal rejected", url: "https://127.0.0.1/hook", wantError: true},
+		{name: "rfc1918 literal rejected", url: "https://10.0.0.1/hook", wantError: true},
+		{name: "link-local rejected", url: "https://169.254.169.254/hook", wantError: true},
+		{name: "private dns rejected", url: "https://private.example.test/hook", wantError: true},
+		{name: "metadata dns rejected", url: "https://metadata.example.test/hook", wantError: true},
+		{name: "mixed dns rejected", url: "https://mixed.example.test/hook", wantError: true},
+		// W3 T3: an unresolvable host is a TRANSIENT failure — must be
+		// tagged errDeployNotifyTransient so the cursor is held, not advanced.
+		{name: "nxdomain is transient", url: "https://nope.example.test/hook", wantError: true, wantTransient: true},
+		{name: "public ok", url: "https://public.example.test/hook", wantIPs: 1},
+		{name: "public ip literal ok", url: "https://8.8.8.8/hook", wantIPs: 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := validateDeployNotifyURL(c.url)
+			ips, err := validateDeployNotifyURL(c.url)
 			if (err != nil) != c.wantError {
-				t.Errorf("validateDeployNotifyURL(%q): err=%v, wantError=%v", c.url, err, c.wantError)
+				t.Fatalf("validateDeployNotifyURL(%q): err=%v, wantError=%v", c.url, err, c.wantError)
+			}
+			if c.wantError {
+				gotTransient := errors.Is(err, errDeployNotifyTransient)
+				if gotTransient != c.wantTransient {
+					t.Errorf("validateDeployNotifyURL(%q): transient=%v, want %v", c.url, gotTransient, c.wantTransient)
+				}
+				return
+			}
+			if len(ips) != c.wantIPs {
+				t.Errorf("validateDeployNotifyURL(%q): returned %d vetted IPs, want %d", c.url, len(ips), c.wantIPs)
 			}
 		})
 	}

@@ -61,9 +61,9 @@ func TestAnonExpiryReminder_Stage1_WritesAuditWithFullMetadata(t *testing.T) {
 		AddRow(resID, teamID, "postgres", expires, 0, "abc12345", "owner@example.com")
 	mock.ExpectQuery(`SELECT r.id, r.team_id`).WillReturnRows(rows)
 
-	// CAS-stamp: target reminders_sent=1, predicate reminders_sent=0
+	// CAS-stamp: fast-forward reminders_sent to 1, guard `reminders_sent < 1`.
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
-		WithArgs(1, resID, 0).
+		WithArgs(1, resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Audit insert must include the resource_type column AND a metadata
@@ -122,9 +122,9 @@ func TestAnonExpiryReminder_Stage2_FiresWhenStage1AlreadySent(t *testing.T) {
 		AddRow(resID, teamID, "redis", expires, 1, "pfx9", "owner@example.com")
 	mock.ExpectQuery(`SELECT r.id, r.team_id`).WillReturnRows(rows)
 
-	// CAS to 2 from 1.
+	// CAS fast-forward to 2, guard `reminders_sent < 2`.
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
-		WithArgs(2, resID, 1).
+		WithArgs(2, resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	var captured []byte
@@ -169,7 +169,7 @@ func TestAnonExpiryReminder_Stage3_Final(t *testing.T) {
 	mock.ExpectQuery(`SELECT r.id, r.team_id`).WillReturnRows(rows)
 
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
-		WithArgs(3, resID, 2).
+		WithArgs(3, resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	var captured []byte
@@ -226,11 +226,74 @@ func TestAnonExpiryReminder_NotEligibleYet(t *testing.T) {
 	}
 }
 
-// TestExpiryReminderWorker_StampsButSkipsAudit_WhenNoOwnerEmail: orphan
-// team with NULL email. We still advance reminders_sent so the row
-// doesn't keep getting re-evaluated, but skip the audit insert because
-// there's no recipient.
-func TestExpiryReminderWorker_StampsButSkipsAudit_WhenNoOwnerEmail(t *testing.T) {
+// TestAnonExpiryReminder_ShortTTL_FiresCorrectlyLabelledStage pins
+// BugBash P2-12: a resource created less than 6h before its TTL is
+// already inside the (6h, 1h] window from the very first sweep with
+// reminders_sent=0. The OLD code required strict 0→1→2 progression
+// (`reminders_sent == mustHaveSent`), so the only stage it could fire
+// was stage 1 — emailing "12h to go" while only ~40 min remained.
+//
+// The fixed selectStage buckets by TIME first: a row ~40 min from
+// expiry buckets straight into stage 3, and the CAS fast-forwards
+// reminders_sent 0→3 in one move. The email is labelled "stage_1h"
+// (reminder_index 3), matching the real hours_remaining.
+func TestAnonExpiryReminder_ShortTTL_FiresCorrectlyLabelledStage(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resID := uuid.New()
+	teamID := uuid.New()
+	// Short-TTL resource: only ~40 min left, but reminders_sent is still 0
+	// (it was created already inside the final window).
+	expires := time.Now().UTC().Add(40 * time.Minute)
+	rows := sqlmock.NewRows([]string{"id", "team_id", "resource_type", "expires_at", "reminders_sent", "key_prefix", "email"}).
+		AddRow(resID, teamID, "postgres", expires, 0, "p", "owner@example.com")
+	mock.ExpectQuery(`SELECT r.id, r.team_id`).WillReturnRows(rows)
+
+	// CAS fast-forwards reminders_sent straight to 3 (stage_1h bucket),
+	// guard `reminders_sent < 3` — consuming the skipped stages 1 and 2.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
+		WithArgs(3, resID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	var captured []byte
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(teamID, "anon.expiry_warning", "postgres", sqlmock.AnyArg(),
+			argCaptureBytes(&captured)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := jobs.NewExpiryReminderWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("short-TTL resource fired the wrong stage — P2-12 regressed: %v", err)
+	}
+
+	meta := map[string]string{}
+	if err := json.Unmarshal(captured, &meta); err != nil {
+		t.Fatalf("metadata not valid JSON: %v", err)
+	}
+	// The label and reminder_index must reflect the IMMINENT stage, not
+	// stage 1 — and hours_remaining (floored at 1) must agree.
+	mustEqual(t, meta, "stage_label", "stage_1h")
+	mustEqual(t, meta, "reminder_index", "3")
+	mustEqual(t, meta, "hours_remaining", "1")
+}
+
+// TestExpiryReminderWorker_NoOwnerEmail_LeavesStageUnconsumed pins
+// BugBash P2-14: an orphan team with a NULL primary-user email must NOT
+// have its reminders_sent counter advanced. The recipient check now
+// runs BEFORE the CAS UPDATE — so no `UPDATE resources` and no audit
+// INSERT fire, and the stage stays available for a future owner.
+//
+// The prior behaviour (stamp first, then check email) burned all 3
+// stages against an address that didn't exist; if an owner was later
+// added they could never receive the consumed reminders.
+func TestExpiryReminderWorker_NoOwnerEmail_LeavesStageUnconsumed(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -243,16 +306,15 @@ func TestExpiryReminderWorker_StampsButSkipsAudit_WhenNoOwnerEmail(t *testing.T)
 	rows := sqlmock.NewRows([]string{"id", "team_id", "resource_type", "expires_at", "reminders_sent", "key_prefix", "email"}).
 		AddRow(resID, teamID, "postgres", expires, 0, "p", nil)
 	mock.ExpectQuery(`SELECT r.id, r.team_id`).WillReturnRows(rows)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
-		WithArgs(1, resID, 0).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// No `UPDATE resources` CAS and no `INSERT INTO audit_log` expected —
+	// sqlmock strict mode fails the test if either statement fires.
 
 	w := jobs.NewExpiryReminderWorker(db)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpiryReminderArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet expectations: %v", err)
+		t.Errorf("owner-less resource had its reminder counter stamped — P2-14 regressed: %v", err)
 	}
 }
 
@@ -272,7 +334,7 @@ func TestExpiryReminderWorker_FailOpenOnAuditInsertError(t *testing.T) {
 		AddRow(resID, teamID, "mongodb", expires, 2, "p", "x@example.com")
 	mock.ExpectQuery(`SELECT r.id`).WillReturnRows(rows)
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
-		WithArgs(3, resID, 2).
+		WithArgs(3, resID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnError(errDB)
@@ -355,7 +417,7 @@ func TestExpiryReminderWorker_CASLoses_NoAudit(t *testing.T) {
 	mock.ExpectQuery(`SELECT r.id`).WillReturnRows(rows)
 	// CAS UPDATE matches nothing (predicate failed because another worker advanced).
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE resources`)).
-		WithArgs(1, resID, 0).
+		WithArgs(1, resID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	// No INSERT INTO audit_log expected.
 

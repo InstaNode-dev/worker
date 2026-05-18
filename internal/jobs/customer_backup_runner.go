@@ -201,6 +201,20 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 		return nil
 	}
 
+	// P2-W4 (BugBash 2026-05-18): stuck-row recovery. A backup row is
+	// atomically claimed by flipping status 'pending' → 'running'. If the
+	// worker pod is killed (rolling deploy, OOM, node drain) AFTER the
+	// claim but BEFORE finalize/markFailed, the row is orphaned at
+	// 'running' forever — the pending-row sweep below only selects
+	// status='pending', so no runner ever picks it up again. A manual
+	// backup is then silently lost. Recover here: any 'running' row whose
+	// started_at is older than backupPerRunTimeout could not still be a
+	// live in-flight backup (the per-run context would have fired), so it
+	// is reset to 'pending' to be re-claimed on this same tick. The
+	// timeout floor guarantees we never reclaim a backup that's genuinely
+	// still streaming.
+	w.recoverStuckRows(ctx)
+
 	// Sweep pending rows. We pull the resource side-data (connection_url,
 	// token, team_id, resource_type) in the same SELECT so the per-row
 	// path only needs one ExecContext for the claim + one for the final
@@ -281,6 +295,35 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 		"job_id", job.ID,
 	)
 	return nil
+}
+
+// recoverStuckRows resets backup rows orphaned at status='running' back
+// to 'pending' so a future tick re-claims them. A row qualifies only
+// when started_at is older than backupPerRunTimeout — a genuinely
+// in-flight backup is bounded by that per-run context, so anything
+// older is a casualty of a pod kill, not a live job. Best-effort: a
+// failure here is logged and the sweep proceeds (the pending-row scan
+// still drains the normal queue).
+func (w *CustomerBackupRunnerWorker) recoverStuckRows(ctx context.Context) {
+	res, err := w.db.ExecContext(ctx, `
+		UPDATE resource_backups
+		   SET status = 'pending',
+		       started_at = NULL,
+		       error_summary = 'recovered: runner pod lost before finalize — re-queued'
+		 WHERE status = 'running'
+		   AND started_at IS NOT NULL
+		   AND started_at < now() - ($1::int * INTERVAL '1 second')
+	`, int(w.timeout.Seconds()))
+	if err != nil {
+		slog.Warn("jobs.customer_backup_runner.stuck_row_recovery_failed", "error", err)
+		return
+	}
+	if n, raErr := res.RowsAffected(); raErr == nil && n > 0 {
+		slog.Warn("jobs.customer_backup_runner.recovered_stuck_rows",
+			"count", n,
+			"note", "rows orphaned at status='running' past the per-run timeout — reset to pending",
+		)
+	}
 }
 
 // processBackup runs a single backup row end-to-end. Returns true on success.
@@ -424,7 +467,19 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	// Step 4 — finalize. FIX-H #59: stamp sha256 alongside s3_key and
 	// size_bytes so the restore handler can verify integrity against a
 	// fresh re-read of the object.
-	if _, updErr := w.db.ExecContext(parentCtx, `
+	//
+	// P2-W4 (BugBash 2026-05-18): the finalize UPDATE runs on a FRESH
+	// bounded context, not parentCtx. The object is already durably in
+	// S3 at this point — if parentCtx were cancelled (worker shutdown)
+	// the UPDATE on parentCtx would fail, leaving the row stuck at
+	// 'running' while the S3 object exists: a paid-for backup the
+	// customer can never see and the stuck-row recovery would later
+	// re-run, orphaning the first object. A 10s fresh context (mirroring
+	// markFailed) lets the row reach 'ok' even mid-shutdown so the
+	// upload and the DB row stay consistent.
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer finalizeCancel()
+	if _, updErr := w.db.ExecContext(finalizeCtx, `
 		UPDATE resource_backups
 		   SET status = 'ok',
 		       finished_at = now(),

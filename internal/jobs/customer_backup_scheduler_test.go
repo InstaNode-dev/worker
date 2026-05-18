@@ -60,11 +60,9 @@ func TestScheduler_InsertsForProTierEveryHour(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
 			AddRow(resID, "pro", teamID))
 
-	// Dedup check returns false (no recent row).
-	mock.ExpectQuery(`SELECT EXISTS`).
-		WithArgs(uuid.MustParse(resID)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-
+	// P2-W4: the dedupe is now folded into the INSERT as an atomic
+	// `INSERT … SELECT … WHERE NOT EXISTS (…)`. RowsAffected=1 means the
+	// NOT EXISTS arm passed and a row was scheduled.
 	mock.ExpectExec(`INSERT INTO resource_backups`).
 		WithArgs(uuid.MustParse(resID), "pro").
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -129,9 +127,6 @@ func TestScheduler_HobbyOnSlot_Inserts(t *testing.T) {
 	mock.ExpectQuery(`SELECT r.id::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
 			AddRow(resID, "hobby", teamID))
-	mock.ExpectQuery(`SELECT EXISTS`).
-		WithArgs(uuid.MustParse(resID)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec(`INSERT INTO resource_backups`).
 		WithArgs(uuid.MustParse(resID), "hobby").
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -149,7 +144,10 @@ func TestScheduler_HobbyOnSlot_Inserts(t *testing.T) {
 }
 
 // TestScheduler_DedupExists_Skips — a recent row inside the 50min lookback
-// should suppress the INSERT.
+// should suppress the INSERT. P2-W4: the dedupe is now atomic inside the
+// INSERT statement, so the worker always issues the INSERT but a recent
+// row makes the `WHERE NOT EXISTS` arm match → RowsAffected=0 → the worker
+// counts it as a deduped skip rather than an inserted row.
 func TestScheduler_DedupExists_Skips(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -163,10 +161,10 @@ func TestScheduler_DedupExists_Skips(t *testing.T) {
 	mock.ExpectQuery(`SELECT r.id::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
 			AddRow(resID, "pro", teamID))
-	mock.ExpectQuery(`SELECT EXISTS`).
-		WithArgs(uuid.MustParse(resID)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	// No INSERT expected.
+	// INSERT runs but the NOT EXISTS arm matches the recent row → 0 rows.
+	mock.ExpectExec(`INSERT INTO resource_backups`).
+		WithArgs(uuid.MustParse(resID), "pro").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	w := NewCustomerBackupSchedulerWorker(db)
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 14, 0, 0, 0, time.UTC) }
@@ -176,6 +174,46 @@ func TestScheduler_DedupExists_Skips(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestScheduler_DedupeIsAtomicInsert pins BugBash P2-W4: the dedupe MUST
+// be a single atomic `INSERT … SELECT … WHERE NOT EXISTS (…)` statement,
+// NOT a separate SELECT EXISTS check followed by an unconditional INSERT.
+// The old check-then-act shape let two concurrent ticks both observe
+// existed=false and both INSERT, double-scheduling a backup.
+//
+// sqlmock's QueryMatcherRegexp asserts the worker issues exactly one
+// statement carrying both `INSERT INTO resource_backups` and the
+// `WHERE NOT EXISTS` guard — a regression to the two-statement shape
+// fails this expectation.
+func TestScheduler_DedupeIsAtomicInsert(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	resID := "fffffff0-1111-2222-3333-444444444444"
+
+	mock.ExpectQuery(`SELECT r\.id::text, r\.tier, r\.team_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
+			AddRow(resID, "pro", teamID))
+	// The single statement must contain BOTH the INSERT and the NOT EXISTS
+	// dedupe guard — proves the dedupe is folded in, not check-then-act.
+	mock.ExpectExec(`INSERT INTO resource_backups[\s\S]+WHERE NOT EXISTS`).
+		WithArgs(uuid.MustParse(resID), "pro").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := NewCustomerBackupSchedulerWorker(db)
+	w.now = func() time.Time { return time.Date(2026, 5, 13, 14, 0, 0, 0, time.UTC) }
+
+	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("dedupe is not an atomic INSERT … WHERE NOT EXISTS — TOCTOU regressed: %v", err)
 	}
 }
 
@@ -201,9 +239,6 @@ func TestScheduler_HobbyPlus_OnSlotInserts(t *testing.T) {
 	mock.ExpectQuery(`SELECT r.id::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
 			AddRow(resID, "hobby_plus", teamID))
-	mock.ExpectQuery(`SELECT EXISTS`).
-		WithArgs(uuid.MustParse(resID)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec(`INSERT INTO resource_backups`).
 		WithArgs(uuid.MustParse(resID), "hobby_plus").
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -236,9 +271,6 @@ func TestScheduler_YearlyVariants_BackupHourly(t *testing.T) {
 	mock.ExpectQuery(`SELECT r.id::text, r.tier, r.team_id`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
 			AddRow(resID, "pro_yearly", teamID))
-	mock.ExpectQuery(`SELECT EXISTS`).
-		WithArgs(uuid.MustParse(resID)).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec(`INSERT INTO resource_backups`).
 		WithArgs(uuid.MustParse(resID), "pro_yearly").
 		WillReturnResult(sqlmock.NewResult(1, 1))
