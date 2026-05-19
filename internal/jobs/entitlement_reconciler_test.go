@@ -14,7 +14,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +30,54 @@ import (
 
 	commonplans "instant.dev/common/plans"
 )
+
+// ─── F6: entitlement drift-correction signal capture ──────────────────────────
+
+// capturedLogRecord is a flattened slog.Record: the message plus its
+// attributes as a string map. Enough for the F6 assertion.
+type capturedLogRecord struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string
+}
+
+// capturingSlogHandler is a minimal slog.Handler that records every emitted
+// record. Used by the F6 test to assert the entitlement reconciler emits the
+// dedicated drift-correction signal — there is no other way to prove a
+// structured-log line fired without capturing it.
+type capturingSlogHandler struct {
+	mu      sync.Mutex
+	records *[]capturedLogRecord
+}
+
+func (h *capturingSlogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingSlogHandler) Handle(_ context.Context, r slog.Record) error {
+	rec := capturedLogRecord{level: r.Level, msg: r.Message, attrs: map[string]string{}}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	h.mu.Lock()
+	*h.records = append(*h.records, rec)
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *capturingSlogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingSlogHandler) WithGroup(string) slog.Handler       { return h }
+
+// captureSlog swaps the process-wide default slog logger for a capturing
+// handler for the duration of the test, restoring it on cleanup. Returns a
+// pointer to the slice the handler appends to.
+func captureSlog(t *testing.T) *[]capturedLogRecord {
+	t.Helper()
+	records := &[]capturedLogRecord{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&capturingSlogHandler{records: records}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return records
+}
 
 // liveRegistry is the production plans source — the same *commonplans.Registry
 // the worker is handed by StartWorkers. *Registry satisfies PlanRegistry.
@@ -619,4 +669,167 @@ type funcRegrader struct {
 
 func (f *funcRegrader) RegradeResource(ctx context.Context, token, prid string, resType commonv1.ResourceType, tier, reqID string) (regradeOutcome, error) {
 	return f.fn(ctx, token, prid, resType, tier, reqID)
+}
+
+// ─── F6: drift-correction signal regression tests ────────────────────────────
+//
+// F6 (P2): the entitlement reconciler corrects infra-entitlement drift but
+// did so silently — there was no dedicated, alertable signal, so monitoring
+// could not alert on a rising drift-correction rate (the symptom of plan
+// upgrades routinely landing the team row before the infra cap). The fix adds
+// a structured `jobs.entitlement_reconciler.drift_corrected` WARN-level signal
+// (and a 1:1 Prometheus counter) emitted once per correction, for BOTH the
+// Postgres and Redis paths.
+//
+// These tests capture the process default slog logger and assert the signal
+// fires on a real correction and does NOT fire when nothing was corrected.
+
+// findDriftSignal returns every captured record whose message is the
+// entitlement drift-correction signal.
+func findDriftSignal(records []capturedLogRecord) []capturedLogRecord {
+	var out []capturedLogRecord
+	for _, r := range records {
+		if r.msg == entitlementDriftCorrectedSignal {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestEntitlementReconciler_PostgresDriftCorrected_EmitsSignal is the F6
+// regression guard for the Postgres path. A drifted postgres resource
+// (applied_conn_limit = NULL, non-ephemeral tier) that the provisioner
+// successfully re-grades MUST produce exactly one
+// `jobs.entitlement_reconciler.drift_corrected` structured-log signal carrying
+// resource_type=postgres.
+//
+// Pre-fix: the reconciler emitted only the generic per-resource
+// `*.postgres.regraded` INFO line — there was no dedicated drift-corrected
+// signal, so this test (which looks for that exact event name) fails.
+func TestEntitlementReconciler_PostgresDriftCorrected_EmitsSignal(t *testing.T) {
+	records := captureSlog(t)
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	// One drifted postgres row: applied_conn_limit = NULL, plan_tier = "pro".
+	rows := sqlmock.NewRows(entitlementSweepCols).
+		AddRow(id1, "tok-drifted", nil, "pro", nil, "pro")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)                            // Postgres query
+	mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())                // Redis query (no-op)
+
+	stub := &stubRegrader{} // returns Applied:true
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, stub)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	signals := findDriftSignal(*records)
+	if len(signals) != 1 {
+		t.Fatalf("expected exactly 1 %q signal, got %d — the Postgres drift "+
+			"correction must emit the F6 drift-corrected signal",
+			entitlementDriftCorrectedSignal, len(signals))
+	}
+	if rt := signals[0].attrs["resource_type"]; rt != entitlementResourceTypePostgres {
+		t.Errorf("drift signal resource_type=%q, want %q", rt, entitlementResourceTypePostgres)
+	}
+	if signals[0].level != slog.LevelWarn {
+		t.Errorf("drift signal level=%v, want WARN (it must be alertable)", signals[0].level)
+	}
+	if signals[0].attrs["resource_id"] != id1.String() {
+		t.Errorf("drift signal resource_id=%q, want %q",
+			signals[0].attrs["resource_id"], id1.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEntitlementReconciler_NoDrift_NoSignal proves the F6 signal is NOT noise:
+// a sweep that finds no drift (every resource's applied cap already matches the
+// entitled cap) must emit ZERO drift-corrected signals.
+func TestEntitlementReconciler_NoDrift_NoSignal(t *testing.T) {
+	records := captureSlog(t)
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	reg := liveRegistry(t)
+	// applied_conn_limit already equals the entitled cap for "pro" → no drift.
+	entitled := reg.ConnectionsLimit("pro", "postgres")
+	rows := sqlmock.NewRows(entitlementSweepCols).
+		AddRow(id1, "tok-ok", "ns/abc", "pro", int64(entitled), "pro")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())
+
+	w := NewEntitlementReconcilerWorker(db, reg, &stubRegrader{})
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	if signals := findDriftSignal(*records); len(signals) != 0 {
+		t.Errorf("expected 0 %q signals when nothing drifted, got %d",
+			entitlementDriftCorrectedSignal, len(signals))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEntitlementReconciler_RedisDriftCorrected_EmitsSignal is the F6
+// regression guard for the Redis path. A Redis maxmemory CONFIG SET that the
+// provisioner reports as applied is an infra-entitlement drift correction and
+// MUST emit the same drift-corrected signal, carrying resource_type=redis.
+func TestEntitlementReconciler_RedisDriftCorrected_EmitsSignal(t *testing.T) {
+	records := captureSlog(t)
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id1 := uuid.New()
+	redisRows := sqlmock.NewRows(redisSweepCols).
+		AddRow(id1, "tok-redis", "instant-customer-tok-redis", "pro", "pro")
+
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols)) // Postgres (no-op)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(redisRows)                            // Redis query
+
+	// Provisioner reports the CONFIG SET landed (Applied:true).
+	regrader := &funcRegrader{fn: func(_ context.Context, _, _ string, _ commonv1.ResourceType, _, _ string) (regradeOutcome, error) {
+		return regradeOutcome{Applied: true, AppliedConnLimit: 512}, nil
+	}}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, regrader)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	signals := findDriftSignal(*records)
+	if len(signals) != 1 {
+		t.Fatalf("expected exactly 1 %q signal for the Redis correction, got %d",
+			entitlementDriftCorrectedSignal, len(signals))
+	}
+	if rt := signals[0].attrs["resource_type"]; rt != entitlementResourceTypeRedis {
+		t.Errorf("drift signal resource_type=%q, want %q", rt, entitlementResourceTypeRedis)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }

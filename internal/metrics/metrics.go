@@ -102,6 +102,21 @@ var (
 		Help: "Drifted resources the reconciler failed to re-grade (gRPC error or provisioner skip).",
 	})
 
+	// EntitlementDriftCorrectedTotal counts resources whose infrastructure
+	// entitlement was actually corrected by the reconciler — a Postgres
+	// connection-cap regrade that the provisioner applied, or a Redis maxmemory
+	// CONFIG SET that landed (F6). Distinct from EntitlementRegradedTotal so
+	// the per-event structured `jobs.entitlement_reconciler.drift_corrected`
+	// log line has a 1:1 counter for NR alerting. Labelled by resource_type so
+	// monitoring can alert on a rising correction rate per resource class —
+	// a sustained non-zero rate means upgrades are routinely landing the team
+	// row before the infra cap, which is the F6 partial-upgrade symptom.
+	// NR alert: rate(instant_entitlement_drift_corrected_total[1h]) climbing → investigate.
+	EntitlementDriftCorrectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_entitlement_drift_corrected_total",
+		Help: "Resources whose infra entitlement drift the reconciler corrected (labelled by resource_type).",
+	}, []string{"resource_type"})
+
 	// ── entitlement_reconciler — Redis maxmemory metrics ─────────────────────
 	//
 	// A4 backfill: the reconciler now also sweeps dedicated k8s Redis pods to
@@ -238,6 +253,28 @@ var (
 	BillingReconcilerRazorpayErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "instant_billing_reconciler_razorpay_errors_total",
 		Help: "Razorpay API errors (including circuit-open) encountered during a reconciler tick.",
+	})
+
+	// BillingReconcilerOrphanScanned counts pending_checkouts rows inspected by
+	// the Razorpay-authoritative orphan sweep (F1). These are checkouts whose
+	// subscription_id was never persisted onto teams.stripe_customer_id — the
+	// team is structurally invisible to the primary teams-table sweep, so this
+	// second pass starts from pending_checkouts instead. NR can confirm the
+	// orphan sweep is alive by watching this counter advance per tick.
+	BillingReconcilerOrphanScanned = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_billing_reconciler_orphan_scanned_total",
+		Help: "pending_checkouts rows inspected by the billing reconciler's orphan (un-persisted subscription_id) sweep.",
+	})
+
+	// BillingReconcilerOrphanCorrected counts teams the orphan sweep elevated:
+	// Razorpay reports the subscription active/paid but teams.plan_tier was
+	// stuck below the entitled tier because the checkout-time subscription_id
+	// UPDATE was lost. A non-zero value means at least one paying customer was
+	// charged-but-not-upgraded and the orphan sweep recovered them.
+	// NR alert: instant_billing_reconciler_orphan_corrected_total > 0 in 15m → P1.
+	BillingReconcilerOrphanCorrected = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_billing_reconciler_orphan_corrected_total",
+		Help: "Teams elevated by the billing reconciler's orphan sweep (paid at Razorpay, no persisted subscription_id).",
 	})
 
 	// GoroutinePanicsRecovered counts panics caught by the shared

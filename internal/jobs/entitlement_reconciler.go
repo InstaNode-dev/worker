@@ -95,6 +95,22 @@ const entitlementReconcilerBatchLimit = 200
 // entitlementReconcilerRegradeTimeout is the per-resource gRPC budget.
 const entitlementReconcilerRegradeTimeout = 30 * time.Second
 
+// entitlementDriftCorrectedSignal is the stable structured-log event name
+// emitted once per infra-entitlement drift correction (F6). It is distinct
+// from the per-resource `*.regraded` / `*.maxmemory_applied` INFO lines: those
+// are operational detail, this WARN-level line is the alertable signal a
+// monitor watches for a rising correction rate. Held as a const so the F6
+// regression test pins the exact string the NR alert query depends on.
+const entitlementDriftCorrectedSignal = "jobs.entitlement_reconciler.drift_corrected"
+
+// entitlementResourceType* are the resource_type label values carried by the
+// drift-corrected signal and its Prometheus counter. Named constants (not
+// scattered string literals) per CLAUDE.md conventions.
+const (
+	entitlementResourceTypePostgres = "postgres"
+	entitlementResourceTypeRedis    = "redis"
+)
+
 // entitlementEphemeralTiers are the tiers that are never re-graded up — the
 // anonymous (24h TTL) and legacy free tiers are ephemeral, so applying a paid
 // connection cap to them is meaningless. Drift detection skips these rows.
@@ -389,6 +405,21 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			"new_limit", out.AppliedConnLimit,
 			"skip_reason", out.SkipReason,
 		)
+		// F6: emit a dedicated, alertable drift-correction signal. The
+		// per-resource INFO above is operational detail; this WARN-level line
+		// (with a stable event name + a 1:1 Prometheus counter) is what
+		// monitoring watches — a rising rate means plan upgrades are routinely
+		// landing the team row before the infra cap, the F6 partial-upgrade
+		// symptom. Without it the correction was silent and an operator could
+		// not see the drift rate climbing.
+		metrics.EntitlementDriftCorrectedTotal.WithLabelValues(entitlementResourceTypePostgres).Inc()
+		slog.Warn(entitlementDriftCorrectedSignal,
+			"resource_type", entitlementResourceTypePostgres,
+			"resource_id", c.id.String(),
+			"plan_tier", c.planTier,
+			"old_limit", oldLimit,
+			"new_limit", out.AppliedConnLimit,
+		)
 	}
 
 	// ── Redis: maxmemory backfill (A4) ───────────────────────────────────────
@@ -514,6 +545,17 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 				"plan_tier", c.planTier,
 				"applied_maxmemory_mb", out.AppliedConnLimit, // AppliedConnLimit repurposed for MB
 				"ns_identifier", nsIdentifier,
+			)
+			// F6: a CONFIG SET that landed is an infra-entitlement drift
+			// correction — emit the same dedicated, alertable signal the
+			// Postgres path emits so monitoring sees Redis drift corrections
+			// in the one `entitlement.drift_corrected` stream.
+			metrics.EntitlementDriftCorrectedTotal.WithLabelValues(entitlementResourceTypeRedis).Inc()
+			slog.Warn(entitlementDriftCorrectedSignal,
+				"resource_type", entitlementResourceTypeRedis,
+				"resource_id", c.id.String(),
+				"plan_tier", c.planTier,
+				"new_limit", out.AppliedConnLimit,
 			)
 		} else {
 			redisSkipped++
