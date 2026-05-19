@@ -1,4 +1,4 @@
-.PHONY: build test docker-build run smoke-buildinfo
+.PHONY: build test gate docker-build run smoke-buildinfo
 
 # Build-time metadata injected into instant.dev/common/buildinfo via -ldflags.
 # Override on the make line if needed. GIT_SHA falls back to "dev" when not
@@ -12,6 +12,16 @@ build:
 
 test:
 	go test ./... -race -count=1
+
+# PR/deploy gate: runs EXACTLY what .github/workflows/deploy.yml runs as its
+# test gate (`go test ./... -short -count=1`, see the deploy.yml "Run unit
+# tests" step), preceded by build + vet as a fast-fail. A green `make gate`
+# locally == a green CI test step — the local gate cannot pass while CI fails.
+gate:
+	go build ./...
+	go vet ./...
+	go test ./... -short -count=1
+	@echo "gate: green — matches deploy.yml test step"
 
 docker-build:
 	docker build -f Dockerfile -t instant-worker:local \
