@@ -182,6 +182,16 @@ const (
 	// Metadata: deploy_id, team_id, failure_stage (build|rollout),
 	// error_summary.
 	auditKindDeployFailedEmail = auditKindDeployFailed
+
+	// Abandoned-checkout dunning. The CheckoutReconcileWorker
+	// (checkout_reconcile.go) writes this kind for a Razorpay checkout that
+	// never resolved within the 15-minute grace window — the ONLY mechanism
+	// that catches the "Razorpay sent no webhook at all" case (a checkout
+	// that failed on Razorpay's hosted page without a payment object ever
+	// being created). Reuse the producer-side constant byte-for-byte so the
+	// SQL filter matches the literal the worker writes (CLAUDE rule 16).
+	// Metadata: email, subscription_id, plan_tier.
+	auditKindCheckoutAbandonedEmail = auditKindCheckoutAbandoned
 )
 
 // auditRow is the projection of audit_log + users used by the forwarder.
@@ -258,6 +268,12 @@ var supportedAuditKinds = []string{
 	auditKindRestoreSucceededEmail,
 	auditKindRestoreFailedEmail,
 	auditKindDeployFailedEmail,
+	// Abandoned-checkout dunning — CheckoutReconcileWorker
+	// (checkout_reconcile.go). The webhook-blind failure path: a Razorpay
+	// checkout that produced no payment object, so no webhook, so the api
+	// never learned of it. The worker's 15-minute-no-resolved_at sweep is
+	// the only thing that emails the customer.
+	auditKindCheckoutAbandonedEmail,
 }
 
 // auditKindDeployTTLSet and auditKindTeamSettingsChanged are emitted by the
@@ -350,6 +366,7 @@ var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
 	auditKindRestoreSucceededEmail:       renderRestoreSucceeded,
 	auditKindRestoreFailedEmail:          renderRestoreFailed,
 	auditKindDeployFailedEmail:           renderDeployFailed,
+	auditKindCheckoutAbandonedEmail:      renderCheckoutAbandoned,
 }
 
 // eventEmailBuilders maps an audit_log.kind to the builder that produces
@@ -393,6 +410,7 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	auditKindRestoreSucceededEmail:       buildRestoreSucceeded,
 	auditKindRestoreFailedEmail:          buildRestoreFailed,
 	auditKindDeployFailedEmail:           buildDeployFailed,
+	auditKindCheckoutAbandonedEmail:      buildCheckoutAbandoned,
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────
@@ -965,5 +983,27 @@ func buildDeployFailed(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "deploy_id", "deploy_id")
 	copyMetaStr(params, meta, "failure_stage", "failure_stage")
 	copyMetaStr(params, meta, "error_summary", "error_summary")
+	return params, true
+}
+
+// buildCheckoutAbandoned — pairs with renderCheckoutAbandoned
+// (checkout.abandoned). The CheckoutReconcileWorker writes this row for a
+// Razorpay checkout that never resolved within 15 minutes.
+//
+// Metadata shape (set by checkout_reconcile.go::emailAbandonedCheckout):
+//
+//	checkout.abandoned — {email, subscription_id, plan_tier}
+//
+// `email` doubles as the forwarder's recipient resolver — pending_checkouts
+// customers may have no users row yet (the upgrade never completed), so the
+// users JOIN yields nothing and metadata.email is the COALESCE fallback.
+func buildCheckoutAbandoned(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "subscription_id", "subscription_id")
+	copyMetaStr(params, meta, "plan_tier", "plan_tier")
 	return params, true
 }

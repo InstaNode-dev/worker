@@ -275,6 +275,10 @@ var (
   {{ if .ErrorSummary }}<tr><td style="color:#666;">Error</td><td>{{ .ErrorSummary }}</td></tr>{{ end }}
 </table>
 <p style="margin:0 0 4px;">Open your dashboard for the full build log, fix the issue, and redeploy.</p>`))
+
+	bodyCheckoutAbandoned = template.Must(template.New("b_ckabandon").Parse(
+		`<p style="margin:0 0 14px;">It looks like your recent instanode upgrade{{ if .PlanTier }} to the {{ .PlanTier }} plan{{ end }} didn't complete — no payment went through, so your plan hasn't changed.</p>
+<p style="margin:0 0 4px;">Nothing was charged. You can try the upgrade again whenever you're ready. If you hit a problem on the checkout page, reply to this email and we'll help you get it sorted.</p>`))
 )
 
 // ── Body view structs — flat, compiler-checked field references ───────────
@@ -305,6 +309,7 @@ type viewPaymentGraceTerminated struct{ GraceEndsAt string }
 type viewBackupFailed struct{ ResourceType, BackupID, ErrorSummary string }
 type viewRestoreResult struct{ ResourceType, RestoreID, BackupID, ErrorSummary string }
 type viewDeployFailed struct{ DeployID, FailureStage, ErrorSummary string }
+type viewCheckoutAbandoned struct{ PlanTier string }
 
 // ── Render helpers ────────────────────────────────────────────────────────
 
@@ -921,6 +926,30 @@ func renderDeployFailed(params map[string]string) (string, string, string) {
 		Heading: heading,
 		Body:    "Your instanode deployment failed. Open your dashboard for the full build log, fix the issue, and redeploy.",
 		CTALabel: "Open your dashboard", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderCheckoutAbandoned — pairs with buildCheckoutAbandoned
+// (checkout.abandoned). The dunning email for a Razorpay checkout that was
+// started but never completed — the customer reached the hosted checkout
+// page and left (or it failed there) without a payment being created, so
+// Razorpay sent no webhook and this is the only nudge they get. The CTA
+// sends them back to pricing to retry the upgrade.
+func renderCheckoutAbandoned(params map[string]string) (string, string, string) {
+	subject := "Your instanode upgrade didn't go through"
+	heading := "Your upgrade didn't complete"
+	body := renderBody(bodyCheckoutAbandoned, viewCheckoutAbandoned{
+		PlanTier: params["plan_tier"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Try the upgrade again", CTAURL: pricingURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading:  heading,
+		Body:     "It looks like your recent instanode upgrade didn't complete — no payment went through, so your plan hasn't changed. You can try again any time; nothing was charged. If you ran into a problem at checkout, reply to this email and we'll help.",
+		CTALabel: "Try the upgrade again", CTAURL: pricingURL,
 	})
 	return subject, html, text
 }

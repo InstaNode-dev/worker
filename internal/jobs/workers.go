@@ -612,6 +612,19 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	}
 	billingFetcher = WrapFetcherWithBreaker(billingFetcher, billingBreakerInst)
 	river.AddWorker(workers, WithObservability(NewBillingReconcilerWorker(db, billingFetcher, nil), nrApp))
+	// Checkout reconciler — every 5min, scan pending_checkouts (api
+	// migration 034) for Razorpay checkouts that never resolved within the
+	// 15-minute grace window and email the customer "your upgrade didn't
+	// complete". This is the ONLY mechanism that catches the no-webhook
+	// case: a checkout that failed on Razorpay's hosted page WITHOUT a
+	// payment object ever being created emits zero webhooks, so the api
+	// never learns of it. The same billingFetcher constructed above is
+	// reused for a best-effort Razorpay double-check — if Razorpay reports
+	// the subscription active (webhook merely delayed) the row is stamped
+	// resolved_at and no email is sent. When RAZORPAY_KEY_ID is unset the
+	// fetcher is the noop and the double-check is skipped — the 15-minute
+	// heuristic stands alone. See checkout_reconcile.go.
+	river.AddWorker(workers, WithObservability(NewCheckoutReconcileWorker(db, billingFetcher), nrApp))
 
 	periodicJobs := buildPeriodicJobs(cfg)
 
@@ -912,6 +925,20 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return PaymentGraceTerminatorArgs{}, periodicInsertOpts(paymentGraceTerminatorInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Checkout reconciler — every 5min, sweeps pending_checkouts for
+		// Razorpay checkouts unresolved past the 15-minute grace window and
+		// emails the customer "your upgrade didn't complete". RunOnStart=
+		// false: a worker restart should not fire an immediate sweep — the
+		// 15-minute grace window means a freshly-restarted worker waiting
+		// for the next 5min slot still catches every abandoned checkout
+		// well within its window. See checkout_reconcile.go.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(checkoutReconcileInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return CheckoutReconcileArgs{}, periodicInsertOpts(checkoutReconcileInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
 		),
 		// Customer backup scheduler — every hour, sweeps active
 		// postgres/vector resources and INSERTs a 'pending' row for any
