@@ -81,6 +81,38 @@ const defaultBillingReconcileInterval = 15 * time.Minute
 // consecutive ticks via the stable ORDER BY id pagination.
 const billingReconcilerBatchLimit = 100
 
+// ── F1: orphan-checkout sweep constants ───────────────────────────────────────
+//
+// The primary sweep above starts from teams.stripe_customer_id (the persisted
+// Razorpay subscription id). That id is written by a best-effort, non-fatal
+// UPDATE in the api at checkout time — if the write is lost and the customer
+// then pays, the team is structurally invisible to the primary sweep forever:
+// Razorpay bills the card, the DB stays on free/hobby, nothing corrects it (F1).
+//
+// The orphan sweep is a Razorpay-authoritative second pass. It does NOT start
+// from the teams table — it enumerates pending_checkouts (api migration 034),
+// which records the (subscription_id, team_id) pair for EVERY checkout the api
+// ever minted, independent of whether the teams.stripe_customer_id UPDATE
+// landed. For each checkout it fetches the live Razorpay subscription; any team
+// Razorpay reports paid-and-active whose DB tier is still below the entitled
+// tier is elevated — the same correction the primary sweep applies, just
+// reachable for teams the primary sweep cannot see.
+
+// billingReconcilerOrphanBatchLimit caps the orphan sweep's per-tick fan-out.
+// Smaller than the primary batch: the orphan population is the steady-state
+// pending_checkouts table minus already-up-to-date teams — tiny in practice.
+// A backlog drains across consecutive ticks via the stable ORDER BY.
+const billingReconcilerOrphanBatchLimit = 100
+
+// billingReconcilerOrphanMinAge is how old a pending_checkouts row must be
+// before the orphan sweep considers it. A just-minted checkout is still in the
+// happy-path window (webhook in flight, primary sweep will pick it up once the
+// sub-id persists); only a checkout that has been around long enough that a
+// missed-write + missed-webhook is plausible is worth a Razorpay round-trip.
+// 15 minutes matches checkoutReconcileGracePeriod — the same "long enough to
+// be a real failure, not an in-flight checkout" threshold.
+const billingReconcilerOrphanMinAge = 15 * time.Minute
+
 // billingReconcilerRazorpayTimeout is the per-team Razorpay fetch budget.
 // FetchSubscriptionForReconciler makes up to 2 Razorpay API calls; 10s is
 // the ceiling so a slow response cannot hold the tick open for the full batch.
@@ -863,6 +895,13 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 	}
 
 done:
+	// F1: Razorpay-authoritative orphan sweep. Catches paid teams the primary
+	// teams-table sweep is structurally blind to (their checkout-time
+	// subscription_id UPDATE was lost). Fail-open: an error here is logged and
+	// swallowed — the primary sweep's corrections are already committed and the
+	// next tick retries the orphan pass.
+	orphanScanned, orphanCorrected := w.runOrphanSweep(ctx)
+
 	slog.Info("jobs.billing_reconciler.completed",
 		"teams_scanned", len(teams),
 		"gap_upgrade", gapUpgrade,
@@ -870,9 +909,189 @@ done:
 		"corrected_upgrade", correctedUpgrade,
 		"corrected_downgrade", correctedDowngrade,
 		"razorpay_errors", razorpayErrors,
+		"orphan_scanned", orphanScanned,
+		"orphan_corrected", orphanCorrected,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return nil
+}
+
+// billingReconcilerOrphanRow is the projection the orphan sweep's SELECT over
+// pending_checkouts returns: the (subscription_id, team_id) pair recorded at
+// checkout time, plus the team's CURRENT plan_tier so the sweep can decide
+// whether an elevation is needed without a second query.
+type billingReconcilerOrphanRow struct {
+	subscriptionID string
+	teamID         uuid.UUID
+	planTier       string
+}
+
+// runOrphanSweep is the F1 fix: a Razorpay-authoritative second pass that
+// starts from pending_checkouts instead of teams.stripe_customer_id.
+//
+// pending_checkouts (api migration 034) records the (subscription_id, team_id)
+// pair for EVERY checkout the api minted — it is written when the customer is
+// handed the Razorpay short_url, on the SAME insert path, NOT via the
+// best-effort UPDATE that the primary sweep's candidate column depends on. So a
+// team whose teams.stripe_customer_id write was lost still has a
+// pending_checkouts row carrying its subscription_id.
+//
+// For each checkout the sweep fetches the live Razorpay subscription. If
+// Razorpay reports the subscription active/authenticated (paid or card
+// authorised) and the team's DB tier is BELOW the entitled tier, the team is
+// elevated via the same upgradeTeamTiers path the primary sweep uses, and a
+// subscription.upgraded audit row is emitted for the event-email forwarder.
+//
+// Error contract — fully fail-open:
+//   - A candidate-query failure logs and returns (0,0): the primary sweep's
+//     work is already committed; River retries the whole tick in 15 minutes.
+//   - A per-checkout Razorpay error / circuit-open / not-configured aborts or
+//     skips that row only, exactly like the primary sweep.
+//   - An elevation DB error logs and moves to the next row.
+//
+// Returns (scanned, corrected) for the completion-log summary.
+func (w *BillingReconcilerWorker) runOrphanSweep(ctx context.Context) (scanned, corrected int) {
+	cutoff := time.Now().UTC().Add(-billingReconcilerOrphanMinAge)
+
+	// Candidate query: pending_checkouts rows joined to their team. The JOIN
+	// projects the team's current plan_tier so the sweep needs no follow-up
+	// query. Ordered by created_at for stable per-tick pagination.
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT pc.subscription_id, pc.team_id, t.plan_tier
+		  FROM pending_checkouts pc
+		  JOIN teams t ON t.id = pc.team_id
+		 WHERE pc.subscription_id IS NOT NULL
+		   AND pc.subscription_id != ''
+		   AND pc.created_at < $1
+		 ORDER BY pc.created_at
+		 LIMIT $2
+	`, cutoff, billingReconcilerOrphanBatchLimit)
+	if err != nil {
+		slog.Warn("billing.reconciler.orphan_query_failed",
+			"error", err,
+			"note", "primary sweep corrections already committed; next tick retries",
+		)
+		return 0, 0
+	}
+	defer rows.Close()
+
+	var candidates []billingReconcilerOrphanRow
+	for rows.Next() {
+		var r billingReconcilerOrphanRow
+		if scanErr := rows.Scan(&r.subscriptionID, &r.teamID, &r.planTier); scanErr != nil {
+			slog.Warn("billing.reconciler.orphan_scan_failed", "error", scanErr)
+			continue
+		}
+		candidates = append(candidates, r)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		slog.Warn("billing.reconciler.orphan_rows_error", "error", rowsErr)
+		return 0, 0
+	}
+	rows.Close()
+
+	for i, c := range candidates {
+		// 100ms stagger between Razorpay calls, same as the primary sweep.
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				slog.Warn("billing.reconciler.orphan_context_cancelled", "processed", i)
+				return scanned, corrected
+			case <-time.After(billingReconcilerStaggerDelay):
+			}
+		}
+
+		scanned++
+		metrics.BillingReconcilerOrphanScanned.Inc()
+
+		fetchCtx, cancel := context.WithTimeout(ctx, billingReconcilerRazorpayTimeout)
+		details, fetchErr := w.fetcher.FetchSubscriptionForReconciler(fetchCtx, c.subscriptionID)
+		cancel()
+
+		if fetchErr != nil {
+			metrics.BillingReconcilerRazorpayErrors.Inc()
+			// Circuit-open / not-configured → abort the orphan sweep cleanly,
+			// matching the primary sweep's batch-abort behaviour.
+			if errors.Is(fetchErr, errReconcilerCircuitOpen) ||
+				errors.Is(fetchErr, errSubFetcherNotConfigured) {
+				slog.Warn("billing.reconciler.orphan_sweep_aborted",
+					"reason", fetchErr,
+					"processed", i,
+				)
+				return scanned, corrected
+			}
+			slog.Warn("billing.reconciler.orphan_fetch_failed",
+				"team_id", c.teamID,
+				"subscription_id", c.subscriptionID,
+				"error", fetchErr,
+			)
+			continue
+		}
+
+		// Only an active/authenticated subscription means "Razorpay says this
+		// team is paid". pending/halted/cancelled checkouts are handled by the
+		// primary sweep (once the sub-id persists) and the grace/terminal
+		// machinery; the orphan sweep's job is narrowly the charged-but-not-
+		// upgraded hole.
+		statusClass, known := razorpayStatusClass[details.Status]
+		if !known || statusClass != rzpStatusClassActive {
+			continue
+		}
+
+		expectedTier := billingReconcilerPlanIDToTier(details.PlanID)
+		if billingTierRank(c.planTier) >= billingTierRank(expectedTier) {
+			// DB tier already at or above expected — no orphan correction
+			// needed (the team was upgraded by some other path).
+			continue
+		}
+
+		// Charged-but-not-upgraded, recovered. This team paid at Razorpay but
+		// its checkout-time subscription_id UPDATE was lost, so the primary
+		// teams-table sweep never scanned it. Elevate it now.
+		slog.Warn("billing.reconciler.orphan_tier_corrected",
+			"team_id", c.teamID,
+			"from", c.planTier,
+			"to", expectedTier,
+			"razorpay_status", details.Status,
+			"subscription_id", c.subscriptionID,
+			"note", "team paid at Razorpay but had no persisted subscription_id — recovered via pending_checkouts orphan sweep (F1)",
+		)
+		metrics.BillingReconcilerGapDetected.WithLabelValues("upgrade").Inc()
+
+		if upgradeErr := w.upgradeTeamTiers(ctx, c.teamID, expectedTier); upgradeErr != nil {
+			slog.Error("billing.reconciler.orphan_upgrade_failed",
+				"team_id", c.teamID, "error", upgradeErr,
+			)
+			continue
+		}
+		corrected++
+		metrics.BillingReconcilerOrphanCorrected.Inc()
+		metrics.BillingReconcilerGapCorrected.WithLabelValues("upgrade").Inc()
+
+		// Backfill teams.stripe_customer_id so the team is visible to the
+		// primary sweep from now on — without this it would remain an orphan
+		// and be re-checked by this sweep every tick. Fail-open: the upgrade is
+		// already committed; a failed backfill just means another orphan-sweep
+		// pass next tick (idempotent — the rank check above no-ops it).
+		if _, backfillErr := w.db.ExecContext(ctx,
+			`UPDATE teams SET stripe_customer_id = $1
+			  WHERE id = $2
+			    AND (stripe_customer_id IS NULL OR stripe_customer_id = '')`,
+			c.subscriptionID, c.teamID,
+		); backfillErr != nil {
+			slog.Warn("billing.reconciler.orphan_subid_backfill_failed",
+				"team_id", c.teamID,
+				"subscription_id", c.subscriptionID,
+				"error", backfillErr,
+			)
+		}
+
+		// Emit the audit row for the event-email forwarder — same as the
+		// primary sweep's upgrade path. Fail-open.
+		w.emitUpgradeAudit(ctx, c.teamID, c.planTier, expectedTier, c.subscriptionID)
+	}
+
+	return scanned, corrected
 }
 
 // upgradeTeamTiers is the worker-local equivalent of models.UpgradeTeamAllTiers.

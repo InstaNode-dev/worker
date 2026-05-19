@@ -82,6 +82,21 @@ func (g *stubGrace) HasTerminatedGracePeriod(_ context.Context, _ uuid.UUID, _ s
 // teamRowCols are the columns the billing reconciler SELECT returns.
 var teamRowCols = []string{"id", "stripe_customer_id", "plan_tier"}
 
+// orphanRowCols are the columns the F1 orphan-sweep SELECT over
+// pending_checkouts returns: (subscription_id, team_id, plan_tier).
+var orphanRowCols = []string{"subscription_id", "team_id", "plan_tier"}
+
+// expectEmptyOrphanSweep registers the F1 orphan-sweep candidate query so a
+// test that does not exercise the orphan path sees it as a clean no-op. The
+// orphan sweep runs at the END of every Work() tick (after the primary
+// teams-table sweep), so EVERY billing-reconciler Work() test must register
+// this expectation. Returning zero rows makes the orphan sweep a no-op — no
+// Razorpay fetch, no DB mutation.
+func expectEmptyOrphanSweep(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`SELECT pc.subscription_id, pc.team_id, t.plan_tier`).
+		WillReturnRows(sqlmock.NewRows(orphanRowCols))
+}
+
 // ── §1: Status → action class table ──────────────────────────────────────────
 
 // TestBillingReconciler_StatusActionClassMapping verifies every documented
@@ -320,6 +335,8 @@ func TestBillingReconciler_ActiveSubscription_LowerTier_Upgrades(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "active", PlanID: "plan_pro_test", PaidCount: 3,
 	}}
@@ -353,6 +370,8 @@ func TestBillingReconciler_ActiveSubscription_MatchingTier_NoOp(t *testing.T) {
 			AddRow(teamID, subID, "pro")) // DB already at pro
 
 	// No BEGIN/UPDATE/COMMIT expected — strict mode fails if any fire.
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "active", PlanID: "plan_pro_noop", PaidCount: 1,
 	}}
@@ -388,6 +407,8 @@ func TestBillingReconciler_HaltedSubscription_NoGrace_OpensGrace(t *testing.T) {
 
 	// No DB mutations expected from the reconciler itself — stubGrace handles
 	// grace period logic.
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "halted", PlanID: "", PaidCount: 2,
 	}}
@@ -420,6 +441,8 @@ func TestBillingReconciler_HaltedSubscription_ActiveGrace_NoOp(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
 			AddRow(teamID, subID, "pro"))
+
+	expectEmptyOrphanSweep(mock)
 
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "paused", PlanID: "", PaidCount: 1,
@@ -460,6 +483,8 @@ func TestBillingReconciler_HaltedSubscription_TerminatedGrace_NoReopen(t *testin
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
 			AddRow(teamID, subID, "hobby")) // already downgraded post-termination
 
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "halted", PlanID: "", PaidCount: 1,
 	}}
@@ -498,6 +523,8 @@ func TestBillingReconciler_HaltedSubscription_NoTerminalGrace_StillOpens(t *test
 	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
 			AddRow(teamID, subID, "pro"))
+
+	expectEmptyOrphanSweep(mock)
 
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "halted", PlanID: "", PaidCount: 2,
@@ -542,6 +569,8 @@ func TestBillingReconciler_CancelledSubscription_PaidTier_Downgrades(t *testing.
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "cancelled", PlanID: "", PaidCount: 3,
 	}}
@@ -585,6 +614,8 @@ func TestBillingReconciler_CancelledSubscription_ZeroPaidCount_DowngradesToHobby
 	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "expired", PlanID: "", PaidCount: 0,
 	}}
@@ -623,6 +654,7 @@ func TestBillingReconciler_CancelledSubscription_AlreadyDowngraded_NoOp(t *testi
 	mock2.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
 			AddRow(teamID, subID, "free")) // "free" is NOT in paidTiers
+	expectEmptyOrphanSweep(mock2)
 
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "cancelled", PlanID: "", PaidCount: 0,
@@ -654,6 +686,8 @@ func TestBillingReconciler_UnknownStatus_NoMutation(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
 			AddRow(teamID, subID, "pro"))
+
+	expectEmptyOrphanSweep(mock)
 
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "totally_invented_status_from_future_razorpay", PlanID: "plan_x",
@@ -689,6 +723,8 @@ func TestBillingReconciler_FetchError_PerTeamSkip(t *testing.T) {
 			AddRow(teamID, subID, "pro"))
 
 	// No UPDATE expected — fetch failure skips this team.
+	expectEmptyOrphanSweep(mock)
+
 	fetcher := &stubFetcher{fetchErr: errors.New("razorpay 500")}
 	grace := &stubGrace{}
 
@@ -720,6 +756,9 @@ func TestBillingReconciler_CircuitOpen_AbortsEarly(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(teamRowCols).
 			AddRow(teamID1, subID1, "pro").
 			AddRow(teamID2, subID2, "pro"))
+	// The orphan sweep still runs after the circuit-open batch-abort; an
+	// empty pending_checkouts result keeps it a no-op (no extra fetch calls).
+	expectEmptyOrphanSweep(mock)
 
 	var calls int
 	circuitFetcher := &countingFetcher{
@@ -793,6 +832,7 @@ func TestBillingReconciler_BatchLimit_SelectUsesLimit(t *testing.T) {
 	// returned empty rows don't trigger any downstream work.
 	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
 		WillReturnRows(sqlmock.NewRows(teamRowCols))
+	expectEmptyOrphanSweep(mock)
 
 	w := jobs.NewBillingReconcilerWorker(db, &stubFetcher{}, &stubGrace{})
 	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
@@ -833,6 +873,7 @@ func TestBillingReconciler_GapMetricOnMismatch_NoError(t *testing.T) {
 	mock.ExpectExec(`UPDATE stacks`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectEmptyOrphanSweep(mock)
 
 	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
 		Status: "active", PlanID: "plan_pro_metric", PaidCount: 2,
@@ -842,6 +883,194 @@ func TestBillingReconciler_GapMetricOnMismatch_NoError(t *testing.T) {
 	w := jobs.NewBillingReconcilerWorker(db, fetcher, grace)
 	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// ── §17: F1 — orphan-checkout sweep (charged-but-not-upgraded recovery) ───────
+//
+// F1 is the P0 billing-trust hole: the primary teams-table sweep only sees
+// teams with a persisted stripe_customer_id (the Razorpay subscription id).
+// That id is written by a best-effort, non-fatal UPDATE at checkout time. If
+// that write is lost and the customer then pays, the team is structurally
+// invisible to the primary sweep forever — Razorpay bills the card, the DB
+// stays on free/hobby, nothing corrects it.
+//
+// The fix is the orphan sweep: a second pass that starts from
+// pending_checkouts (which records the (subscription_id, team_id) pair for
+// EVERY checkout, independent of the lost UPDATE), fetches the live Razorpay
+// subscription, and elevates any team Razorpay says is paid-and-active whose
+// DB tier is still below the entitled tier.
+//
+// These tests drive the orphan sweep with the PRIMARY teams-table SELECT
+// returning ZERO rows — i.e. the team genuinely has no persisted
+// stripe_customer_id, the exact F1 condition. Before the fix the reconciler
+// did exactly one SELECT and the team was never seen.
+
+// TestBillingReconciler_OrphanSweep_PaidTeamNoSubID_Recovered is the core F1
+// regression guard. A team paid at Razorpay (subscription active, plan = pro)
+// but has NO row in the teams-table candidate set (stripe_customer_id was
+// never persisted). The pending_checkouts table still carries its
+// (subscription_id, team_id) pair. The orphan sweep MUST detect it and
+// elevate the team hobby → pro.
+//
+// Pre-fix: the reconciler issues only the teams-table SELECT, finds nothing,
+// and returns — the paid team is never upgraded. This test fails (unmet
+// pending_checkouts expectation + no UPDATE teams) without the orphan sweep.
+func TestBillingReconciler_OrphanSweep_PaidTeamNoSubID_Recovered(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	subID := "sub_orphan_paid"
+	os.Setenv("RAZORPAY_PLAN_ID_PRO", "plan_pro_orphan")
+	defer os.Unsetenv("RAZORPAY_PLAN_ID_PRO")
+
+	// PRIMARY teams-table sweep: ZERO rows — the team has no persisted
+	// stripe_customer_id, so it is structurally invisible here. This is the
+	// exact F1 condition.
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols))
+
+	// ORPHAN sweep: pending_checkouts carries the (subscription_id, team_id)
+	// pair — the team is on "hobby" but the checkout was for pro.
+	mock.ExpectQuery(`SELECT pc.subscription_id, pc.team_id, t.plan_tier`).
+		WillReturnRows(sqlmock.NewRows(orphanRowCols).
+			AddRow(subID, teamID, "hobby"))
+
+	// upgradeTeamTiers: BEGIN + 4 UPDATEs + COMMIT — the same elevation path
+	// the primary sweep uses.
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE teams SET plan_tier`).
+		WithArgs("pro", teamID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE resources`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE deployments`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`UPDATE stacks`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	// stripe_customer_id backfill so the team becomes visible to the primary
+	// sweep from the next tick onward.
+	mock.ExpectExec(`UPDATE teams SET stripe_customer_id`).
+		WithArgs(subID, teamID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// subscription.upgraded audit row for the event-email forwarder.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// Razorpay reports the subscription active on the pro plan — the customer
+	// genuinely paid.
+	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
+		Status: "active", PlanID: "plan_pro_orphan", PaidCount: 1,
+	}}
+
+	w := jobs.NewBillingReconcilerWorker(db, fetcher, &stubGrace{})
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v — the orphan sweep must elevate a paid "+
+			"team that has no persisted stripe_customer_id (F1)", err)
+	}
+}
+
+// TestBillingReconciler_OrphanSweep_AlreadyCorrectTier_NoUpgrade proves the
+// orphan sweep is a no-op when the team is already on (or above) the entitled
+// tier — a checkout that DID resolve normally must not be re-elevated. The
+// teams-table sweep returns zero rows; the orphan candidate is already "pro"
+// and Razorpay also says pro → no UPDATE teams must fire.
+func TestBillingReconciler_OrphanSweep_AlreadyCorrectTier_NoUpgrade(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	subID := "sub_orphan_already_pro"
+	os.Setenv("RAZORPAY_PLAN_ID_PRO", "plan_pro_orphan2")
+	defer os.Unsetenv("RAZORPAY_PLAN_ID_PRO")
+
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols))
+	// Orphan candidate already on "pro" — no elevation needed.
+	mock.ExpectQuery(`SELECT pc.subscription_id, pc.team_id, t.plan_tier`).
+		WillReturnRows(sqlmock.NewRows(orphanRowCols).
+			AddRow(subID, teamID, "pro"))
+	// No BEGIN/UPDATE/COMMIT expected — strict sqlmock fails if any fire.
+
+	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
+		Status: "active", PlanID: "plan_pro_orphan2", PaidCount: 5,
+	}}
+
+	w := jobs.NewBillingReconcilerWorker(db, fetcher, &stubGrace{})
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestBillingReconciler_OrphanSweep_NonActiveStatus_NoUpgrade proves the orphan
+// sweep only elevates on an active/authenticated Razorpay status. A checkout
+// whose subscription is still "pending" must NOT be upgraded — the customer
+// has not paid yet. No UPDATE teams must fire.
+func TestBillingReconciler_OrphanSweep_NonActiveStatus_NoUpgrade(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	subID := "sub_orphan_pending"
+
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols))
+	mock.ExpectQuery(`SELECT pc.subscription_id, pc.team_id, t.plan_tier`).
+		WillReturnRows(sqlmock.NewRows(orphanRowCols).
+			AddRow(subID, teamID, "hobby"))
+	// No upgrade expected — the subscription is not yet paid.
+
+	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{
+		Status: "pending", PlanID: "plan_anything", PaidCount: 0,
+	}}
+
+	w := jobs.NewBillingReconcilerWorker(db, fetcher, &stubGrace{})
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestBillingReconciler_OrphanSweep_QueryFailure_FailOpen proves the orphan
+// sweep is fully fail-open: a pending_checkouts query error must NOT fail the
+// whole tick (the primary sweep's corrections are already committed). Work()
+// must still return nil.
+func TestBillingReconciler_OrphanSweep_QueryFailure_FailOpen(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols))
+	mock.ExpectQuery(`SELECT pc.subscription_id, pc.team_id, t.plan_tier`).
+		WillReturnError(errors.New("pending_checkouts table brownout"))
+
+	w := jobs.NewBillingReconcilerWorker(db, &stubFetcher{}, &stubGrace{})
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("orphan-sweep query failure must be fail-open, got error: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
