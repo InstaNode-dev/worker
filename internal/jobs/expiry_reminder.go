@@ -60,6 +60,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
+	"instant.dev/common/resourcestatus"
 )
 
 // ExpiryReminderArgs is the River job payload — no fields, runs as a sweep.
@@ -69,20 +70,25 @@ type ExpiryReminderArgs struct{}
 func (ExpiryReminderArgs) Kind() string { return "expiry_reminder" }
 
 // reminderStage describes one bucket in the 12h/6h/1h schedule.
+//
+// As of the resourcestatus unification it is a thin wrapper over
+// instant.dev/common/resourcestatus.ExpiryStage — the 12h/6h/1h
+// thresholds, the index→reminder_index mapping, and the label→stage_label
+// mapping all live in the shared package, so api and worker can never
+// disagree on which window a resource falls in. The struct is retained
+// only so the existing `stage.index` / `stage.label` / `stage.stage`
+// call sites in Work() and emitAnonExpiryWarningAudit() stay unchanged.
 type reminderStage struct {
-	index         int           // 1-based; matches reminder_index in the email
-	expiresWithin time.Duration // resource fires this stage when expires_at <= now + expiresWithin
-	label         string        // logging label, also flows into the email as stage_label
+	stage resourcestatus.ExpiryStage
+	index int    // 1-based; matches reminder_index in the email
+	label string // logging label, also flows into the email as stage_label
 }
 
-// reminderSchedule is the canonical stage table. Ordered most-distant
-// to most-imminent. selectStage picks the MOST IMMINENT window the
-// resource currently falls in (time-bucket-first) — see P2-12 below.
-var reminderSchedule = []reminderStage{
-	{index: 1, expiresWithin: 12 * time.Hour, label: "stage_12h"},
-	{index: 2, expiresWithin: 6 * time.Hour, label: "stage_6h"},
-	{index: 3, expiresWithin: 1 * time.Hour, label: "stage_1h"},
-}
+// outermostReminderWindow is the widest reminder window — anything past
+// it is too far from expiry to be a candidate for any stage. Derived
+// from the shared package's canonical 12h threshold (no second copy of
+// the duration here).
+const outermostReminderWindow = resourcestatus.ExpiryWindow12h
 
 // reminderCooldown is the minimum wall-clock gap between two
 // dispatches on the same resource. Belt-and-braces — the CAS on
@@ -155,7 +161,7 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 	// The outermost window is the largest stage threshold — anything
 	// outside this window is too far from expiry to be a candidate
 	// for any stage. Inner windows are checked per-stage below.
-	windowEnd := now.Add(reminderSchedule[0].expiresWithin)
+	windowEnd := now.Add(outermostReminderWindow)
 	cooldownBefore := now.Add(-reminderCooldown)
 
 	// LEFT JOIN users u ... AND u.is_primary = true — the is_primary
@@ -314,49 +320,34 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 
 // selectStage picks the stage a row is currently eligible for.
 //
-// P2-12 (BugBash 2026-05-18): the stage is chosen by TIME BUCKET first,
-// then gated on reminders_sent — NOT the other way round. The prior
-// implementation required strict monotonic 0→1→2 progression
-// (`reminders_sent == mustHaveSent`), so a resource created less than
-// 6h before its TTL — already inside the (6h, 1h] or (1h, 0h] window
-// from the very first sweep — still fired stage 1 because that was the
-// only stage whose mustHaveSent matched reminders_sent=0. The email
-// then claimed "12h to go" while only ~50 min actually remained:
-// hours_remaining and stage_label disagreed.
+// The time-bucket classification is delegated to
+// resourcestatus.DeriveExpiryStage — the canonical, shared "most
+// imminent window wins" logic (the P2-12 BugBash fix now lives in the
+// common package, so api and worker can never disagree on the bucket).
+// selectStage layers the worker-specific reminders_sent CAS gate on top:
+// a stage already sent (reminders_sent >= stage index) is skipped.
 //
-// The fix: bucket the resource into the MOST IMMINENT stage window its
-// time-to-expiry falls in (schedule is most-distant → most-imminent, so
-// the last matching entry wins), then fire it only if reminders_sent is
-// still below that stage's index. The CAS in Work() fast-forwards
-// reminders_sent straight to stage.index, consuming any skipped earlier
-// stages. Result: a short-TTL resource gets exactly one correctly
-// labelled reminder ("1h to go"), not a mislabelled "12h" one.
+// P2-12 (BugBash 2026-05-18) recap: the stage is chosen by TIME BUCKET
+// first, then gated on reminders_sent — NOT the other way round. A
+// resource created less than 6h before its TTL is bucketed straight into
+// stage_6h / stage_1h; the CAS in Work() fast-forwards reminders_sent to
+// that stage's index, consuming the skipped earlier stages so exactly one
+// correctly labelled reminder fires.
 //
 // Examples:
-//   remaining 8h, reminders_sent 0 → stage 1 ("12h") — bucket (12h,6h]
-//   remaining 4h, reminders_sent 0 → stage 2 ("6h")  — skips stage 1
-//   remaining 40m, reminders_sent 0 → stage 3 ("1h") — skips 1 and 2
-//   remaining 4h, reminders_sent 2 → no stage (already past stage 2)
+//
+//	remaining 8h, reminders_sent 0 → stage 1 ("12h") — bucket (12h,6h]
+//	remaining 4h, reminders_sent 0 → stage 2 ("6h")  — skips stage 1
+//	remaining 40m, reminders_sent 0 → stage 3 ("1h") — skips 1 and 2
+//	remaining 4h, reminders_sent 2 → no stage (already past stage 2)
 func selectStage(r expiryReminderRow, now time.Time) (reminderStage, bool) {
-	remaining := r.expiresAt.Sub(now)
-	if remaining <= 0 {
+	es := resourcestatus.DeriveExpiryStage(r.expiresAt, now)
+	if !es.IsWarning() {
+		// ExpiryStageNone (too far out) or ExpiryStagePastTTL — no
+		// reminder stage applies.
 		return reminderStage{}, false
 	}
-	var bucket reminderStage
-	found := false
-	for _, s := range reminderSchedule {
-		if remaining <= s.expiresWithin {
-			// schedule is ordered most-distant → most-imminent, so
-			// later matches overwrite earlier ones — the final match
-			// is the tightest window the resource currently sits in.
-			bucket = s
-			found = true
-		}
-	}
-	if !found {
-		// Outside even the widest (12h) window — too far from expiry.
-		return reminderStage{}, false
-	}
+	bucket := reminderStage{stage: es, index: es.Index(), label: es.Label()}
 	if r.remindersSent >= bucket.index {
 		// This stage (or a later one) was already sent — nothing to do.
 		return reminderStage{}, false
@@ -364,22 +355,19 @@ func selectStage(r expiryReminderRow, now time.Time) (reminderStage, bool) {
 	return bucket, true
 }
 
-// hoursLeft rounds the gap up to whole hours, with a floor of 1 so
-// the email never says "0 hours". The legacy worker had the same
-// floor (it just always rendered the floor due to a Brevo template bug).
+// hoursLeft rounds the gap up to whole hours, with a floor of 1 so the
+// email never says "0 hours". Delegates to the shared
+// resourcestatus.HoursUntilExpiry — identical floor-of-1 / round-up
+// semantics, now shared so api and worker render the same number.
 func hoursLeft(expires, now time.Time) int {
-	delta := expires.Sub(now)
-	if delta <= time.Hour {
+	h := resourcestatus.HoursUntilExpiry(expires, now)
+	if h < 1 {
+		// HoursUntilExpiry returns 0 for a past-TTL / zero expiry; the
+		// reminder path only ever calls this for a future expiry, but
+		// keep the floor of 1 so the email copy never regresses.
 		return 1
 	}
-	hours := int(delta.Hours())
-	if delta-time.Duration(hours)*time.Hour > 0 {
-		hours++
-	}
-	if hours < 1 {
-		hours = 1
-	}
-	return hours
+	return h
 }
 
 // emitAnonExpiryWarningAudit writes one anon.expiry_warning audit_log

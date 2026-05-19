@@ -5,16 +5,36 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	madmin "github.com/minio/madmin-go/v3"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
+	"instant.dev/common/resourcestatus"
 	commonv1 "instant.dev/proto/common/v1"
 	"instant.dev/worker/internal/metrics"
 	"instant.dev/worker/internal/provisioner"
 )
+
+// reapableStatusSQLList is the canonical SQL `IN (...)` body listing the
+// statuses a TTL-expiry sweep may act on (active / paused / suspended),
+// derived from resourcestatus.ReapableStatuses() so the reaper's SQL
+// filter can never drift from the shared Go predicate Status.IsReapable.
+// TTL must win over lifecycle state: a paused/suspended resource past its
+// 24h TTL is still expired and must be deprovisioned.
+//
+// Built once at init from a fixed enum of literals (no caller input), so
+// there is no SQL-injection surface — the values are 'active', 'paused',
+// 'suspended'.
+var reapableStatusSQLList = func() string {
+	quoted := make([]string, 0, 3)
+	for _, s := range resourcestatus.ReapableStatuses() {
+		quoted = append(quoted, "'"+s+"'")
+	}
+	return strings.Join(quoted, ", ")
+}()
 
 // ExpireAnonymousArgs holds the arguments for the ExpireAnonymousJob.
 // No fields are needed — it's a periodic maintenance job.
@@ -106,7 +126,7 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 		SELECT id::text, token::text, resource_type, COALESCE(provider_resource_id, '')
 		FROM resources
 		WHERE ((team_id IS NULL AND tier = 'anonymous') OR tier = 'free')
-		  AND status IN ('active', 'paused', 'suspended')
+		  AND status IN (`+reapableStatusSQLList+`)
 		  AND expires_at IS NOT NULL
 		  AND expires_at < now()
 	`)
@@ -195,8 +215,8 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 		// the SELECT above. Gating on status='active' alone would leave the
 		// paused/suspended rows we just deprovisioned stuck in their old status.
 		if _, err := w.db.ExecContext(ctx,
-			`UPDATE resources SET status = 'deleted'
-			 WHERE id = $1 AND status IN ('active', 'paused', 'suspended')`,
+			`UPDATE resources SET status = '`+resourcestatus.StatusDeleted.String()+`'
+			 WHERE id = $1 AND status IN (`+reapableStatusSQLList+`)`,
 			r.id,
 		); err != nil {
 			slog.Error("jobs.expire_anonymous.mark_deleted_failed",
@@ -214,7 +234,7 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	var activeAnon int
 	if scanErr := w.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM resources
-		WHERE team_id IS NULL AND status = 'active' AND expires_at IS NOT NULL
+		WHERE team_id IS NULL AND status = '`+resourcestatus.StatusActive.String()+`' AND expires_at IS NOT NULL
 	`).Scan(&activeAnon); scanErr == nil {
 		metrics.ActiveAnonymousResources.Set(float64(activeAnon))
 	}
