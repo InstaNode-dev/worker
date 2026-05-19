@@ -12,6 +12,7 @@ package jobs
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -739,18 +740,31 @@ func (m recentTimeArg) Match(v driver.Value) bool {
 }
 
 // fakeLedger is the test double for sentLedger. claimed controls what
-// markSent returns; markCalls / releaseCalls count invocations so a test
-// can assert idempotency behavior. seen records claimed audit_ids so a
-// re-run against the SAME fakeLedger behaves like the real ON CONFLICT.
+// markSent returns; markCalls / releaseCalls / isSentCalls count
+// invocations so a test can assert idempotency behavior. seen records
+// claimed audit_ids so a re-run against the SAME fakeLedger behaves
+// like the real ON CONFLICT.
 type fakeLedger struct {
 	mu           sync.Mutex
 	seen         map[string]bool
+	isSentCalls  int
 	markCalls    int
 	releaseCalls int
 	markErr      error
+	isSentErr    error
 }
 
 func newFakeLedger() *fakeLedger { return &fakeLedger{seen: map[string]bool{}} }
+
+func (l *fakeLedger) isSent(_ context.Context, auditID string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.isSentCalls++
+	if l.isSentErr != nil {
+		return false, l.isSentErr
+	}
+	return l.seen[auditID], nil
+}
 
 func (l *fakeLedger) markSent(_ context.Context, auditID string) (bool, error) {
 	l.mu.Lock()
@@ -877,16 +891,27 @@ func TestEventForwarder_Ledger_SendsOnce(t *testing.T) {
 	if got := provider.callCount(); got != 1 {
 		t.Errorf("SendEvent called %d times across two runs of the same audit_id; want 1 — the forwarder_sent ledger must make re-runs idempotent (P1-3)", got)
 	}
-	if ledger.markCalls != 2 {
-		t.Errorf("ledger.markSent called %d times; want 2 (claimed once, rejected once)", ledger.markCalls)
+	// MR-P1-16: under claim-after-2xx the BEFORE-send dedup is the
+	// isSent probe, not markSent. Run 1 calls markSent once (after a
+	// successful send); run 2's isSent probe returns true → markSent is
+	// NEVER called on the duplicate. The total markCalls is 1, not 2.
+	if ledger.markCalls != 1 {
+		t.Errorf("ledger.markSent called %d times; want 1 (only the first successful send claims; the duplicate is suppressed via isSent BEFORE the send)", ledger.markCalls)
+	}
+	if ledger.isSentCalls != 2 {
+		t.Errorf("ledger.isSent called %d times; want 2 (probe runs once per row per tick — both ticks should probe)", ledger.isSentCalls)
 	}
 }
 
-// TestEventForwarder_TransientReleasesLedger guards the ledger correctness
-// corner of P1-3: a claim followed by a Transient send failure MUST
-// release the claim, otherwise the retry next tick would see claimed=false
-// and skip the row forever (a permanently-lost email).
-func TestEventForwarder_TransientReleasesLedger(t *testing.T) {
+// TestEventForwarder_TransientDoesNotClaim guards the MR-P1-16 ledger
+// ordering: under claim-after-2xx, a Transient send MUST NOT have claimed
+// the ledger (the claim is gated on a confirmed 2xx) — so there is
+// nothing to release and the audit_id is NOT in `seen`. Next tick will
+// re-fetch the row, the isSent probe will return false, and the send
+// will retry. Pre-MR-P1-16 ordering claimed before the send and required
+// release on Transient; that ordering opened a crash-loss window
+// (see TestEventForwarder_CrashAfterSendBeforeClaim_NoLoss below).
+func TestEventForwarder_TransientDoesNotClaim(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -910,11 +935,104 @@ func TestEventForwarder_TransientReleasesLedger(t *testing.T) {
 	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
-	if ledger.releaseCalls != 1 {
-		t.Errorf("ledger.release called %d times after a Transient send; want 1 — an un-released claim would skip the row forever on retry", ledger.releaseCalls)
+	if ledger.markCalls != 0 {
+		t.Errorf("ledger.markSent called %d times after a Transient send; want 0 — under claim-after-2xx, Transient must NEVER claim", ledger.markCalls)
+	}
+	if ledger.releaseCalls != 0 {
+		t.Errorf("ledger.release called %d times; want 0 — there is no claim to release under claim-after-2xx", ledger.releaseCalls)
 	}
 	if ledger.seen["transient-id"] {
-		t.Errorf("transient-id still claimed in the ledger after release — the retry next tick would never re-send it")
+		t.Errorf("transient-id appears in the ledger after a Transient send — the row must be retryable next tick")
+	}
+}
+
+// TestEventForwarder_CrashAfterSendBeforeClaim_NoLoss is the MR-P1-16
+// regression test.
+//
+// BUG (pre-MR-P1-16, the 2026-05-19 ordering): the forwarder claimed
+// `forwarder_sent` BEFORE calling SendEvent. A pod-kill between the
+// claim commit and the send returning left the row ledgered with no
+// email actually delivered. On restart the next tick re-fetched the
+// row, saw claimed=false → branched to "duplicate_suppressed" → cursor
+// advanced → email permanently lost, no alert.
+//
+// FIX (MR-P1-16, this PR): the claim moved to AFTER a confirmed 2xx.
+// A crash mid-POST now leaves the ledger un-claimed and the cursor
+// un-advanced — restart re-sends the email (Brevo X-Mailin-Custom
+// header absorbs the duplicate where honored). A duplicate is strictly
+// safer than a silent loss.
+//
+// Repro: a fake provider whose SendEvent returns nil (success) on
+// the first call, then SIGKILL is simulated by the test simply NOT
+// crashing the process — but the test asserts the email IS attempted
+// on a re-run. The pre-fix ordering would have skipped the re-run
+// (the ledger row from the crashed run would have been present); the
+// fix leaves the ledger un-claimed if the claim itself fails post-send.
+//
+// We exercise the precise loss-pathway by using a markErr on the FIRST
+// run only (simulating "send succeeded but ledger write failed / pod
+// died during ledger commit"). With the old ordering, the row would
+// have been pre-claimed before the send. With the new ordering, the
+// ledger only ever sees markSent AFTER a successful send, so a
+// markSent error after a successful send is a "transient hold" (cursor
+// not advanced) and the next tick retries the send. The email IS
+// re-attempted instead of being silently lost.
+func TestEventForwarder_CrashAfterSendBeforeClaim_NoLoss(t *testing.T) {
+	createdAt := time.Now().UTC().Add(-time.Hour)
+
+	provider := &fakeProvider{} // default success
+	ledger := newFakeLedger()
+	// First run: markSent errors after the send (simulating a crash
+	// between SendEvent returning and the ledger insert committing,
+	// or a transient DB error on the claim).
+	ledger.markErr = errors.New("simulated crash: ledger insert failed after send")
+
+	runOnce := func(cursor *memCursor) {
+		db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer db.Close()
+		mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+			WillReturnRows(sqlmock.NewRows(auditRowsCols).
+				AddRow("crash-window-id", "team-1", auditKindOnboardingClaimed, "",
+					"claim", []byte(`{"signup_source":"github"}`), createdAt, "owner@example.com"))
+		w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+		w.ledger = ledger
+		if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+			t.Fatalf("Work: %v", err)
+		}
+	}
+
+	// Run 1: send succeeds, ledger insert errors → cursor NOT advanced,
+	// transient_halt — row eligible for retry.
+	cursor1 := &memCursor{}
+	runOnce(cursor1)
+	if got := provider.callCount(); got != 1 {
+		t.Fatalf("Run 1: SendEvent called %d times; want 1 (send happens before claim)", got)
+	}
+	// Cursor must NOT have advanced past the zero value. If it advanced,
+	// the next tick would skip this row, losing the email.
+	if cursor1.c.ID != "" || !cursor1.c.CreatedAt.IsZero() {
+		t.Errorf("Run 1: cursor advanced to id=%q created_at=%v after a failed post-send claim — next tick would skip this row, losing the email",
+			cursor1.c.ID, cursor1.c.CreatedAt)
+	}
+
+	// Run 2: clear the markErr (simulating recovery from the crash)
+	// and re-run with a fresh zero cursor (simulating cursor reset /
+	// new pod start). The email MUST be re-attempted, NOT silently
+	// suppressed. Under the OLD ordering this would be skipped (the
+	// pre-claim from run 1 would have been written before the send
+	// crashed) — a permanent loss. Under the NEW ordering, run 1's
+	// failed claim left the ledger empty, so isSent returns false
+	// and the send is re-tried.
+	ledger.markErr = nil
+	runOnce(&memCursor{})
+	if got := provider.callCount(); got != 2 {
+		t.Errorf("Run 2 after a crash-window failure: SendEvent called %d times total; want 2 — claim-after-2xx must allow re-send when a post-send claim fails (MR-P1-16)", got)
+	}
+	if !ledger.seen["crash-window-id"] {
+		t.Errorf("After the recovery run the audit_id must be in the ledger so subsequent ticks won't re-send")
 	}
 }
 

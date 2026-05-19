@@ -260,7 +260,7 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 		// the row instead of looping on a programmer bug.
 		slog.Error("email.brevo.marshal_failed",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
 		return &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: marshal payload"}
@@ -310,7 +310,7 @@ func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
 		// past the row; the caller is supposed to render a subject.
 		slog.Error("email.brevo.raw_missing_subject",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 		)
 		return &SendError{
 			Class:   SendClassPermanent,
@@ -327,7 +327,7 @@ func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
 	if err != nil {
 		slog.Error("email.brevo.raw_marshal_failed",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
 		return &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: raw marshal"}
@@ -363,7 +363,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		// Network error, timeout, dns failure. Transient by definition.
 		slog.Warn("email.brevo.http_failed",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"path", string(path),
 			"error", err,
 		)
@@ -376,7 +376,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		slog.Info("email.brevo.event_sent",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"status", resp.StatusCode,
 			"path", string(path),
 			"template_id", tmplID,
@@ -399,7 +399,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		// payload rejects, not account auth failure.
 		slog.Error("email.brevo.auth_wall",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"status", resp.StatusCode,
 			"path", string(path),
 			"body", string(respBody),
@@ -416,7 +416,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		// the cursor holds and the row retries next tick.
 		slog.Warn("email.brevo.rate_limited",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"status", resp.StatusCode,
 			"path", string(path),
 			"body", string(respBody),
@@ -432,7 +432,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		// correct: holding it pins the whole queue on one bad row.
 		slog.Error("email.brevo.permanent_4xx",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"status", resp.StatusCode,
 			"path", string(path),
 			"body", string(respBody),
@@ -446,7 +446,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		// 5xx — Brevo upstream issue. Hold cursor; retry next tick.
 		slog.Warn("email.brevo.transient_5xx",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"status", resp.StatusCode,
 			"path", string(path),
 			"body", string(respBody),

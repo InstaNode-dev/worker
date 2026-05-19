@@ -122,7 +122,8 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.deployment_expirer.completed",
+		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.
+		slog.Debug("jobs.deployment_expirer.completed",
 			"expired", 0, "candidates", 0,
 			"duration_ms", time.Since(start).Milliseconds(),
 		)

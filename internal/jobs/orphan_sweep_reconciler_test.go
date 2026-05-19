@@ -73,17 +73,20 @@ func (f *fakeOrphanCanceler) CancelSubscription(_ context.Context, subID string)
 }
 
 // fakeNamespaceLister extends fakeNamespaceDeleter behaviour with the
-// cluster-wide lists PASS 3 (deploy namespaces) and PASS 4 (customer
-// namespaces) need. listErr / customerListErr, when set, make the
-// corresponding List return that error — used to exercise the fail-open
-// posture for an RBAC Forbidden / transient k8s failure.
+// cluster-wide lists PASS 3 (deploy namespaces), PASS 4 (customer
+// namespaces), and PASS 5 (stack namespaces — T6 P0-1) need. listErr /
+// customerListErr / stackListErr, when set, make the corresponding List
+// return that error — used to exercise the fail-open posture for an RBAC
+// Forbidden / transient k8s failure.
 type fakeNamespaceLister struct {
 	namespaces         []string // instant-deploy-* — returned by ListDeployNamespaces
 	customerNamespaces []string // instant-customer-* — returned by ListCustomerNamespaces
+	stackNamespaces    []string // instant-stack-* — returned by ListStackNamespaces
 	deleted            []string
 	failOn             map[string]error
 	listErr            error
 	customerListErr    error
+	stackListErr       error
 }
 
 func newFakeNamespaceLister(namespaces ...string) *fakeNamespaceLister {
@@ -97,6 +100,13 @@ func newFakeNamespaceLister(namespaces ...string) *fakeNamespaceLister {
 // reports to PASS 4. Returns the fake for chaining.
 func (f *fakeNamespaceLister) withCustomerNamespaces(ns ...string) *fakeNamespaceLister {
 	f.customerNamespaces = ns
+	return f
+}
+
+// withStackNamespaces sets the instant-stack-* namespaces the fake reports
+// to PASS 5 (T6 P0-1). Returns the fake for chaining.
+func (f *fakeNamespaceLister) withStackNamespaces(ns ...string) *fakeNamespaceLister {
+	f.stackNamespaces = ns
 	return f
 }
 
@@ -135,6 +145,15 @@ func (f *fakeNamespaceLister) ListCustomerNamespaces(_ context.Context) ([]strin
 	return out, nil
 }
 
+func (f *fakeNamespaceLister) ListStackNamespaces(_ context.Context) ([]string, error) {
+	if f.stackListErr != nil {
+		return nil, f.stackListErr
+	}
+	out := make([]string, len(f.stackNamespaces))
+	copy(out, f.stackNamespaces)
+	return out, nil
+}
+
 // expectEmptyPass4 queues the sqlmock expectation for PASS 4's live-token
 // query returning nothing — used when the fake reports customer namespaces
 // but a test only cares about the earlier passes, OR when the fake reports
@@ -143,6 +162,15 @@ func (f *fakeNamespaceLister) ListCustomerNamespaces(_ context.Context) ([]strin
 func expectEmptyPass4(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"token"}))
+}
+
+// expectEmptyPass5 queues the sqlmock expectation for PASS 5's live-stack-id
+// query returning nothing — same shape as expectEmptyPass4 but for stacks.
+// Only call this when the fake reports a non-empty stackNamespaces slice;
+// PASS 5 short-circuits before the query on an empty namespaces list.
+func expectEmptyPass5(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`SELECT id::text FROM stacks`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 }
 
 // captureBytesArgOSR captures a JSONB column's bytes for audit assertions.
@@ -576,5 +604,115 @@ func TestOrphanSweep_Pass4_NoCustomerNamespaces_NoQuery(t *testing.T) {
 	}
 	if len(lister.deleted) != 0 {
 		t.Errorf("PASS 4 deleted namespaces on an empty customer set: %v", lister.deleted)
+	}
+}
+
+// TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace is the T6 P0-1
+// regression test (BugBash 2026-05-20).
+//
+// THE BUG: ExpireStacksWorker was wired with nsPrefix="instant-apps-"
+// (from cfg.KubeNamespaceApps+"-"), but real stack namespaces are
+// "instant-stack-<id>". The safety guard in deleteK8sNamespace refused
+// every real stack namespace and returned nil-success. ExpireStacksWorker
+// treated nil as "teardown succeeded" and DELETE'd the `stacks` row
+// anyway → orphan namespace + pods + ingress + TLS cert forever, no DB
+// pointer to recover.
+//
+// THE FIX: (a) ExpireStacksWorker now carries the correct
+// "instant-stack-" prefix (workers.go). (b) PASS 5 (this test) lists
+// every instant-stack-* namespace and deletes any whose <id> has no row
+// in `stacks`, catching pre-fix orphans and guarding against recurrence.
+//
+// THE ASSERTION: given two stack namespaces — one whose id IS still
+// present in `stacks`, one whose id is NOT — PASS 5 deletes ONLY the
+// orphan. If a future edit drops PASS 5 (or reintroduces the prefix
+// mismatch via ExpireStacksWorker only and never adds the backstop),
+// the orphan is never deleted and this test fails.
+func TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	liveStackID := "1111aaaa-bbbb-cccc-dddd-eeeeffff0000"
+	orphanStackID := "2222aaaa-bbbb-cccc-dddd-eeeeffff0000"
+	liveNS := ExpireStacksNamespacePrefix + liveStackID
+	orphanNS := ExpireStacksNamespacePrefix + orphanStackID
+
+	// PASS 1 + 2 skipped (nil executor, nil canceler).
+	// PASS 3 (no deploy namespaces — fake returns empty).
+	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+	// PASS 4 (no customer namespaces — fake returns empty; short-circuits).
+	// PASS 5: live-stack-ids query returns ONLY liveStackID → orphanNS is
+	// the orphan.
+	mock.ExpectQuery(`SELECT id::text FROM stacks`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(liveStackID))
+
+	lister := newFakeNamespaceLister().withStackNamespaces(liveNS, orphanNS)
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if len(lister.deleted) != 1 || lister.deleted[0] != orphanNS {
+		t.Errorf("T6 P0-1 regression: deleted stack namespaces = %v, want [%s] "+
+			"(the orphan must be reclaimed; the live-stack namespace must be kept)",
+			lister.deleted, orphanNS)
+	}
+}
+
+// TestOrphanSweep_Pass5_NoStackNamespaces_NoQuery proves PASS 5 short-
+// circuits when the cluster has no instant-stack-* namespaces — must NOT
+// run the live-stack-id query. Guards against a delete-everything bug if
+// the query is ever moved before the empty check.
+func TestOrphanSweep_Pass5_NoStackNamespaces_NoQuery(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// PASS 3 only — empty deploy + empty customer + empty stack set means
+	// nothing else queues.
+	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+
+	lister := newFakeNamespaceLister()
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if len(lister.deleted) != 0 {
+		t.Errorf("PASS 5 deleted namespaces on an empty stack set: %v", lister.deleted)
+	}
+}
+
+// TestExpireStacksNamespacePrefix_MatchesStackProviderContract is the
+// build-SHA gate for the T6 P0-1 prefix-fix. The pre-fix code used
+// `cfg.KubeNamespaceApps+"-"` = "instant-apps-" which never matched a
+// real "instant-stack-<id>" namespace and silently passed the safety
+// guard. Any future edit that changes ExpireStacksNamespacePrefix away
+// from "instant-stack-" fails this test loudly.
+func TestExpireStacksNamespacePrefix_MatchesStackProviderContract(t *testing.T) {
+	const wantPrefix = "instant-stack-"
+	if ExpireStacksNamespacePrefix != wantPrefix {
+		t.Fatalf("ExpireStacksNamespacePrefix = %q; want %q — must match api compute.StackNamespacePrefix",
+			ExpireStacksNamespacePrefix, wantPrefix)
+	}
+	// And the wired-in worker MUST carry that exact prefix. Construct an
+	// ExpireStacksWorker via the exported constructor and verify the
+	// nsPrefix field (package-private — visible from the same package's
+	// _test.go).
+	w := NewExpireStacksWorker(nil, ExpireStacksNamespacePrefix)
+	if w.nsPrefix != wantPrefix {
+		t.Fatalf("NewExpireStacksWorker(nsPrefix=%q): worker carried %q; want %q — the safety guard refuses every real stack namespace if these drift",
+			ExpireStacksNamespacePrefix, w.nsPrefix, wantPrefix)
 	}
 }

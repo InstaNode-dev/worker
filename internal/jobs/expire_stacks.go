@@ -15,6 +15,19 @@ import (
 	"github.com/riverqueue/river"
 )
 
+// ExpireStacksNamespacePrefix is the prefix used by the api stack
+// provider (`compute.StackNamespace = "instant-stack-" + stackID`).
+// EVERY namespace handled by this worker must start with this prefix —
+// the `deleteK8sNamespace` safety guard refuses anything else.
+//
+// T6 P0-1 (BugBash 2026-05-20): before this constant, the prefix came
+// from `cfg.KubeNamespaceApps+"-"` = "instant-apps-", which never
+// matches a real stack namespace → the safety guard refused every
+// delete and returned nil-success → the ExpireStacks Worker proceeded
+// to DELETE the `stacks` row anyway, orphaning the namespace, pods,
+// services, ingress, and TLS cert forever with no DB pointer.
+const ExpireStacksNamespacePrefix = "instant-stack-"
+
 // ExpireStacksArgs holds the arguments for the ExpireStacksJob.
 // No fields are needed — it's a periodic maintenance job.
 type ExpireStacksArgs struct{}

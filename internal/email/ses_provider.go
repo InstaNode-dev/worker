@@ -157,7 +157,7 @@ func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 		// instead of looping forever on a programmer bug.
 		slog.Error("email.ses.marshal_failed",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
 		return &SendError{Class: SendClassPermanent, Cause: err, Message: "ses: marshal params"}
@@ -183,7 +183,7 @@ func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 
 	slog.Info("email.ses.event_sent",
 		"kind", evt.Kind,
-		"recipient", evt.Recipient,
+		"recipient", maskEmail(evt.Recipient),
 		"template", tmplName,
 	)
 	return nil
@@ -212,7 +212,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		slog.Warn("email.ses.context_canceled",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
 		return &SendError{Class: SendClassTransient, Cause: err, Message: "ses: context canceled"}
@@ -234,7 +234,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 			"SendingPausedException":
 			slog.Warn("email.ses.transient_throttle",
 				"kind", evt.Kind,
-				"recipient", evt.Recipient,
+				"recipient", maskEmail(evt.Recipient),
 				"code", code,
 				"message", apiErr.ErrorMessage(),
 			)
@@ -253,7 +253,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 			"SignatureDoesNotMatch", "AccessDeniedException":
 			slog.Error("email.ses.permanent",
 				"kind", evt.Kind,
-				"recipient", evt.Recipient,
+				"recipient", maskEmail(evt.Recipient),
 				"code", code,
 				"template", tmplName,
 				"message", apiErr.ErrorMessage(),
@@ -268,7 +268,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 		case "InternalServiceErrorException", "ServiceUnavailableException":
 			slog.Warn("email.ses.transient_5xx",
 				"kind", evt.Kind,
-				"recipient", evt.Recipient,
+				"recipient", maskEmail(evt.Recipient),
 				"code", code,
 				"message", apiErr.ErrorMessage(),
 			)
@@ -285,7 +285,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 		case smithy.FaultServer:
 			slog.Warn("email.ses.transient_server_fault",
 				"kind", evt.Kind,
-				"recipient", evt.Recipient,
+				"recipient", maskEmail(evt.Recipient),
 				"code", code,
 				"message", apiErr.ErrorMessage(),
 			)
@@ -299,7 +299,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 			// row can't pin the queue forever.
 			slog.Error("email.ses.permanent_client_fault",
 				"kind", evt.Kind,
-				"recipient", evt.Recipient,
+				"recipient", maskEmail(evt.Recipient),
 				"code", code,
 				"template", tmplName,
 				"message", apiErr.ErrorMessage(),
@@ -318,7 +318,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 	if errors.As(err, &netErr) {
 		slog.Warn("email.ses.network",
 			"kind", evt.Kind,
-			"recipient", evt.Recipient,
+			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
 		return &SendError{Class: SendClassTransient, Cause: err, Message: "ses: network"}
@@ -328,7 +328,7 @@ func classifySESError(err error, evt EventEmail, tmplName string) error {
 	// cursor (mirrors the package-level ClassOf default).
 	slog.Warn("email.ses.unknown_error",
 		"kind", evt.Kind,
-		"recipient", evt.Recipient,
+		"recipient", maskEmail(evt.Recipient),
 		"error", err,
 	)
 	return &SendError{Class: SendClassTransient, Cause: err, Message: "ses: unknown error"}

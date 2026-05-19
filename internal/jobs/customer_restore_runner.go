@@ -190,12 +190,25 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 		processed++
 	}
 
-	slog.Info("jobs.customer_restore_runner.completed",
-		"processed", processed,
-		"succeeded", succeeded,
-		"failed", processed-succeeded,
-		"job_id", job.ID,
-	)
+	// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.
+	// Steady state is processed=0; surface INFO only when work happened
+	// or a failure surfaced (otherwise this fires every River batch).
+	failedCount := processed - succeeded
+	if processed == 0 && failedCount == 0 {
+		slog.Debug("jobs.customer_restore_runner.completed",
+			"processed", processed,
+			"succeeded", succeeded,
+			"failed", failedCount,
+			"job_id", job.ID,
+		)
+	} else {
+		slog.Info("jobs.customer_restore_runner.completed",
+			"processed", processed,
+			"succeeded", succeeded,
+			"failed", failedCount,
+			"job_id", job.ID,
+		)
+	}
 	return nil
 }
 

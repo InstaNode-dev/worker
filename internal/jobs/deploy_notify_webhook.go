@@ -300,7 +300,8 @@ func (w *DeployNotifyWebhookWorker) Work(ctx context.Context, job *river.Job[Dep
 	}
 
 	if len(rows) == 0 {
-		slog.Info("jobs.deploy_notify_webhook.completed",
+		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.
+		slog.Debug("jobs.deploy_notify_webhook.completed",
 			"sent", 0,
 			"skipped", 0,
 			"failed", 0,

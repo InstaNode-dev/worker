@@ -10,6 +10,8 @@ import (
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
 	commonv1 "instant.dev/proto/common/v1"
+
+	"instant.dev/worker/internal/logsafe"
 )
 
 // UpdateStorageBytesArgs holds arguments for the storage bytes update job.
@@ -108,7 +110,7 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 			if w.minioClient == nil {
 				slog.Warn("jobs.update_storage_bytes.minio_scanner_unavailable",
 					"resource_id", id,
-					"token", token,
+					"token", logsafe.Token(token),
 				)
 				continue // fail-open — skip until scanner is wired up
 			}
@@ -116,7 +118,7 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 			if queryErr != nil {
 				slog.Error("jobs.update_storage_bytes.minio_error",
 					"resource_id", id,
-					"token", token,
+					"token", logsafe.Token(token),
 					"resource_type", resourceType,
 					"error", queryErr,
 				)
@@ -135,7 +137,7 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 			if queryErr != nil {
 				slog.Error("jobs.update_storage_bytes.provisioner_error",
 					"resource_id", id,
-					"token", token,
+					"token", logsafe.Token(token),
 					"resource_type", resourceType,
 					"error", queryErr,
 				)

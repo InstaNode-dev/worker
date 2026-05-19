@@ -70,6 +70,7 @@ import (
 	"go.opentelemetry.io/otel"
 
 	commonv1 "instant.dev/proto/common/v1"
+	"instant.dev/worker/internal/logsafe"
 	"instant.dev/worker/internal/metrics"
 )
 
@@ -216,16 +217,32 @@ type entitlementCandidate struct {
 // it against the live plans registry. Returns:
 //
 //	drift    — true when the resource needs a re-grade.
-//	entitled — the entitled connection cap for planTier (the value the
+//	entitled — the entitled connection cap for resourceTier (the value the
 //	           provisioner should apply). Only meaningful when drift is true.
 //
-// ephemeral tiers (anonymous/free) always return drift=false: they are never
-// re-graded up regardless of their applied_conn_limit.
-func shouldRegrade(plans PlanRegistry, planTier string, appliedConnLimit sql.NullInt64) (drift bool, entitled int) {
-	if entitlementEphemeralTiers[planTier] {
+// MR-P1-21 / T8 P1-6 (BugBash 2026-05-20): caps are resolved from
+// resourceTier (the per-row SNAPSHOT), not team.plan_tier. The pre-fix
+// code joined teams.plan_tier and resolved caps from THAT — which silently
+// degraded a downgraded customer's existing paid resources, contradicting
+// the documented "keep their tier" courtesy:
+//
+//	team upgrades free → pro → resource.tier=pro, applied_conn_limit=20
+//	team downgrades pro → hobby → team.plan_tier=hobby BUT resource.tier
+//	  stays pro (the documented snapshot courtesy)
+//	pre-fix reconciler: entitled = ConnectionsLimit("hobby") = 8
+//	→ drift detected (20 != 8) → ALTER ROLE … CONNECTION LIMIT 8
+//	→ paid customer's pro infra cap silently cut to hobby.
+//
+// The snapshot IS the entitlement-of-record for an individual resource —
+// that is the whole point of the snapshot/downgrade-asymmetry design.
+//
+// Ephemeral tiers (anonymous/free) always return drift=false: they are
+// never re-graded up regardless of their applied_conn_limit.
+func shouldRegrade(plans PlanRegistry, resourceTier string, appliedConnLimit sql.NullInt64) (drift bool, entitled int) {
+	if entitlementEphemeralTiers[resourceTier] {
 		return false, 0
 	}
-	entitled = plans.ConnectionsLimit(planTier, "postgres")
+	entitled = plans.ConnectionsLimit(resourceTier, "postgres")
 	if !appliedConnLimit.Valid {
 		// NULL — never re-graded since migration 047 added the column.
 		return true, entitled
@@ -257,6 +274,28 @@ type redisEntitlementCandidate struct {
 	providerResourceID sql.NullString // nullable — prod rows are NULL; namespace derived from token
 	resourceTier       string         // resources.tier — informational
 	planTier           string         // teams.plan_tier — the entitled tier
+}
+
+// mongoEntitlementCandidate is the projection for one MongoDB sweep row.
+//
+// MR-P1-22 / T8 P1-9 (BugBash 2026-05-20): the reconciler previously only
+// re-graded Postgres + Redis; a hobby → pro upgrade silently under-delivered
+// Mongo (the Mongo user's storage quota / connection cap stayed at hobby
+// values until the resource was re-provisioned). This sweep is the third
+// arm. It iterates every active mongo resource and calls RegradeResource —
+// today the provisioner's RegradeResource returns `applied=false, skip_reason
+// ="unsupported resource type for regrade"` for MONGODB, so the sweep is a
+// loud no-op (one skipped count per tick) and a clear hook for when the
+// Mongo arm of provisioner.regradeMongo is implemented. With the hook in
+// place the surface checklist (CLAUDE.md rule 22 + 18) is satisfied — a
+// future provisioner.regradeMongo implementation does not also have to add
+// the worker sweep.
+type mongoEntitlementCandidate struct {
+	id                 uuid.UUID
+	token              string
+	providerResourceID sql.NullString
+	resourceTier       string
+	planTier           string
 }
 
 // Work executes one sweep: Postgres connection-cap regrade + Redis maxmemory
@@ -325,12 +364,19 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 	for _, c := range pgCandidates {
 		pgScanned++
 
-		if entitlementEphemeralTiers[c.planTier] {
+		// Skip when EITHER the resource snapshot OR the team plan is
+		// ephemeral: the snapshot is the source of truth (MR-P1-21), but
+		// a deleted/downgraded-to-free team's resources should not be
+		// regraded even if their snapshot is paid (defensive).
+		if entitlementEphemeralTiers[c.resourceTier] || entitlementEphemeralTiers[c.planTier] {
 			pgSkippedTier++
 			continue
 		}
 
-		needsRegrade, entitled := shouldRegrade(w.plans, c.planTier, c.appliedConnLimit)
+		// MR-P1-21: resolve caps from resource.tier (the per-row snapshot),
+		// NOT team.plan_tier. A downgraded paying customer keeps their
+		// previously-applied cap because the snapshot is preserved.
+		needsRegrade, entitled := shouldRegrade(w.plans, c.resourceTier, c.appliedConnLimit)
 		if !needsRegrade {
 			continue
 		}
@@ -343,11 +389,13 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		}
 
 		// Per-resource re-grade. requestID is the resource id — gives the
-		// provisioner a stable idempotency key per resource.
+		// provisioner a stable idempotency key per resource. The TIER passed
+		// to the provisioner is the resource.tier snapshot (MR-P1-21), so
+		// the infra cap matches the resource's recorded entitlement.
 		regradeCtx, cancel := context.WithTimeout(ctx, entitlementReconcilerRegradeTimeout)
 		out, regErr := w.regrader.RegradeResource(
 			regradeCtx, c.token, c.providerResourceID.String,
-			commonv1.ResourceType_RESOURCE_TYPE_POSTGRES, c.planTier, c.id.String(),
+			commonv1.ResourceType_RESOURCE_TYPE_POSTGRES, c.resourceTier, c.id.String(),
 		)
 		cancel()
 
@@ -356,6 +404,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			metrics.EntitlementRegradeFailedTotal.Inc()
 			slog.Error("jobs.entitlement_reconciler.postgres.regrade_failed",
 				"resource_id", c.id.String(),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"old_limit", oldLimit,
 				"entitled_limit", entitled,
@@ -369,6 +418,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			metrics.EntitlementRegradeFailedTotal.Inc()
 			slog.Warn("jobs.entitlement_reconciler.postgres.regrade_skipped",
 				"resource_id", c.id.String(),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"old_limit", oldLimit,
 				"entitled_limit", entitled,
@@ -389,6 +439,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			metrics.EntitlementRegradeFailedTotal.Inc()
 			slog.Error("jobs.entitlement_reconciler.postgres.persist_failed",
 				"resource_id", c.id.String(),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"applied_conn_limit", out.AppliedConnLimit,
 				"error", uErr,
@@ -400,6 +451,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		metrics.EntitlementRegradedTotal.Inc()
 		slog.Info("jobs.entitlement_reconciler.postgres.regraded",
 			"resource_id", c.id.String(),
+			"resource_tier", c.resourceTier,
 			"plan_tier", c.planTier,
 			"old_limit", oldLimit,
 			"new_limit", out.AppliedConnLimit,
@@ -416,6 +468,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		slog.Warn(entitlementDriftCorrectedSignal,
 			"resource_type", entitlementResourceTypePostgres,
 			"resource_id", c.id.String(),
+			"resource_tier", c.resourceTier,
 			"plan_tier", c.planTier,
 			"old_limit", oldLimit,
 			"new_limit", out.AppliedConnLimit,
@@ -492,7 +545,11 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		redisChecked++
 		metrics.RedisMaxmemoryCheckedTotal.Inc()
 
-		if entitlementEphemeralTiers[c.planTier] {
+		// MR-P1-21 (Redis twin): skip on EITHER ephemeral resource.tier
+		// OR ephemeral team.plan_tier. Caps come from resource.tier — the
+		// snapshot — so a downgraded paying customer's Redis pod keeps
+		// its pro maxmemory cap (T8 P1-10 was the noeviction-shrink bug).
+		if entitlementEphemeralTiers[c.resourceTier] || entitlementEphemeralTiers[c.planTier] {
 			// Anonymous and free tier dedicated Redis would be unusual, but skip
 			// gracefully for correctness — they are not re-graded.
 			redisSkippedTier++
@@ -515,10 +572,13 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			nsIdentifier = c.providerResourceID.String
 		}
 
+		// MR-P1-21: tier passed to the provisioner is the resource snapshot
+		// — NOT team.plan_tier. A downgraded paying customer keeps their
+		// previously-applied maxmemory because the snapshot is preserved.
 		regradeCtx, cancel := context.WithTimeout(ctx, entitlementReconcilerRegradeTimeout)
 		out, regErr := w.regrader.RegradeResource(
 			regradeCtx, c.token, nsIdentifier,
-			commonv1.ResourceType_RESOURCE_TYPE_REDIS, c.planTier, c.id.String(),
+			commonv1.ResourceType_RESOURCE_TYPE_REDIS, c.resourceTier, c.id.String(),
 		)
 		cancel()
 
@@ -527,7 +587,8 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			metrics.RedisMaxmemoryFailedTotal.Inc()
 			slog.Error("jobs.entitlement_reconciler.redis.regrade_failed",
 				"resource_id", c.id.String(),
-				"token", c.token,
+				"token", logsafe.Token(c.token),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"ns_identifier", nsIdentifier,
 				"provider_resource_id", c.providerResourceID.String,
@@ -541,7 +602,8 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			metrics.RedisMaxmemoryAppliedTotal.Inc()
 			slog.Info("jobs.entitlement_reconciler.redis.maxmemory_applied",
 				"resource_id", c.id.String(),
-				"token", c.token,
+				"token", logsafe.Token(c.token),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"applied_maxmemory_mb", out.AppliedConnLimit, // AppliedConnLimit repurposed for MB
 				"ns_identifier", nsIdentifier,
@@ -554,6 +616,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			slog.Warn(entitlementDriftCorrectedSignal,
 				"resource_type", entitlementResourceTypeRedis,
 				"resource_id", c.id.String(),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"new_limit", out.AppliedConnLimit,
 			)
@@ -562,12 +625,26 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 			metrics.RedisMaxmemorySkippedTotal.Inc()
 			slog.Debug("jobs.entitlement_reconciler.redis.maxmemory_skipped",
 				"resource_id", c.id.String(),
-				"token", c.token,
+				"token", logsafe.Token(c.token),
+				"resource_tier", c.resourceTier,
 				"plan_tier", c.planTier,
 				"skip_reason", out.SkipReason,
 			)
 		}
 	}
+
+	// ── MongoDB: regrade fan-out (MR-P1-22) ──────────────────────────────────
+	//
+	// Iterates every active, non-expired Mongo resource and calls
+	// RegradeResource. The provisioner today returns
+	// {applied:false, skip_reason:"unsupported resource type for regrade"}
+	// for MONGODB — that's expected, the sweep is the loud no-op that gives a
+	// future Mongo-regrade implementation a CI-protected attach point. When
+	// provisioner.regradeMongo lands, this sweep starts delivering Mongo cap
+	// updates with zero changes to the worker. Until then, every sweep emits
+	// one skipped count per Mongo resource and the operator sees the sweep is
+	// covering Mongo (rather than silently omitting it, which was the bug).
+	mongoChecked, mongoApplied, mongoSkipped, mongoFailed, mongoSkippedTier := w.sweepMongoEntitlements(ctx, teamFilter)
 
 	slog.Info("jobs.entitlement_reconciler.completed",
 		// Postgres metrics (backward-compatible log keys)
@@ -582,7 +659,127 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		"redis_skipped", redisSkipped,
 		"redis_failed", redisFailed,
 		"redis_skipped_ephemeral", redisSkippedTier,
+		// Mongo MR-P1-22 metrics (sweep coverage; provisioner-side
+		// implementation lands separately — see sweepMongoEntitlements).
+		"mongo_checked", mongoChecked,
+		"mongo_applied", mongoApplied,
+		"mongo_skipped", mongoSkipped,
+		"mongo_failed", mongoFailed,
+		"mongo_skipped_ephemeral", mongoSkippedTier,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return nil
+}
+
+// sweepMongoEntitlements is the MR-P1-22 / T8 P1-9 arm: every sweep iterates
+// active, non-expired Mongo resources and asks the provisioner to RegradeResource.
+// The tier sent is `resource.tier` — the per-row snapshot — matching the
+// downgrade-asymmetry contract that the snapshot is the entitlement-of-record
+// (MR-P1-21).
+//
+// Returns: (checked, applied, skipped, failed, skippedEphemeral). A query
+// failure is logged at WARN and treated as a zero-row tick — Mongo coverage
+// is best-effort right now (until provisioner.regradeMongo ships, every
+// tick is a skip, so a transient query failure has zero customer impact).
+func (w *EntitlementReconcilerWorker) sweepMongoEntitlements(ctx context.Context, teamFilter string) (checked, applied, skipped, failed, skippedTier int) {
+	mongoRows, err := w.db.QueryContext(ctx, `
+		SELECT r.id, r.token, r.provider_resource_id, r.tier, t.plan_tier
+		  FROM resources r
+		  JOIN teams t ON t.id = r.team_id
+		 WHERE r.resource_type = 'mongodb'
+		   AND r.status = 'active'
+		   AND (r.expires_at IS NULL OR r.expires_at > now())
+		   AND ($2 = '' OR t.id::text = ANY(string_to_array($2, ',')))
+		 ORDER BY r.id
+		 LIMIT $1
+	`, entitlementReconcilerBatchLimit, teamFilter)
+	if err != nil {
+		slog.Warn("jobs.entitlement_reconciler.mongo.query_failed",
+			"error", err.Error(),
+			"note", "Mongo sweep skipped this tick — Mongo regrade is provisioner-side TODO; query failure is non-fatal for the Postgres/Redis arms",
+		)
+		return 0, 0, 0, 0, 0
+	}
+	defer mongoRows.Close()
+
+	var mongoCandidates []mongoEntitlementCandidate
+	for mongoRows.Next() {
+		var c mongoEntitlementCandidate
+		if scanErr := mongoRows.Scan(
+			&c.id, &c.token, &c.providerResourceID,
+			&c.resourceTier, &c.planTier,
+		); scanErr != nil {
+			slog.Warn("jobs.entitlement_reconciler.mongo.scan_failed", "error", scanErr)
+			continue
+		}
+		if c.token == "" {
+			continue
+		}
+		mongoCandidates = append(mongoCandidates, c)
+	}
+	if rowsErr := mongoRows.Err(); rowsErr != nil {
+		slog.Warn("jobs.entitlement_reconciler.mongo.rows_failed", "error", rowsErr)
+		return checked, applied, skipped, failed, skippedTier
+	}
+	mongoRows.Close()
+
+	for _, c := range mongoCandidates {
+		checked++
+
+		// MR-P1-21: skip ephemeral resource.tier OR plan_tier — the
+		// snapshot is the source of truth (a paid-tier resource on a
+		// downgraded team keeps its cap), but a deleted/free team's
+		// resources still skip even with a paid snapshot.
+		if entitlementEphemeralTiers[c.resourceTier] || entitlementEphemeralTiers[c.planTier] {
+			skippedTier++
+			continue
+		}
+
+		// Tier sent to provisioner is the resource snapshot (MR-P1-21).
+		regradeCtx, cancel := context.WithTimeout(ctx, entitlementReconcilerRegradeTimeout)
+		out, regErr := w.regrader.RegradeResource(
+			regradeCtx, c.token, c.providerResourceID.String,
+			commonv1.ResourceType_RESOURCE_TYPE_MONGODB, c.resourceTier, c.id.String(),
+		)
+		cancel()
+
+		if regErr != nil {
+			failed++
+			slog.Warn("jobs.entitlement_reconciler.mongo.regrade_failed",
+				"resource_id", c.id.String(),
+				"token", logsafe.Token(c.token),
+				"resource_tier", c.resourceTier,
+				"plan_tier", c.planTier,
+				"error", regErr,
+			)
+			continue
+		}
+
+		if out.Applied {
+			applied++
+			slog.Info("jobs.entitlement_reconciler.mongo.regraded",
+				"resource_id", c.id.String(),
+				"token", logsafe.Token(c.token),
+				"resource_tier", c.resourceTier,
+				"plan_tier", c.planTier,
+				"applied_value", out.AppliedConnLimit,
+				"skip_reason", out.SkipReason,
+			)
+		} else {
+			skipped++
+			// DEBUG, not INFO — until provisioner.regradeMongo lands, this
+			// fires once per Mongo resource per 5-minute tick (the expected
+			// steady state). Logged at DEBUG so it does not spam INFO; the
+			// rollup `mongo_skipped` counter on the .completed line is the
+			// visible signal.
+			slog.Debug("jobs.entitlement_reconciler.mongo.regrade_skipped",
+				"resource_id", c.id.String(),
+				"token", logsafe.Token(c.token),
+				"resource_tier", c.resourceTier,
+				"plan_tier", c.planTier,
+				"skip_reason", out.SkipReason,
+			)
+		}
+	}
+	return checked, applied, skipped, failed, skippedTier
 }

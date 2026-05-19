@@ -40,6 +40,14 @@ const queueReconcile = "reconcile"
 // as long as it likes without ever touching queueReconcile's capacity.
 const queueBilling = "billing"
 
+// globalJobTimeout caps any single Work() invocation. River's default is no
+// timeout — a job blocking on a wedged provisioner gRPC / Razorpay TCP
+// black-hole / k8s API stall would pin its slot forever (T20 P1, BugBash
+// 2026-05-20). 20 min comfortably exceeds the longest legitimate single-tick
+// job (billing reconciler ~17 min) while still bounding a runaway. Individual
+// workers can shorten this via `Timeout()` on the worker; none currently do.
+const globalJobTimeout = 20 * time.Minute
+
 // periodicUniqueOpts is the UniqueOpts EVERY periodic job must carry
 // (P1-W3-07 / P1-W4-06 / P2-W5-05). The worker runs at replicas:2 — without
 // a uniqueness guard, both pods' River clients independently enqueue the
@@ -99,16 +107,45 @@ type Workers struct {
 func (w *Workers) Started() bool { return w.started }
 
 // Stop gracefully shuts down the background worker pool.
+//
+// T20 P1-3 (BugBash 2026-05-20): the previous ordering was
+// `w.cancel(); client.Stop(ctx)` — but `w.cancel()` cancels `workerCtx`,
+// the context River runs every in-flight job under. Cancelling it FIRST
+// meant every in-flight job saw `ctx.Err() == context.Canceled`
+// immediately and aborted mid-work, even though `Stop` then waited up
+// to 30s for a "graceful drain" that no longer had any work to drain.
+// River's contract: `Stop(ctx)` waits for in-flight jobs to finish
+// naturally; `StopAndCancel(ctx)` is the forced variant. The pre-fix
+// code reimplemented `StopAndCancel` by accident.
+//
+// CORRECT ORDERING (this PR):
+//  1. `client.Stop(ctx)` — graceful drain of in-flight jobs under their
+//     original `workerCtx`. Drain budget = 30s (must be < the k8s
+//     `terminationGracePeriodSeconds`, currently 30s; consider raising
+//     the pod's grace period to 45–60s in infra so the drain budget can
+//     too).
+//  2. `w.cancel()` — backstop, only meaningful if a job survived the
+//     drain (e.g. ignored its ctx). At-this-point cancel is the right
+//     hard stop. Otherwise it's a no-op.
+//
+// A job that exceeds the 30s drain budget will be killed by River's own
+// timeout-on-Stop machinery; on the next worker start the JobRescuer
+// re-queues anything that didn't reach a terminal status.
 func (w *Workers) Stop() {
-	if w.cancel != nil {
-		w.cancel()
-	}
 	if w.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := w.client.Stop(ctx); err != nil {
-			slog.Error("jobs.workers.stop_failed", "error", err)
+			slog.Error("jobs.workers.stop_failed", "error", err,
+				"note", "river.Client.Stop exceeded its 30s drain budget — in-flight jobs may have been hard-cancelled; JobRescuer will re-queue them on next start")
 		}
+	}
+	// Cancel the worker context only AFTER the graceful drain. This is the
+	// hard backstop: any job that ignored its ctx during the drain gets
+	// cancelled here, and any background helper goroutines that share
+	// workerCtx are released.
+	if w.cancel != nil {
+		w.cancel()
 	}
 }
 
@@ -334,7 +371,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			WithObjectDeleter(storageObjectDeleter, cfg.ObjectStoreBucket),
 		nrApp,
 	))
-	river.AddWorker(workers, WithObservability(NewExpireStacksWorker(db, cfg.KubeNamespaceApps+"-"), nrApp))
+	// T6 P0-1 (BugBash 2026-05-20): real stack namespaces are
+	// `instant-stack-<id>` (see api `compute.StackNamespacePrefix`),
+	// NOT `instant-apps-<id>` (which `cfg.KubeNamespaceApps+"-"`
+	// would produce). The pre-fix prefix mismatch caused
+	// `deleteK8sNamespace`'s safety guard to refuse every real stack
+	// namespace and return nil-success → ExpireStacks then DELETE'd
+	// the DB row, orphaning the namespace forever with no DB pointer
+	// to reach it. The orphan-sweep reconciler now also covers
+	// `instant-stack-*` (PASS 5) so any pre-fix orphans drain.
+	river.AddWorker(workers, WithObservability(NewExpireStacksWorker(db, ExpireStacksNamespacePrefix), nrApp))
 	river.AddWorker(workers, WithObservability(NewRefreshGeoDBWorker(), nrApp))
 	// TrialExpiryWorker was deleted in FOLLOWUP-5 (2026-05-14) — per project
 	// memory rule `project_no_trial_pay_day_one.md`, the platform has NO
@@ -691,6 +737,22 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		},
 		Workers:      workers,
 		PeriodicJobs: periodicJobs,
+		// T20 P1 (BugBash 2026-05-20): process-wide JobTimeout — a hung job
+		// (provisioner gRPC stall, Razorpay TCP black-hole, k8s API stall)
+		// without this would pin its worker slot forever. River's default
+		// `JobTimeout` is no timeout. With MaxWorkers=5 on the default queue,
+		// five hung jobs = total stall of all bulk email + heavyweight
+		// periodics until pod restart; with the single-replica `instant-worker`
+		// (P0-1) that means total background-jobs outage. River cancels the
+		// job's ctx on timeout and the job retries (per-job `Retried`
+		// strategy).
+		//
+		// Sizing: the longest legitimate single-tick job is the billing
+		// reconciler (~17 min for a full sweep — see queueBilling comment
+		// above). 20 minutes leaves headroom for that without pinning a slot
+		// on a runaway. Individual jobs that need a longer or shorter ceiling
+		// can override via `Timeout()` on the worker (none currently do).
+		JobTimeout: globalJobTimeout,
 	})
 	if err != nil {
 		slog.Error("jobs.workers.client_init_failed", "error", err)
