@@ -175,7 +175,10 @@ func (w *PaymentGraceTerminatorWorker) Work(ctx context.Context, job *river.Job[
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.payment_grace_terminator.completed",
+		// P1-1 (BugBash 2026-05-19): idle tick — demoted INFO → DEBUG.
+		// Liveness via jobs.middleware.work_ok; INFO only for a tick that
+		// actually terminated a grace period.
+		slog.Debug("jobs.payment_grace_terminator.completed",
 			"terminated", 0,
 			"candidates", 0,
 			"duration_ms", time.Since(start).Milliseconds(),

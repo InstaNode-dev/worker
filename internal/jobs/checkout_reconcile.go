@@ -175,7 +175,11 @@ func (w *CheckoutReconcileWorker) Work(ctx context.Context, job *river.Job[Check
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.checkout_reconcile.completed",
+		// P1-1 (BugBash 2026-05-19): idle tick — zero candidates carries
+		// no operational signal. Demoted INFO → DEBUG; liveness is
+		// covered by jobs.middleware.work_ok. INFO is reserved for a
+		// tick that actually did work.
+		slog.Debug("jobs.checkout_reconcile.completed",
 			"emailed", 0,
 			"resolved_late", 0,
 			"skipped", 0,

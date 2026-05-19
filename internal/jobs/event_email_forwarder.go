@@ -78,6 +78,92 @@ const eventEmailCursorKey = "email:event_forwarder:last_audit_cursor"
 // pattern-match dedupe headers in provider dashboards.
 const eventEmailIdempotencyPrefix = "audit-"
 
+// eventEmailMaxAge is the absolute age floor for fetchBatch (P1-2 fix,
+// BugBash 2026-05-19). Any audit_log row older than this is considered
+// stale and is never (re)forwarded — a lifecycle email that old has no
+// value and re-firing it after a cursor reset is a mass-spam incident.
+//
+// 48h comfortably exceeds the forwarder's worst realistic backlog (the
+// job runs every 60s and drains 100 rows/tick), so the floor never drops
+// a row that legitimately should have been sent. Combined with seeding a
+// missing cursor to now()-grace (see read()), a Redis wipe loses at most
+// a few minutes of email instead of replaying all of audit_log history.
+const eventEmailMaxAge = 48 * time.Hour
+
+// eventEmailCursorSeedGrace is how far back a freshly-seeded cursor starts
+// when Redis returns no value (a wipe / failover to an empty replica /
+// first boot). We seed to now()-grace rather than the zero value so a
+// cursor loss replays at most this much email instead of the entire
+// audit_log tail. Small enough that almost nothing is re-sent, large
+// enough to absorb the row that was in flight when Redis died.
+const eventEmailCursorSeedGrace = 5 * time.Minute
+
+// sentLedger is the worker-side idempotency seam (P1-3 fix, BugBash
+// 2026-05-19). markSent attempts to claim an audit_id in the
+// forwarder_sent table; it returns claimed=true when THIS call inserted
+// the row and claimed=false when the row already existed (the audit_id
+// was sent before — by an earlier tick, a pre-reset run, or a crash
+// recovery). The forwarder skips the provider send when claimed=false.
+//
+// This makes the forwarder idempotent regardless of provider behavior:
+// the Brevo X-Mailin-Custom header is NOT a delivery-dedup guarantee, so
+// without this ledger every cursor reset / cursor_corrupt reset /
+// crash-mid-batch re-sent real duplicate email.
+//
+// release un-claims an audit_id. It is called ONLY when a claim was made
+// but the provider then returned a Transient failure (the cursor is not
+// advanced, so the row will be retried next tick — and the retry must be
+// able to re-claim). A claim followed by a confirmed 2xx / Permanent /
+// SkippedNoTemplate is left in place: those advance the cursor and the
+// ledger row is the permanent record that the audit_id is done.
+type sentLedger interface {
+	markSent(ctx context.Context, auditID string) (claimed bool, err error)
+	release(ctx context.Context, auditID string) error
+}
+
+// sqlSentLedger is the production sentLedger backed by the forwarder_sent
+// table in the platform Postgres (same DB as audit_log).
+type sqlSentLedger struct {
+	db *sql.DB
+}
+
+// markSent inserts (audit_id) ON CONFLICT DO NOTHING. RowsAffected==1
+// means this call claimed the send; ==0 means the audit_id was already
+// in the ledger and the send must be skipped.
+func (l *sqlSentLedger) markSent(ctx context.Context, auditID string) (bool, error) {
+	res, err := l.db.ExecContext(ctx, `
+		INSERT INTO forwarder_sent (audit_id)
+		VALUES ($1)
+		ON CONFLICT (audit_id) DO NOTHING
+	`, auditID)
+	if err != nil {
+		return false, fmt.Errorf("forwarder_sent insert: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("forwarder_sent rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+// release deletes the audit_id row so a Transient-failed send can be
+// re-claimed on the next tick.
+func (l *sqlSentLedger) release(ctx context.Context, auditID string) error {
+	if _, err := l.db.ExecContext(ctx, `
+		DELETE FROM forwarder_sent WHERE audit_id = $1
+	`, auditID); err != nil {
+		return fmt.Errorf("forwarder_sent release: %w", err)
+	}
+	return nil
+}
+
+// noopSentLedger always claims the send — used by tests that don't care
+// about the ledger path. Production NEVER uses this.
+type noopSentLedger struct{}
+
+func (noopSentLedger) markSent(context.Context, string) (bool, error) { return true, nil }
+func (noopSentLedger) release(context.Context, string) error          { return nil }
+
 // Suppression-related constants — mirrored from the api package's
 // internal/models.email_events.go so the worker doesn't import the api
 // module. Keep these values in sync across the two repos.
@@ -201,8 +287,13 @@ func (c eventCursor) zero() bool {
 // eventCursorStore abstracts the cursor read/write so tests can supply an
 // in-memory implementation. Production uses redisEventCursorStore, which wraps
 // a *redis.Client. Single-method-per-direction surface keeps the seam tiny.
+//
+// read returns missing=true when the store has no persisted cursor (a
+// fresh boot, a Redis wipe, a failover to an empty replica, or a corrupt
+// blob that was discarded). Work uses that signal to seed the cursor to
+// now()-grace rather than the zero value — see P1-2 (BugBash 2026-05-19).
 type eventCursorStore interface {
-	read(ctx context.Context) (eventCursor, error)
+	read(ctx context.Context) (c eventCursor, missing bool, err error)
 	write(ctx context.Context, c eventCursor) error
 }
 
@@ -212,26 +303,31 @@ type redisEventCursorStore struct {
 	rdb *redis.Client
 }
 
-func (s *redisEventCursorStore) read(ctx context.Context) (eventCursor, error) {
+func (s *redisEventCursorStore) read(ctx context.Context) (eventCursor, bool, error) {
 	raw, err := s.rdb.Get(ctx, eventEmailCursorKey).Result()
 	if err == redis.Nil {
-		return eventCursor{}, nil
+		// No persisted cursor. missing=true tells Work to seed to
+		// now()-grace instead of replaying audit_log history (P1-2).
+		return eventCursor{}, true, nil
 	}
 	if err != nil {
-		return eventCursor{}, fmt.Errorf("redis GET %s: %w", eventEmailCursorKey, err)
+		return eventCursor{}, false, fmt.Errorf("redis GET %s: %w", eventEmailCursorKey, err)
 	}
 	var c eventCursor
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
-		// Corrupt cursor — start over. Log loudly so the operator can
-		// investigate (provider dedupe absorbs duplicates).
+		// Corrupt cursor — treat as missing. Log loudly so the operator
+		// can investigate. missing=true → Work seeds to now()-grace; the
+		// forwarder_sent ledger (P1-3) prevents any duplicate sends for
+		// rows that were already forwarded, and the 48h fetchBatch floor
+		// (P1-2) bounds the blast radius regardless.
 		slog.Error("jobs.event_email_forwarder.cursor_corrupt",
 			"raw", raw,
 			"error", err,
-			"note", "resetting to zero — provider dedupe absorbs duplicates",
+			"note", "discarding corrupt cursor — reseeding to now()-grace; ledger + 48h floor prevent duplicate/stale sends",
 		)
-		return eventCursor{}, nil
+		return eventCursor{}, true, nil
 	}
-	return c, nil
+	return c, false, nil
 }
 
 func (s *redisEventCursorStore) write(ctx context.Context, c eventCursor) error {
@@ -256,6 +352,11 @@ type EventEmailForwarderWorker struct {
 	cursor      eventCursorStore
 	provider    email.EmailProvider
 	suppression suppressionChecker
+	// ledger is the worker-side idempotency guard (P1-3). markSent is
+	// called immediately before each provider send; a send is skipped
+	// when the audit_id was already claimed. Production wires
+	// sqlSentLedger; tests default to noopSentLedger.
+	ledger sentLedger
 }
 
 // NewEventEmailForwarderWorker constructs the worker. provider MUST be
@@ -270,6 +371,7 @@ func NewEventEmailForwarderWorker(db *sql.DB, rdb *redis.Client, provider email.
 		cursor:      &redisEventCursorStore{rdb: rdb},
 		provider:    provider,
 		suppression: &sqlSuppressionChecker{db: db},
+		ledger:      &sqlSentLedger{db: db},
 	}
 }
 
@@ -287,6 +389,7 @@ func newEventEmailForwarderWorkerForTest(db *sql.DB, cursor eventCursorStore, pr
 		cursor:      cursor,
 		provider:    provider,
 		suppression: noopSuppressionChecker{},
+		ledger:      noopSentLedger{},
 	}
 }
 
@@ -310,9 +413,27 @@ func (w *EventEmailForwarderWorker) Work(ctx context.Context, job *river.Job[Eve
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.event_email_forwarder")
 	defer span.End()
 
-	cursor, err := w.cursor.read(ctx)
+	cursor, missing, err := w.cursor.read(ctx)
 	if err != nil {
 		return fmt.Errorf("event_email_forwarder: read cursor: %w", err)
+	}
+
+	// P1-2 (BugBash 2026-05-19): a missing cursor (Redis wipe / failover to
+	// an empty replica / corrupt blob / first boot) used to fall through as
+	// the zero value, and fetchBatch then re-scanned the entire audit_log
+	// history → mass-spam. Instead, seed the cursor to now()-grace so a
+	// cursor loss replays at most a few minutes of email. The 48h fetchBatch
+	// floor and the forwarder_sent ledger (P1-3) are the other two layers of
+	// defense in depth — even with the seed, neither stale nor duplicate
+	// rows can re-fire.
+	if missing {
+		seed := eventCursor{CreatedAt: time.Now().UTC().Add(-eventEmailCursorSeedGrace)}
+		slog.Warn("jobs.event_email_forwarder.cursor_missing",
+			"seeded_to", seed.CreatedAt,
+			"grace", eventEmailCursorSeedGrace.String(),
+			"note", "no persisted cursor — seeding to now()-grace instead of replaying audit_log history (P1-2)",
+		)
+		cursor = seed
 	}
 
 	rows, err := w.fetchBatch(ctx, cursor)
@@ -321,7 +442,11 @@ func (w *EventEmailForwarderWorker) Work(ctx context.Context, job *river.Job[Eve
 	}
 
 	if len(rows) == 0 {
-		slog.Info("jobs.event_email_forwarder.no_new_rows",
+		// P1-1 (BugBash 2026-05-19): idle-tick log demoted INFO → DEBUG.
+		// An idle sweep carries zero operational signal; emitting it at
+		// INFO every 60s was ~1,440 noise lines/day. Liveness is covered
+		// by jobs.middleware.work_ok. INFO is reserved for state changes.
+		slog.Debug("jobs.event_email_forwarder.no_new_rows",
 			"cursor_at", cursor.CreatedAt,
 			"provider", w.provider.Name(),
 		)
@@ -353,16 +478,29 @@ batchLoop:
 			continue
 		}
 
+		// Resolve the recipient ONCE, up front. F5 (BugBash 2026-05-19):
+		// the suppression check below MUST run against the exact address
+		// the email is actually sent to. Previously suppression checked
+		// row.OwnerEmail but the send used resolveRecipient(row) — for an
+		// anonymous-tier row whose address lives in metadata.email the two
+		// could diverge, letting an unsubscribed anon user still receive
+		// the high-volume anon.expiry_warning / digest.weekly campaigns.
+		recipient := resolveRecipient(row)
+
 		params, payloadOK := builder(row)
 		if !payloadOK {
-			// Missing owner email or other required field. Advance the
-			// cursor — a row that can't produce a valid payload now will
-			// never be able to, and holding the cursor pins the queue.
-			slog.Warn("jobs.event_email_forwarder.builder_skipped_row",
+			// No resolvable recipient (or other required field missing).
+			// Advance the cursor — a row that can't produce a valid
+			// payload now never will, and holding the cursor pins the
+			// queue. P2-1 (BugBash 2026-05-19): a no-recipient row is an
+			// EXPECTED, benign state (deleted / orphan / test teams), so
+			// this logs at INFO, not WARN — a steady trickle of orphan
+			// rows must not erode WARN's signal value.
+			slog.Info("jobs.event_email_forwarder.builder_skipped_row",
 				"kind", row.Kind,
 				"audit_id", row.ID,
 				"team_id", row.TeamID,
-				"reason", "builder returned ok=false (likely no owner email)",
+				"reason", "builder returned ok=false (no resolvable owner email — expected for deleted/orphan/test teams)",
 			)
 			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
 				return fmt.Errorf("event_email_forwarder: advance cursor after builder skip: %w", advErr)
@@ -385,7 +523,7 @@ batchLoop:
 		//   - Bounce / spam_complaint lookup failure → fail-OPEN. A
 		//     duplicate to a bouncing inbox only costs sender reputation;
 		//     pinning the queue is worse.
-		suppressed, supErr := w.suppression.hasSuppression(ctx, row.OwnerEmail)
+		suppressed, supErr := w.suppression.hasSuppression(ctx, recipient)
 		if supErr != nil && errors.Is(supErr, errUnsubscribeLookupFailed) {
 			// Fail-CLOSED: can't prove the recipient is NOT unsubscribed.
 			// Skip without advancing the cursor — the row retries when the
@@ -427,36 +565,82 @@ batchLoop:
 			continue
 		}
 
-		// W3 (P1-W3-10): the recipient is resolveRecipient(row), not
-		// row.OwnerEmail — anonymous teams have no users row, so OwnerEmail
-		// is empty for them and the address lives in metadata.email.
-		// fetchBatch already COALESCEs this at the SQL layer, so OwnerEmail
-		// is normally populated; resolveRecipient keeps the recipient
-		// correct even for a row that reached here without that COALESCE
-		// (and matches what requireEmail accepted in the builder).
+		// F4 (BugBash 2026-05-19): a kind that has a builder but NO
+		// registered renderer used to fall through to the dead Brevo
+		// dashboard-template path → SkippedNoTemplate → cursor advanced
+		// silently → zero email, zero error, audit row consumed forever.
+		// AS OF 2026-05-15 every kind IS Go-rendered, so a missing
+		// renderer is now unambiguously a programming bug (a 19th kind
+		// added to eventEmailBuilders without a renderer). Treat it as a
+		// loud ERROR and HOLD the cursor — never advance silently. The
+		// TestEveryEmailKindHasAGoRenderer registry test catches this at
+		// CI time; this is the runtime backstop if it ever ships anyway.
+		renderer, hasRenderer := eventEmailBodyRenderers[row.Kind]
+		if !hasRenderer {
+			slog.Error("jobs.event_email_forwarder.missing_renderer",
+				"kind", row.Kind,
+				"audit_id", row.ID,
+				"note", "kind has a builder but no Go renderer — holding cursor (NOT advancing). This is a registry bug; add a renderer to eventEmailBodyRenderers. Email NOT sent.",
+			)
+			transient++
+			break batchLoop
+		}
+
+		// recipient was resolved once at the top of the loop (F5) — the
+		// same address the suppression check ran against.
 		evt := email.EventEmail{
 			Kind:           row.Kind,
-			Recipient:      resolveRecipient(row),
+			Recipient:      recipient,
 			RecipientName:  "", // we don't store a display name today
 			Params:         params,
 			IdempotencyKey: eventEmailIdempotencyPrefix + row.ID,
 		}
-		// Per-kind Go-rendered body decoration. When the kind has a
-		// registered renderer the forwarder fills Subject/HTMLBody/TextBody
-		// and the provider takes the raw-HTML path (no dashboard template
-		// lookup). Kinds without a renderer fall through unchanged —
-		// they continue to use the Brevo template id mapping.
+		// Per-kind Go-rendered body — the provider takes the raw-HTML path
+		// (no dashboard template lookup). Every supported kind has a
+		// renderer (asserted above + by TestEveryEmailKindHasAGoRenderer).
+		subject, htmlBody, textBody := renderer(params)
+		evt.Subject = subject
+		evt.HTMLBody = htmlBody
+		evt.TextBody = textBody
+
+		// P1-3 (BugBash 2026-05-19): claim the audit_id in the
+		// forwarder_sent ledger BEFORE the send. markSent inserts ON
+		// CONFLICT DO NOTHING — claimed=false means this audit_id was
+		// already forwarded (by an earlier tick, a pre-cursor-reset run,
+		// or a crash recovery), so we skip the provider POST and just
+		// advance the cursor. This is the real idempotency guarantee:
+		// the Brevo X-Mailin-Custom header is NOT a delivery dedup, so
+		// without this ledger a cursor reset re-sent every email.
 		//
-		// Registered today (2026-05-15):
-		//   anon.expiry_warning — fixes the broken dashboard template
-		//     (hardcoded "6 hours" subject, empty Type/Token/Expires
-		//     fields). See expiry_reminder_email.go.
-		if renderer, ok := eventEmailBodyRenderers[row.Kind]; ok {
-			subject, htmlBody, textBody := renderer(params)
-			evt.Subject = subject
-			evt.HTMLBody = htmlBody
-			evt.TextBody = textBody
+		// A ledger DB error is treated as Transient (hold the cursor):
+		// we cannot prove the row was not already sent, and sending into
+		// an unknown state risks a duplicate — better to retry next tick.
+		claimed, ledgerErr := w.ledger.markSent(ctx, row.ID)
+		if ledgerErr != nil {
+			slog.Warn("jobs.event_email_forwarder.ledger_error",
+				"audit_id", row.ID,
+				"kind", row.Kind,
+				"error", ledgerErr,
+				"note", "forwarder_sent claim failed — holding cursor, retry next tick (cannot prove not-already-sent)",
+			)
+			transient++
+			break batchLoop
 		}
+		if !claimed {
+			// Already in the ledger — duplicate-suppressed. Advance the
+			// cursor (the row is genuinely done) without re-sending.
+			slog.Info("jobs.event_email_forwarder.duplicate_suppressed",
+				"audit_id", row.ID,
+				"kind", row.Kind,
+				"note", "audit_id already in forwarder_sent ledger — skipping re-send (cursor reset / crash recovery)",
+			)
+			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
+				return fmt.Errorf("event_email_forwarder: advance cursor after duplicate suppression: %w", advErr)
+			}
+			skipped++
+			continue
+		}
+
 		sendErr := w.provider.SendEvent(ctx, evt)
 		class := email.ClassOf(sendErr)
 		switch {
@@ -487,6 +671,20 @@ batchLoop:
 			// rest of the batch because if the provider is throwing 5xx,
 			// the remaining rows will hit the same wall. A labeled break
 			// is required so we exit the for-range, not just the switch.
+			//
+			// P1-3: the send did NOT succeed, so RELEASE the ledger claim
+			// — otherwise the retry next tick would see claimed=false and
+			// skip the row forever (a never-sent email). A release error
+			// is logged but not fatal: worst case the row is skipped, and
+			// that is strictly safer than a re-send.
+			if relErr := w.ledger.release(ctx, row.ID); relErr != nil {
+				slog.Error("jobs.event_email_forwarder.ledger_release_failed",
+					"audit_id", row.ID,
+					"kind", row.Kind,
+					"error", relErr,
+					"note", "could not un-claim forwarder_sent after transient send — row may be skipped on retry",
+				)
+			}
 			slog.Warn("jobs.event_email_forwarder.transient_halt",
 				"kind", row.Kind,
 				"audit_id", row.ID,
@@ -533,6 +731,15 @@ batchLoop:
 // cursor) we pass the time.Time zero value + empty string, which sorts
 // before every real row.
 func (w *EventEmailForwarderWorker) fetchBatch(ctx context.Context, c eventCursor) ([]auditRow, error) {
+	// P1-2 (BugBash 2026-05-19): the `a.created_at > $5` floor caps the
+	// blast radius of a cursor reset. A Redis wipe / corrupt cursor used
+	// to drop the watermark to the zero value, and this query — with no
+	// age bound — then re-scanned and re-emailed the ENTIRE audit_log
+	// history. The 48h floor means even a fully-lost cursor only ever
+	// re-scans the last 48h; a lifecycle email older than that is stale
+	// and must never re-fire. (The forwarder_sent ledger is the other
+	// guard — it stops re-sends even inside the 48h window.)
+	ageFloor := time.Now().UTC().Add(-eventEmailMaxAge)
 	q := `
 		SELECT
 			a.id::text,
@@ -554,6 +761,7 @@ func (w *EventEmailForwarderWorker) fetchBatch(ctx context.Context, c eventCurso
 		) u ON true
 		WHERE a.kind = ANY($1::text[])
 		  AND (a.created_at, a.id::text) > ($2, $3)
+		  AND a.created_at > $5
 		ORDER BY a.created_at ASC, a.id::text ASC
 		LIMIT $4
 	`
@@ -562,6 +770,7 @@ func (w *EventEmailForwarderWorker) fetchBatch(ctx context.Context, c eventCurso
 		c.CreatedAt,
 		c.ID,
 		eventEmailBatchLimit,
+		ageFloor,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("fetchBatch query: %w", err)

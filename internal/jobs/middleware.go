@@ -114,7 +114,14 @@ func (w *observabilityWorker[T]) Work(ctx context.Context, job *river.Job[T]) er
 		return err
 	}
 
-	slog.InfoContext(ctx, "jobs.middleware.work_ok",
+	// P1-1 (BugBash 2026-05-19): demoted INFO → DEBUG. work_ok fires once
+	// per tick of every periodic job — across ~20 jobs running on 60s
+	// cadences that is the single largest source of zero-signal NR
+	// ingest. A successful tick is not a state change; the failure path
+	// (work_failed, above) stays at ERROR so the signal that matters is
+	// untouched. An operator who wants per-job duration/liveness can
+	// raise the worker slog handler to DEBUG.
+	slog.DebugContext(ctx, "jobs.middleware.work_ok",
 		"kind", kind,
 		"job_id", job.ID,
 		"attempt", job.Attempt,
