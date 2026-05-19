@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"instant.dev/common/resourcestatus"
 	commonv1 "instant.dev/proto/common/v1"
+	"instant.dev/worker/internal/logsafe"
 	"instant.dev/worker/internal/metrics"
 	"instant.dev/worker/internal/provisioner"
 )
@@ -255,7 +256,7 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 							"error", deprovErr,
 							"resource_id", r.id,
 							"resource_type", r.resourceType,
-							"token", r.token,
+							"token", logsafe.Token(r.token),
 							"job_id", job.ID,
 							"effect", "row left reapable for retry; NOT marked deleted (MR-P0-1a)",
 						)
@@ -393,7 +394,7 @@ func deleteStorageObjects(ctx context.Context, deleter S3BackupDeleter, bucket, 
 		// A missing deleter is a real gap, not a benign skip — surface it.
 		slog.Warn("jobs.expire_anonymous.storage_objects_not_deleted",
 			"resource_id", resourceID,
-			"token", token,
+			"token", logsafe.Token(token),
 			"reason", "no object-store deleter wired (OBJECT_STORE_* unset) — tenant objects rely on the bucket-lifecycle rule",
 			"job_id", jobID,
 		)
@@ -404,7 +405,7 @@ func deleteStorageObjects(ctx context.Context, deleter S3BackupDeleter, bucket, 
 	if prefix == "" {
 		slog.Warn("jobs.expire_anonymous.storage_prefix_empty",
 			"resource_id", resourceID,
-			"token", token,
+			"token", logsafe.Token(token),
 			"job_id", jobID,
 		)
 		return
@@ -459,7 +460,7 @@ func deleteStorageObjects(ctx context.Context, deleter S3BackupDeleter, bucket, 
 
 	slog.Info("jobs.expire_anonymous.storage_objects_deleted",
 		"resource_id", resourceID,
-		"token", token,
+		"token", logsafe.Token(token),
 		"prefix", prefix,
 		"objects_listed", objectCount,
 		"remove_errors", removeErrors,

@@ -69,6 +69,8 @@ import (
 	"strings"
 
 	goredis "github.com/redis/go-redis/v9"
+
+	"instant.dev/worker/internal/logsafe"
 )
 
 // sharedRedisTiers are the tiers whose Redis resources live on the shared
@@ -169,7 +171,7 @@ func NewDirectRedisEvictor(adminURL string) RedisKeyEvictor {
 func (e *directRedisEvictor) EvictTenantToCap(ctx context.Context, token string, limitBytes int64) (int, int64, error) {
 	if e.adminURL == "" {
 		slog.Warn("quota_redis_eviction.evict: CUSTOMER_REDIS_URL not set — skipping eviction",
-			"token", token)
+			"token", logsafe.Token(token))
 		return 0, 0, nil
 	}
 	opts, err := goredis.ParseURL(e.adminURL)
@@ -177,7 +179,7 @@ func (e *directRedisEvictor) EvictTenantToCap(ctx context.Context, token string,
 		// Parse failure is a config error, not a transient one — surface it so
 		// the sweep logs it, but return 0/0 so one bad URL doesn't abort.
 		slog.Error("quota_redis_eviction.evict: parse CUSTOMER_REDIS_URL failed",
-			"token", token, "error", err)
+			"token", logsafe.Token(token), "error", err)
 		return 0, 0, fmt.Errorf("EvictTenantToCap: parse admin URL: %w", err)
 	}
 	client := goredis.NewClient(opts)
@@ -291,14 +293,14 @@ func evictTenantToCap(ctx context.Context, client redisEvictionClient, token str
 			// Abort the tenant's eviction immediately rather than risk a
 			// single mis-scoped DEL.
 			slog.Error("quota_redis_eviction.evict: prefix assertion failed",
-				"token", token, "key", sk.key, "error", err)
+				"token", logsafe.Token(token), "key", sk.key, "error", err)
 			return deleted, reclaimed, err
 		}
 		if delErr := client.Del(ctx, sk.key).Err(); delErr != nil {
 			// One key's DEL failed — log and continue with the rest; the next
 			// sweep retries. Do not abort: partial progress is still progress.
 			slog.Warn("quota_redis_eviction.evict: DEL failed (continuing)",
-				"token", token, "key", sk.key, "error", delErr)
+				"token", logsafe.Token(token), "key", sk.key, "error", delErr)
 			continue
 		}
 		deleted++

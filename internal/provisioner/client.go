@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	commonv1 "instant.dev/proto/common/v1"
 	provisionerv1 "instant.dev/proto/provisioner/v1"
+	"instant.dev/worker/internal/logsafe"
 )
 
 // Client wraps the gRPC ProvisionerServiceClient with convenience methods.
@@ -105,7 +106,7 @@ func (c *Client) DeprovisionResource(ctx context.Context, token, providerResourc
 		ResourceType:       resType,
 	})
 	if err != nil {
-		slog.Error("provisioner.DeprovisionResource failed", "error", err, "token", token)
+		slog.Error("provisioner.DeprovisionResource failed", "error", err, "token", logsafe.Token(token))
 		return fmt.Errorf("provisioner.DeprovisionResource: %w", err)
 	}
 	return nil

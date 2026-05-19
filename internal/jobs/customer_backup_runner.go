@@ -288,12 +288,26 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	// successful uploads from the same tick.
 	w.runRetentionSweep(ctx)
 
-	slog.Info("jobs.customer_backup_runner.completed",
-		"processed", processed,
-		"succeeded", succeeded,
-		"failed", failed,
-		"job_id", job.ID,
-	)
+	// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG. The
+	// runner is invoked per River batch; the steady state in prod is
+	// processed=0 (no backups in the batch window). When real work
+	// happened (processed>0 OR a failure surfaced), stay at INFO so
+	// operators see the activity.
+	if processed == 0 && failed == 0 {
+		slog.Debug("jobs.customer_backup_runner.completed",
+			"processed", processed,
+			"succeeded", succeeded,
+			"failed", failed,
+			"job_id", job.ID,
+		)
+	} else {
+		slog.Info("jobs.customer_backup_runner.completed",
+			"processed", processed,
+			"succeeded", succeeded,
+			"failed", failed,
+			"job_id", job.ID,
+		)
+	}
 	return nil
 }
 

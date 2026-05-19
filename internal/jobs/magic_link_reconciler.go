@@ -148,7 +148,8 @@ func (w *MagicLinkReconcilerWorker) Work(ctx context.Context, job *river.Job[Mag
 	}
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.magic_link_reconciler.completed",
+		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.
+		slog.Debug("jobs.magic_link_reconciler.completed",
 			"candidates", 0,
 			"resent", 0,
 			"abandoned", 0,

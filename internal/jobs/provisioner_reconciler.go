@@ -40,6 +40,7 @@ import (
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
 
+	"instant.dev/worker/internal/logsafe"
 	"instant.dev/worker/internal/metrics"
 )
 
@@ -178,7 +179,12 @@ func (w *ProvisionerReconcilerWorker) Work(ctx context.Context, job *river.Job[P
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.provisioner_reconciler.completed",
+		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.
+		// The provisioner reconciler runs every 2 min and is observed in
+		// prod logs (`candidates:0` continuously) because no row is ever
+		// `status='pending'` until MR-P0-2 lands — even after, the steady
+		// state is the empty case.
+		slog.Debug("jobs.provisioner_reconciler.completed",
 			"recovered", 0,
 			"abandoned", 0,
 			"candidates", 0,
@@ -210,7 +216,7 @@ func (w *ProvisionerReconcilerWorker) Work(ctx context.Context, job *river.Job[P
 			slog.Info("jobs.provisioner_reconciler.recovered",
 				"resource_id", c.id.String(),
 				"resource_type", c.resourceType,
-				"token", c.token.String(),
+				"token", logsafe.Token(c.token.String()),
 			)
 
 		case ProbeUnreachable:
@@ -232,7 +238,7 @@ func (w *ProvisionerReconcilerWorker) Work(ctx context.Context, job *river.Job[P
 			slog.Info("jobs.provisioner_reconciler.abandoned",
 				"resource_id", c.id.String(),
 				"resource_type", c.resourceType,
-				"token", c.token.String(),
+				"token", logsafe.Token(c.token.String()),
 				"reason", truncateReason(probeErrString(probeErr)),
 			)
 
@@ -283,7 +289,7 @@ func (w *ProvisionerReconcilerWorker) markRecovered(ctx context.Context, c recon
 	meta := map[string]any{
 		"resource_id":   c.id.String(),
 		"resource_type": c.resourceType,
-		"token":         c.token.String(),
+		"token":         logsafe.Token(c.token.String()),
 	}
 	metaBytes, _ := json.Marshal(meta) // map of primitives — can't fail
 
@@ -314,7 +320,7 @@ func (w *ProvisionerReconcilerWorker) markAbandoned(ctx context.Context, c recon
 	meta := map[string]any{
 		"resource_id":   c.id.String(),
 		"resource_type": c.resourceType,
-		"token":         c.token.String(),
+		"token":         logsafe.Token(c.token.String()),
 		"error":         truncateReason(probeErrString(probeErr)),
 	}
 	metaBytes, _ := json.Marshal(meta)

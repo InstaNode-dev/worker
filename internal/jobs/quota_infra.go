@@ -33,6 +33,8 @@ import (
 	// compile error, so we rely on database/sql.Open("postgres", …) being available
 	// because pq is already registered by another file in this package.
 	_ "github.com/lib/pq"
+
+	"instant.dev/worker/internal/logsafe"
 )
 
 // ResourceInfraRevoker is a narrow interface for the worker's infra-revoke path.
@@ -118,7 +120,7 @@ func (r *directResourceRevoker) GrantAccess(ctx context.Context, resourceType, t
 func (r *directResourceRevoker) revokePostgres(ctx context.Context, token string) error {
 	if r.customerDatabaseURL == "" {
 		slog.Warn("quota_infra.revokePostgres: CUSTOMER_DATABASE_URL not set — skipping infra revoke",
-			"token", token)
+			"token", logsafe.Token(token))
 		return nil
 	}
 	dbName := "db_" + token
@@ -132,14 +134,14 @@ func (r *directResourceRevoker) revokePostgres(ctx context.Context, token string
 
 	conn, err := sql.Open("postgres", r.customerDatabaseURL)
 	if err != nil {
-		slog.Warn("quota_infra.revokePostgres: open failed (fail-open)", "token", token, "error", err)
+		slog.Warn("quota_infra.revokePostgres: open failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
 	defer conn.Close()
 
 	if _, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`REVOKE CONNECT ON DATABASE %q FROM %q`, dbName, username)); err != nil {
-		slog.Warn("quota_infra.revokePostgres: REVOKE failed (fail-open)", "token", token, "error", err)
+		slog.Warn("quota_infra.revokePostgres: REVOKE failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
 	// Terminate live sessions — non-fatal on failure (REVOKE already prevents new connections).
@@ -148,16 +150,16 @@ func (r *directResourceRevoker) revokePostgres(ctx context.Context, token string
 		   FROM pg_stat_activity
 		  WHERE datname = $1 AND usename = $2 AND pid <> pg_backend_pid()`,
 		dbName, username); err != nil {
-		slog.Warn("quota_infra.revokePostgres: pg_terminate_backend failed (non-fatal)", "token", token, "error", err)
+		slog.Warn("quota_infra.revokePostgres: pg_terminate_backend failed (non-fatal)", "token", logsafe.Token(token), "error", err)
 	}
-	slog.Info("quota_infra.revokePostgres: revoked", "token", token, "db", dbName, "user", username)
+	slog.Info("quota_infra.revokePostgres: revoked", "token", logsafe.Token(token), "db", dbName, "user", username)
 	return nil
 }
 
 func (r *directResourceRevoker) grantPostgres(ctx context.Context, token string) error {
 	if r.customerDatabaseURL == "" {
 		slog.Warn("quota_infra.grantPostgres: CUSTOMER_DATABASE_URL not set — skipping infra grant",
-			"token", token)
+			"token", logsafe.Token(token))
 		return nil
 	}
 	dbName := "db_" + token
@@ -171,17 +173,17 @@ func (r *directResourceRevoker) grantPostgres(ctx context.Context, token string)
 
 	conn, err := sql.Open("postgres", r.customerDatabaseURL)
 	if err != nil {
-		slog.Warn("quota_infra.grantPostgres: open failed (fail-open)", "token", token, "error", err)
+		slog.Warn("quota_infra.grantPostgres: open failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
 	defer conn.Close()
 
 	if _, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %q`, dbName, username)); err != nil {
-		slog.Warn("quota_infra.grantPostgres: GRANT failed (fail-open)", "token", token, "error", err)
+		slog.Warn("quota_infra.grantPostgres: GRANT failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
-	slog.Info("quota_infra.grantPostgres: granted", "token", token, "db", dbName, "user", username)
+	slog.Info("quota_infra.grantPostgres: granted", "token", logsafe.Token(token), "db", dbName, "user", username)
 	return nil
 }
 
@@ -275,7 +277,7 @@ func redisUsernameForToken(token, tier, providerResourceID string) string {
 func (r *directResourceRevoker) revokeRedis(ctx context.Context, token, tier, providerResourceID string) error {
 	if r.customerRedisURL == "" {
 		slog.Warn("quota_infra.revokeRedis: CUSTOMER_REDIS_URL not set — skipping infra revoke",
-			"token", token)
+			"token", logsafe.Token(token))
 		return nil
 	}
 	username := redisUsernameForToken(token, tier, providerResourceID)
@@ -285,7 +287,7 @@ func (r *directResourceRevoker) revokeRedis(ctx context.Context, token, tier, pr
 func (r *directResourceRevoker) grantRedis(ctx context.Context, token, tier, providerResourceID string) error {
 	if r.customerRedisURL == "" {
 		slog.Warn("quota_infra.grantRedis: CUSTOMER_REDIS_URL not set — skipping infra grant",
-			"token", token)
+			"token", logsafe.Token(token))
 		return nil
 	}
 	username := redisUsernameForToken(token, tier, providerResourceID)
@@ -295,7 +297,7 @@ func (r *directResourceRevoker) grantRedis(ctx context.Context, token, tier, pro
 func setCustomerRedisACL(ctx context.Context, adminURL, username string, enable bool, token string) error {
 	opts, err := goredis.ParseURL(adminURL)
 	if err != nil {
-		slog.Warn("quota_infra.setCustomerRedisACL: parse URL failed (fail-open)", "token", token, "error", err)
+		slog.Warn("quota_infra.setCustomerRedisACL: parse URL failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
 	client := goredis.NewClient(opts)
@@ -306,14 +308,14 @@ func setCustomerRedisACL(ctx context.Context, adminURL, username string, enable 
 	}
 	if err := client.Do(ctx, "ACL", "SETUSER", username, state).Err(); err != nil {
 		slog.Warn("quota_infra.setCustomerRedisACL: ACL SETUSER failed (fail-open)",
-			"token", token, "username", username, "state", state, "error", err)
+			"token", logsafe.Token(token), "username", username, "state", state, "error", err)
 		return nil
 	}
 	action := "revoked"
 	if enable {
 		action = "granted"
 	}
-	slog.Info("quota_infra.setCustomerRedisACL: "+action, "token", token, "username", username)
+	slog.Info("quota_infra.setCustomerRedisACL: "+action, "token", logsafe.Token(token), "username", username)
 	return nil
 }
 
@@ -322,7 +324,7 @@ func setCustomerRedisACL(ctx context.Context, adminURL, username string, enable 
 func (r *directResourceRevoker) revokeMongo(ctx context.Context, token string) error {
 	if r.mongoAdminURI == "" {
 		slog.Warn("quota_infra.revokeMongo: MONGO_ADMIN_URI not set — skipping infra revoke",
-			"token", token)
+			"token", logsafe.Token(token))
 		return nil
 	}
 	username := "usr_" + token
@@ -333,7 +335,7 @@ func (r *directResourceRevoker) revokeMongo(ctx context.Context, token string) e
 func (r *directResourceRevoker) grantMongo(ctx context.Context, token string) error {
 	if r.mongoAdminURI == "" {
 		slog.Warn("quota_infra.grantMongo: MONGO_ADMIN_URI not set — skipping infra grant",
-			"token", token)
+			"token", logsafe.Token(token))
 		return nil
 	}
 	username := "usr_" + token
@@ -345,12 +347,12 @@ func runMongoRoleOp(ctx context.Context, adminURI, username, dbName string, gran
 	client, err := mongo.Connect(ctx, mongooptions.Client().ApplyURI(adminURI).
 		SetServerSelectionTimeout(3*time.Second))
 	if err != nil {
-		slog.Warn("quota_infra.runMongoRoleOp: connect failed (fail-open)", "token", token, "error", err)
+		slog.Warn("quota_infra.runMongoRoleOp: connect failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
 	defer func() {
 		if discErr := client.Disconnect(ctx); discErr != nil {
-			slog.Warn("quota_infra.runMongoRoleOp: disconnect", "token", token, "error", discErr)
+			slog.Warn("quota_infra.runMongoRoleOp: disconnect", "token", logsafe.Token(token), "error", discErr)
 		}
 	}()
 
@@ -370,14 +372,14 @@ func runMongoRoleOp(ctx context.Context, adminURI, username, dbName string, gran
 	})
 	if result.Err() != nil {
 		slog.Warn("quota_infra.runMongoRoleOp: command failed (fail-open)",
-			"op", op, "token", token, "error", result.Err())
+			"op", op, "token", logsafe.Token(token), "error", result.Err())
 		return nil
 	}
 	action := "revoked"
 	if grant {
 		action = "granted"
 	}
-	slog.Info("quota_infra.runMongoRoleOp: "+action, "token", token, "user", username, "db", dbName)
+	slog.Info("quota_infra.runMongoRoleOp: "+action, "token", logsafe.Token(token), "user", username, "db", dbName)
 	return nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
 
+	"instant.dev/worker/internal/logsafe"
 	"instant.dev/worker/internal/metrics"
 )
 
@@ -268,7 +269,7 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 			metrics.RedisEvictionFailedTotal.Inc()
 			slog.Error("jobs.enforce_storage_quota.redis_eviction_failed",
 				"resource_id", id,
-				"token", token,
+				"token", logsafe.Token(token),
 				"tier", tier,
 				"limit_mb", limitMB,
 				"error", evErr,
@@ -289,7 +290,7 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 
 		slog.Warn("jobs.enforce_storage_quota.redis_evicted",
 			"resource_id", id,
-			"token", token,
+			"token", logsafe.Token(token),
 			"tier", tier,
 			"limit_mb", limitMB,
 			"keys_deleted", keysDeleted,
@@ -388,7 +389,7 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 				// error, log a WARN). A non-nil error here is unexpected —
 				// log it but don't abort the row update.
 				slog.Error("jobs.enforce_storage_quota.revoke_error",
-					"resource_id", id, "token", token, "resource_type", resourceType,
+					"resource_id", id, "token", logsafe.Token(token), "resource_type", resourceType,
 					"error", revokeErr,
 				)
 			}
@@ -422,7 +423,7 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 
 		slog.Warn("jobs.enforce_storage_quota.suspended",
 			"resource_id", id,
-			"token", token,
+			"token", logsafe.Token(token),
 			"resource_type", resourceType,
 			"tier", tier,
 			"storage_bytes", storageBytes,
@@ -543,7 +544,7 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 			// ded_<token[:8]>). See redisUsernameForToken.
 			if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, tier, providerResourceID); grantErr != nil {
 				slog.Error("jobs.enforce_storage_quota.grant_error",
-					"resource_id", id, "token", token, "resource_type", resourceType,
+					"resource_id", id, "token", logsafe.Token(token), "resource_type", resourceType,
 					"error", grantErr,
 				)
 				// Non-nil means unexpected path — still proceed with row flip.
@@ -562,7 +563,7 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 
 		slog.Info("jobs.enforce_storage_quota.unsuspended",
 			"resource_id", id,
-			"token", token,
+			"token", logsafe.Token(token),
 			"resource_type", resourceType,
 			"tier", tier,
 			"storage_bytes", storageBytes,

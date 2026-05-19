@@ -127,6 +127,7 @@ const (
 	orphanKindRazorpaySub      = "razorpay_subscription"
 	orphanKindK8sNamespace     = "k8s_namespace"
 	orphanKindK8sCustomerNS    = "k8s_customer_namespace"
+	orphanKindK8sStackNS       = "k8s_stack_namespace"
 )
 
 // customerNamespacePrefix is the prefix of every per-resource customer
@@ -150,15 +151,16 @@ type OrphanSubscriptionCanceler interface {
 }
 
 // K8sNamespaceLister extends K8sNamespaceDeleter with the cluster-wide
-// lists the reconciler's PASS 3 (deploy namespaces) and PASS 4 (customer
-// namespaces) need. The concrete k8sNamespaceClient satisfies it (see
-// k8s_namespace_client.go). Kept as a separate interface so the executor —
-// which only deletes namespaces it already knows by name — does not depend
-// on the list capability.
+// lists the reconciler's PASS 3 (deploy namespaces), PASS 4 (customer
+// namespaces), and PASS 5 (stack namespaces — T6 P0-1) need. The concrete
+// k8sNamespaceClient satisfies it (see k8s_namespace_client.go). Kept as a
+// separate interface so the executor — which only deletes namespaces it
+// already knows by name — does not depend on the list capability.
 type K8sNamespaceLister interface {
 	K8sNamespaceDeleter
 	ListDeployNamespaces(ctx context.Context) ([]string, error)
 	ListCustomerNamespaces(ctx context.Context) ([]string, error)
+	ListStackNamespaces(ctx context.Context) ([]string, error)
 }
 
 // teamTeardownExecutor is the slice of the team-deletion executor the
@@ -229,6 +231,7 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 	// error.
 	nsDeleted, nsFailed := w.sweepOrphanedNamespaces(ctx)
 	custNSDeleted, custNSFailed := w.sweepOrphanedCustomerNamespaces(ctx)
+	stackNSDeleted, stackNSFailed := w.sweepOrphanedStackNamespaces(ctx)
 
 	slog.Info("jobs.orphan_sweep.completed",
 		"pending_teams_finished", pendingFinished,
@@ -239,6 +242,8 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		"orphan_namespaces_failed", nsFailed,
 		"orphan_customer_namespaces_deleted", custNSDeleted,
 		"orphan_customer_namespaces_failed", custNSFailed,
+		"orphan_stack_namespaces_deleted", stackNSDeleted,
+		"orphan_stack_namespaces_failed", stackNSFailed,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"job_id", job.ID,
 	)
@@ -574,6 +579,111 @@ func (w *OrphanSweepReconciler) fetchLiveResourceTokens(ctx context.Context) (ma
 		}
 		if token != "" {
 			out[token] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// ── PASS 5 — orphaned k8s stack namespaces (T6 P0-1) ─────────────────────
+
+// sweepOrphanedStackNamespaces lists every instant-stack-<id> namespace and
+// deletes the ones whose backing `stacks` row is gone — the durable fix for
+// the T6 P0-1 leak (BugBash 2026-05-20).
+//
+// THE LEAK THIS CLOSES. The pre-fix ExpireStacksWorker carried nsPrefix
+// "instant-apps-" (derived from cfg.KubeNamespaceApps), but real stack
+// namespaces are "instant-stack-<id>". The safety guard in
+// deleteK8sNamespace refused every real stack namespace (returning
+// nil-success), and ExpireStacksWorker then DELETE'd the `stacks` row,
+// leaving the namespace + pods + service + ingress + TLS cert running
+// indefinitely with NO DB pointer ever again. PASS 5 is the recurrence
+// guard plus the catch-up sweep for pre-fix orphans.
+//
+// SAFETY. A namespace is deleted ONLY when its <id> has no row in the
+// `stacks` table (the row was hard-deleted by the buggy expirer). A
+// namespace whose row is still present — even in terminal status — is left
+// alone so the per-stack teardown path stays in charge of it.
+//
+// FAIL-OPEN. Identical to PASS 3/4: a namespace List failure or a DB blip
+// on the live-stack-ids query degrades to one WARN and a zero-orphan
+// result. The pass never returns an error — PASS 1/2/3/4 have already run.
+func (w *OrphanSweepReconciler) sweepOrphanedStackNamespaces(ctx context.Context) (deleted, failed int) {
+	if w.k8s == nil {
+		slog.Warn("jobs.orphan_sweep.pass5_skipped_no_k8s")
+		return 0, 0
+	}
+
+	namespaces, err := w.k8s.ListStackNamespaces(ctx)
+	if err != nil {
+		slog.Warn("jobs.orphan_sweep.pass5_namespace_list_failed",
+			"error", err.Error(),
+			"detail", "stack-namespace orphan cleanup skipped this sweep; "+
+				"PASS 1/2/3/4 still ran; check instant-worker RBAC for cluster-scoped namespaces list")
+		return 0, 0
+	}
+	if len(namespaces) == 0 {
+		return 0, 0
+	}
+
+	liveStackIDs, err := w.fetchLiveStackIDs(ctx)
+	if err != nil {
+		// A DB blip on the live-stack-ids query must NOT cause a delete
+		// decision off an empty set — that would tear down every stack
+		// namespace. Skip the pass this sweep.
+		slog.Warn("jobs.orphan_sweep.pass5_live_stack_ids_failed",
+			"error", err.Error(),
+			"detail", "stack-namespace orphan cleanup skipped this sweep; PASS 1/2/3/4 still ran")
+		return 0, 0
+	}
+
+	for _, ns := range namespaces {
+		// The id portion is everything after the "instant-stack-" prefix.
+		// Stack IDs are UUIDs; we don't parse here — the in-Go string
+		// comparison against the live-ids set is exact.
+		stackID := ns[len(ExpireStacksNamespacePrefix):]
+		if stackID == "" {
+			continue
+		}
+		if liveStackIDs[stackID] {
+			continue // a row still owns this namespace — leave it
+		}
+		// Orphan: no stacks row for this id.
+		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
+			failed++
+			slog.Error("jobs.orphan_sweep.stack_namespace_delete_failed",
+				"namespace", ns, "error", delErr)
+			w.emitOrphanSweepFailed(ctx, uuid.Nil, orphanKindK8sStackNS, ns, delErr)
+			continue
+		}
+		deleted++
+		slog.Info("jobs.orphan_sweep.stack_namespace_reclaimed",
+			"namespace", ns,
+			"detail", "instant-stack-* namespace with no backing stacks row deleted (T6 P0-1)")
+		w.emitOrphanReclaimed(ctx, uuid.Nil, orphanKindK8sStackNS, ns,
+			"deleted orphaned k8s stack namespace (no backing stacks row)")
+	}
+	return deleted, failed
+}
+
+// fetchLiveStackIDs returns the set of stack ids that still have a row in
+// the `stacks` table. Note: unlike PASS 4 (resources), we do NOT filter on
+// status — even a terminal-status stacks row pins its namespace so the
+// per-stack teardown path owns the delete. The pass is a strict "no row at
+// all = orphan" sweep.
+func (w *OrphanSweepReconciler) fetchLiveStackIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := w.db.QueryContext(ctx, `SELECT id::text FROM stacks`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			return nil, scanErr
+		}
+		if id != "" {
+			out[id] = true
 		}
 	}
 	return out, rows.Err()

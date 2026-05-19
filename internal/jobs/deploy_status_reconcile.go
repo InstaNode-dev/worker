@@ -287,7 +287,11 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 	}
 
 	if len(deployments) == 0 {
-		slog.Info("jobs.deploy_status_reconcile.completed",
+		// T21 P1-1 (BugBash 2026-05-20): demote idle-tick INFO to DEBUG
+		// (~5,760 lines/day from this 30s job alone). Same pattern as the
+		// email-noise fix `7169493`. Operators see the non-zero ticks; the
+		// idle steady state stays out of NR Logs.
+		slog.Debug("jobs.deploy_status_reconcile.completed",
 			"total", 0,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"job_id", job.ID,

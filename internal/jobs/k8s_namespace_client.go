@@ -109,6 +109,19 @@ func (c *k8sNamespaceClient) ListCustomerNamespaces(ctx context.Context) ([]stri
 	return c.listNamespacesWithPrefix(ctx, customerNamespacePrefix)
 }
 
+// ListStackNamespaces returns the names of every instant-stack-* namespace
+// currently in the cluster. The orphan-sweep reconciler's PASS 5 (T6 P0-1,
+// BugBash 2026-05-20) uses this to find stack namespaces whose backing
+// `stacks` row is gone. The pre-fix ExpireStacksWorker carried the wrong
+// prefix ("instant-apps-"), causing the safety guard to refuse every real
+// stack-namespace delete while still hard-deleting the DB row → orphaned
+// namespace + pods + ingress + TLS cert forever with no DB pointer. PASS 5
+// is both the catch-up sweep for pre-fix orphans and the durable recurrence
+// guard.
+func (c *k8sNamespaceClient) ListStackNamespaces(ctx context.Context) ([]string, error) {
+	return c.listNamespacesWithPrefix(ctx, ExpireStacksNamespacePrefix)
+}
+
 // listNamespacesWithPrefix is the shared cluster-scoped namespace List used
 // by both ListDeployNamespaces and ListCustomerNamespaces.
 func (c *k8sNamespaceClient) listNamespacesWithPrefix(ctx context.Context, prefix string) ([]string, error) {

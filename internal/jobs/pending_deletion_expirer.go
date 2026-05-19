@@ -132,7 +132,8 @@ func (w *PendingDeletionExpirerWorker) Work(ctx context.Context, job *river.Job[
 	}
 
 	if len(expired) == 0 {
-		slog.Info("jobs.pending_deletion_expirer.completed",
+		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.
+		slog.Debug("jobs.pending_deletion_expirer.completed",
 			"expired", 0,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"job_id", job.ID,

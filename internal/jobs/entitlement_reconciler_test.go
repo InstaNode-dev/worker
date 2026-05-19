@@ -219,12 +219,36 @@ func TestEntitlementReconcileInterval_BadValue(t *testing.T) {
 // assertion fails exactly when the NULL-scan bug is reintroduced.
 
 // stubRegrader satisfies entitlementRegrader and counts RegradeResource calls.
-type stubRegrader struct{ calls atomic.Int32 }
+// MR-P1-22 (BugBash 2026-05-20): also captures the per-call (resType, tier)
+// pair so a Mongo-arm regression test can assert the sweep actually iterated
+// MONGODB rows (and not just Postgres/Redis).
+type stubRegrader struct {
+	calls    atomic.Int32
+	mu       sync.Mutex
+	captured []stubRegradeCall
+}
+
+type stubRegradeCall struct {
+	token              string
+	providerResourceID string
+	resType            commonv1.ResourceType
+	tier               string
+	requestID          string
+}
 
 func (s *stubRegrader) RegradeResource(
-	_ context.Context, _, _ string, _ commonv1.ResourceType, _, _ string,
+	_ context.Context, token, prid string, resType commonv1.ResourceType, tier, reqID string,
 ) (regradeOutcome, error) {
 	s.calls.Add(1)
+	s.mu.Lock()
+	s.captured = append(s.captured, stubRegradeCall{
+		token:              token,
+		providerResourceID: prid,
+		resType:            resType,
+		tier:               tier,
+		requestID:          reqID,
+	})
+	s.mu.Unlock()
 	return regradeOutcome{Applied: true, AppliedConnLimit: 5}, nil
 }
 
@@ -247,6 +271,24 @@ var redisSweepCols = []string{
 // a no-op.
 func emptyRedisRows() *sqlmock.Rows {
 	return sqlmock.NewRows(redisSweepCols)
+}
+
+// mongoSweepCols mirrors the SELECT in sweepMongoEntitlements (MR-P1-22).
+// Used by tests that need to queue an empty Mongo result so the sweep
+// matches an `ExpectQuery` instead of falling through to the WARN-and-
+// continue path. Same shape as redisSweepCols today, but kept as its own
+// var so a future Mongo-specific projection change does not silently break
+// the Mongo tests.
+var mongoSweepCols = []string{
+	"id", "token", "provider_resource_id",
+	"tier", "plan_tier",
+}
+
+// emptyMongoRows returns an empty sqlmock result set for the Mongo sweep
+// query (MR-P1-22). Use in tests that focus on Postgres/Redis behaviour and
+// want the Mongo sweep to be a no-op without producing a WARN.
+func emptyMongoRows() *sqlmock.Rows {
+	return sqlmock.NewRows(mongoSweepCols)
 }
 
 // fakeEntitlementJob returns a minimal *river.Job for EntitlementReconcilerArgs.
@@ -280,6 +322,7 @@ func TestEntitlementReconciler_NullProviderResourceID_AllRowsScanned(t *testing.
 			WillReturnResult(sqlmock.NewResult(1, 1))
 	}
 	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows()) // Redis A4 query (no-op)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyMongoRows()) // Mongo MR-P1-22 query (no-op)
 
 	stub := &stubRegrader{}
 	reg := liveRegistry(t)
@@ -320,6 +363,7 @@ func TestEntitlementReconciler_NullProviderResourceID_PassesEmptyStringToRegrade
 	mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())               // Redis A4 query (no-op)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyMongoRows()) // Mongo MR-P1-22 query (no-op)
 
 	var capturedPRID string
 	capturingRegrader := &capturePRIDRegrader{captured: &capturedPRID}
@@ -724,6 +768,7 @@ func TestEntitlementReconciler_PostgresDriftCorrected_EmitsSignal(t *testing.T) 
 	mock.ExpectExec(`UPDATE resources SET applied_conn_limit`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())                // Redis query (no-op)
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyMongoRows()) // Mongo MR-P1-22 query (no-op)
 
 	stub := &stubRegrader{} // returns Applied:true
 	reg := liveRegistry(t)
@@ -775,6 +820,7 @@ func TestEntitlementReconciler_NoDrift_NoSignal(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT`).WillReturnRows(rows)
 	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyMongoRows()) // Mongo MR-P1-22 query (no-op)
 
 	w := NewEntitlementReconcilerWorker(db, reg, &stubRegrader{})
 	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
@@ -829,6 +875,126 @@ func TestEntitlementReconciler_RedisDriftCorrected_EmitsSignal(t *testing.T) {
 	if rt := signals[0].attrs["resource_type"]; rt != entitlementResourceTypeRedis {
 		t.Errorf("drift signal resource_type=%q, want %q", rt, entitlementResourceTypeRedis)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEntitlementReconciler_DowngradedTeam_KeepsResourceTierCap is the
+// MR-P1-21 / T8 P1-6 regression test (BugBash 2026-05-20).
+//
+// THE BUG: shouldRegrade and the SELECT path resolved caps from
+// teams.plan_tier — the team's *current* tier — instead of resources.tier
+// (the per-row snapshot). A downgraded paying customer
+// (pro→hobby) would then see:
+//
+//	team.plan_tier = "hobby"
+//	resource.tier  = "pro"               (the documented snapshot)
+//	applied_conn_limit = 20               (the pro cap)
+//	entitled (from team.plan_tier="hobby") = 8
+//	→ drift detected (20 != 8) → ALTER ROLE … CONNECTION LIMIT 8
+//	→ paid customer's pro infra cap silently cut to hobby.
+//
+// This contradicted the documented "keep their tier" downgrade courtesy
+// and silently degraded a live paid resource.
+//
+// THE FIX: shouldRegrade and the regrade call now resolve caps from
+// resources.tier — the per-row snapshot is the entitlement-of-record.
+//
+// THE ASSERTION: given a row where resource.tier="pro" and
+// team.plan_tier="hobby" (a downgraded customer's pro resource), the
+// applied_conn_limit on file (the pro cap) matches the snapshot's
+// entitled cap → shouldRegrade returns drift=false → NO regrade fires.
+// Pre-fix the same input returned drift=true and the worker issued an
+// ALTER ROLE that shrunk the pro cap to hobby.
+func TestEntitlementReconciler_DowngradedTeam_KeepsResourceTierCap(t *testing.T) {
+	reg := liveRegistry(t)
+	proCap := reg.ConnectionsLimit("pro", "postgres")
+	if proCap <= 0 {
+		t.Skipf("live plans registry has no positive pro connection cap (got %d) — registry may be missing 'pro'", proCap)
+	}
+
+	// MR-P1-21: pass resource.tier="pro" (the snapshot), even though the
+	// hypothetical team has plan_tier="hobby". applied_conn_limit matches
+	// the pro cap on file → no drift, no shrink.
+	drift, entitled := shouldRegrade(reg, "pro", nullInt(int64(proCap)))
+	if drift {
+		t.Errorf("MR-P1-21 regression: shouldRegrade(resourceTier=pro, applied=%d) drifted to entitled=%d — the pre-fix code resolved caps from team.plan_tier and would have shrunk this pro resource to the team's current (hobby) cap. The snapshot must be the source of truth.",
+			proCap, entitled)
+	}
+
+	// Sanity-check the other direction too: a stale pro applied_conn_limit
+	// against a pro snapshot SHOULD drift (legitimate first-time regrade).
+	driftStale, _ := shouldRegrade(reg, "pro", nullInt(int64(proCap-1)))
+	if !driftStale {
+		t.Errorf("sanity: a stale applied_conn_limit must still drift on its own snapshot tier")
+	}
+}
+
+// TestEntitlementReconciler_MongoArm_SweepsMongoResources is the
+// MR-P1-22 / T8 P1-9 regression test (BugBash 2026-05-20).
+//
+// THE BUG: the entitlement reconciler iterated Postgres + Redis only — a
+// hobby→pro upgrade left every Mongo resource at hobby caps until the
+// resource was re-provisioned (the rest of the entitlement-of-record
+// path silently under-delivered Mongo).
+//
+// THE FIX: a third sweep arm (sweepMongoEntitlements) iterates active,
+// non-expired Mongo resources and calls RegradeResource. The
+// provisioner currently returns skip_reason="unsupported resource type
+// for regrade" for MONGODB, so the sweep is a hooked-up no-op — the
+// loud no-op (one skipped count per Mongo resource per sweep, visible
+// on the .completed log) is the deliberate observability surface that
+// a future provisioner.regradeMongo implementation does not have to
+// also-add a worker sweep. CLAUDE.md rule 22.
+//
+// THE ASSERTION: given an active Mongo resource on a paid team, the
+// reconciler issues a RegradeResource call with resType=MONGODB and
+// tier=resource.tier. The stub records the call and the test asserts
+// MONGODB shows up — the pre-fix code would never call the provisioner
+// for Mongo at all (the sweep didn't exist).
+func TestEntitlementReconciler_MongoArm_SweepsMongoResources(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+
+	// Postgres + Redis empty; Mongo has one drifted row.
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(mongoSweepCols).
+		AddRow(id, "tok-mongo-1", nil, "pro", "pro"))
+
+	stub := &stubRegrader{}
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, stub)
+
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	// The stub records every RegradeResource call. We expect at least one
+	// MONGODB call (the Mongo sweep arm) — the pre-fix code never made
+	// such a call. The provisioner returning unsupported is acceptable:
+	// what matters is the worker iterated and called.
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	var mongoCalls int
+	for _, c := range stub.captured {
+		if c.resType == commonv1.ResourceType_RESOURCE_TYPE_MONGODB {
+			mongoCalls++
+			if c.tier != "pro" {
+				t.Errorf("Mongo arm: tier=%q, want %q — must pass resource.tier (the snapshot), MR-P1-21", c.tier, "pro")
+			}
+		}
+	}
+	if mongoCalls != 1 {
+		t.Errorf("Mongo arm: RegradeResource called for MONGODB %d times, want 1 — MR-P1-22 requires the sweep to cover Mongo", mongoCalls)
+	}
+
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}

@@ -98,25 +98,39 @@ const eventEmailMaxAge = 48 * time.Hour
 // enough to absorb the row that was in flight when Redis died.
 const eventEmailCursorSeedGrace = 5 * time.Minute
 
-// sentLedger is the worker-side idempotency seam (P1-3 fix, BugBash
-// 2026-05-19). markSent attempts to claim an audit_id in the
-// forwarder_sent table; it returns claimed=true when THIS call inserted
-// the row and claimed=false when the row already existed (the audit_id
-// was sent before — by an earlier tick, a pre-reset run, or a crash
-// recovery). The forwarder skips the provider send when claimed=false.
+// sentLedger is the worker-side idempotency seam.
 //
-// This makes the forwarder idempotent regardless of provider behavior:
-// the Brevo X-Mailin-Custom header is NOT a delivery-dedup guarantee, so
-// without this ledger every cursor reset / cursor_corrupt reset /
-// crash-mid-batch re-sent real duplicate email.
+// MR-P1-16 (BugBash 2026-05-20): the ledger is now consulted with isSent
+// BEFORE the send (to skip a known-already-sent row), and the claim
+// (markSent) is made AFTER a confirmed provider 2xx — never before. The
+// earlier ordering (claim-before-send, shipped 2026-05-19) opened a
+// crash-loss window where a SIGKILL between markSent commit and a
+// successful SendEvent return left the row ledgered with no email actually
+// sent, and the next tick saw claimed=false → skipped → permanent silent
+// loss. The new ordering trades that loss for an at-most-once duplicate
+// on a crash mid-POST (the cursor never advanced, the row re-fetches, the
+// ledger probe returns false → re-sent; the Brevo X-Mailin-Custom header
+// absorbs the duplicate where honored). A duplicate is strictly safer
+// than a loss.
 //
-// release un-claims an audit_id. It is called ONLY when a claim was made
-// but the provider then returned a Transient failure (the cursor is not
-// advanced, so the row will be retried next tick — and the retry must be
-// able to re-claim). A claim followed by a confirmed 2xx / Permanent /
-// SkippedNoTemplate is left in place: those advance the cursor and the
-// ledger row is the permanent record that the audit_id is done.
+// isSent returns true when audit_id has already been claimed in the
+// forwarder_sent table. It is the BEFORE-send guard against re-sending
+// rows that an earlier tick already delivered (cursor reset / cursor
+// corrupt / crash recovery).
+//
+// markSent is called AFTER a confirmed provider 2xx (or a terminal
+// Permanent/Skipped class that has decided to consume the row). It
+// inserts the audit_id ON CONFLICT DO NOTHING. claimed=true means this
+// call inserted the row; claimed=false means a concurrent forwarder won
+// the race (only possible with horizontal worker scale-out) — both are
+// treated as "sent."
+//
+// release is retained for backward compatibility but is unused on the
+// new ordering — the claim happens after the send, so a Transient never
+// has a claim to release. Existing tests/callers that release on a
+// pre-existing claim are tolerated.
 type sentLedger interface {
+	isSent(ctx context.Context, auditID string) (sent bool, err error)
 	markSent(ctx context.Context, auditID string) (claimed bool, err error)
 	release(ctx context.Context, auditID string) error
 }
@@ -125,6 +139,19 @@ type sentLedger interface {
 // table in the platform Postgres (same DB as audit_log).
 type sqlSentLedger struct {
 	db *sql.DB
+}
+
+// isSent returns true when a forwarder_sent row already exists for the
+// audit_id — i.e. an earlier successful send claimed this row. MR-P1-16:
+// the BEFORE-send dedup probe; cheap SELECT EXISTS, no write.
+func (l *sqlSentLedger) isSent(ctx context.Context, auditID string) (bool, error) {
+	var exists bool
+	if err := l.db.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM forwarder_sent WHERE audit_id = $1)
+	`, auditID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("forwarder_sent probe: %w", err)
+	}
+	return exists, nil
 }
 
 // markSent inserts (audit_id) ON CONFLICT DO NOTHING. RowsAffected==1
@@ -161,6 +188,7 @@ func (l *sqlSentLedger) release(ctx context.Context, auditID string) error {
 // about the ledger path. Production NEVER uses this.
 type noopSentLedger struct{}
 
+func (noopSentLedger) isSent(context.Context, string) (bool, error)   { return false, nil }
 func (noopSentLedger) markSent(context.Context, string) (bool, error) { return true, nil }
 func (noopSentLedger) release(context.Context, string) error          { return nil }
 
@@ -603,30 +631,34 @@ batchLoop:
 		evt.HTMLBody = htmlBody
 		evt.TextBody = textBody
 
-		// P1-3 (BugBash 2026-05-19): claim the audit_id in the
-		// forwarder_sent ledger BEFORE the send. markSent inserts ON
-		// CONFLICT DO NOTHING — claimed=false means this audit_id was
-		// already forwarded (by an earlier tick, a pre-cursor-reset run,
-		// or a crash recovery), so we skip the provider POST and just
-		// advance the cursor. This is the real idempotency guarantee:
-		// the Brevo X-Mailin-Custom header is NOT a delivery dedup, so
-		// without this ledger a cursor reset re-sent every email.
+		// MR-P1-16 (BugBash 2026-05-20): probe the ledger BEFORE the send
+		// so a duplicate audit_id is skipped, but CLAIM ON 2xx AFTER the
+		// send completes — never before. Earlier ordering (claim-before-send,
+		// shipped 2026-05-19) opened a crash-loss window: a SIGKILL between
+		// markSent commit and SendEvent returning left the row ledgered with
+		// no email sent → restart saw claimed=false → cursor advanced →
+		// permanent silent loss. The current ordering trades that loss for
+		// an at-most-once duplicate on crash mid-POST (cursor not advanced,
+		// row re-fetched, ledger not yet claimed → re-sent; the Brevo
+		// X-Mailin-Custom header absorbs the duplicate where honored). A
+		// duplicate is strictly safer than a loss.
 		//
-		// A ledger DB error is treated as Transient (hold the cursor):
-		// we cannot prove the row was not already sent, and sending into
-		// an unknown state risks a duplicate — better to retry next tick.
-		claimed, ledgerErr := w.ledger.markSent(ctx, row.ID)
-		if ledgerErr != nil {
-			slog.Warn("jobs.event_email_forwarder.ledger_error",
+		// A ledger DB error on the probe is treated as Transient (hold the
+		// cursor): we cannot prove the row was not already sent, and
+		// sending into an unknown state risks a duplicate — better to
+		// retry next tick.
+		alreadySent, ledgerProbeErr := w.ledger.isSent(ctx, row.ID)
+		if ledgerProbeErr != nil {
+			slog.Warn("jobs.event_email_forwarder.ledger_probe_error",
 				"audit_id", row.ID,
 				"kind", row.Kind,
-				"error", ledgerErr,
-				"note", "forwarder_sent claim failed — holding cursor, retry next tick (cannot prove not-already-sent)",
+				"error", ledgerProbeErr,
+				"note", "forwarder_sent probe failed — holding cursor, retry next tick (cannot prove not-already-sent)",
 			)
 			transient++
 			break batchLoop
 		}
-		if !claimed {
+		if alreadySent {
 			// Already in the ledger — duplicate-suppressed. Advance the
 			// cursor (the row is genuinely done) without re-sending.
 			slog.Info("jobs.event_email_forwarder.duplicate_suppressed",
@@ -645,7 +677,33 @@ batchLoop:
 		class := email.ClassOf(sendErr)
 		switch {
 		case sendErr == nil:
-			// Success — advance cursor.
+			// Success — claim the ledger AFTER the confirmed 2xx (MR-P1-16),
+			// then advance the cursor. If the markSent insert fails the
+			// send was real and the cursor must not advance — retry next
+			// tick (Brevo dedup header absorbs the at-most-once duplicate
+			// where honored).
+			claimed, ledgerErr := w.ledger.markSent(ctx, row.ID)
+			if ledgerErr != nil {
+				slog.Warn("jobs.event_email_forwarder.ledger_claim_failed_post_send",
+					"audit_id", row.ID,
+					"kind", row.Kind,
+					"error", ledgerErr,
+					"note", "send succeeded but ledger claim failed — holding cursor; next tick may produce one duplicate (Brevo X-Mailin-Custom absorbs)",
+				)
+				transient++
+				break batchLoop
+			}
+			if !claimed {
+				// Another forwarder instance won the claim race for this
+				// row (shouldn't happen with `replicas:1`, possible with
+				// horizontal worker scale-out). Both sent; one duplicate
+				// is the documented trade. Advance cursor.
+				slog.Info("jobs.event_email_forwarder.ledger_claim_race",
+					"audit_id", row.ID,
+					"kind", row.Kind,
+					"note", "ledger row already present after our send — concurrent forwarder; treating as sent",
+				)
+			}
 			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
 				return fmt.Errorf("event_email_forwarder: advance cursor: %w", advErr)
 			}
@@ -655,6 +713,23 @@ batchLoop:
 			// provider itself; SkippedNoTemplate is a configuration choice
 			// (this kind isn't wired up in the provider's template map)
 			// and stays at INFO here so dashboards don't light up.
+			//
+			// Claim the ledger so that a cursor reset doesn't re-send a
+			// Permanent failure (e.g. an invalid recipient). A best-effort
+			// claim — a failure here is non-fatal because the cursor still
+			// advances; worst case a duplicate Permanent error is logged
+			// on a cursor reset, which is harmless.
+			if claimed, ledgerErr := w.ledger.markSent(ctx, row.ID); ledgerErr != nil {
+				slog.Warn("jobs.event_email_forwarder.ledger_claim_failed_terminal",
+					"audit_id", row.ID,
+					"kind", row.Kind,
+					"class", class.String(),
+					"error", ledgerErr,
+					"note", "terminal class but ledger claim failed — cursor still advances; cursor-reset may re-attempt this row",
+				)
+			} else if !claimed {
+				// Already claimed by a prior attempt; benign.
+			}
 			slog.Info("jobs.event_email_forwarder.row_skipped",
 				"kind", row.Kind,
 				"audit_id", row.ID,
@@ -672,19 +747,8 @@ batchLoop:
 			// the remaining rows will hit the same wall. A labeled break
 			// is required so we exit the for-range, not just the switch.
 			//
-			// P1-3: the send did NOT succeed, so RELEASE the ledger claim
-			// — otherwise the retry next tick would see claimed=false and
-			// skip the row forever (a never-sent email). A release error
-			// is logged but not fatal: worst case the row is skipped, and
-			// that is strictly safer than a re-send.
-			if relErr := w.ledger.release(ctx, row.ID); relErr != nil {
-				slog.Error("jobs.event_email_forwarder.ledger_release_failed",
-					"audit_id", row.ID,
-					"kind", row.Kind,
-					"error", relErr,
-					"note", "could not un-claim forwarder_sent after transient send — row may be skipped on retry",
-				)
-			}
+			// MR-P1-16: there is no claim to release — the claim is now
+			// AFTER the send, so a Transient never claimed.
 			slog.Warn("jobs.event_email_forwarder.transient_halt",
 				"kind", row.Kind,
 				"audit_id", row.ID,
