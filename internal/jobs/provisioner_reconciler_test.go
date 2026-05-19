@@ -252,3 +252,61 @@ func TestNoopProber_AlwaysReachable(t *testing.T) {
 		t.Errorf("NoopProber returned err=%v, want nil", err)
 	}
 }
+
+// TestProvisionerReconciler_P0_2_RealProberUnreachable_DoesNotPromote is the
+// MR-P0-2 behavioral regression guard (BugBash 2026-05-20, cross-confirmed by
+// T1/T20).
+//
+// THE BUG: the reconciler was wired with a nil → NoopProber. NoopProber.Probe
+// ALWAYS returns ProbeReachable, so a stuck 'pending' row whose backend had
+// genuinely FAILED was nonetheless flipped to status='active' — a credentials-
+// less resource the platform then claimed was healthy.
+//
+// THE FIX: wire the real prober. With a real (non-Noop) prober, an unreachable
+// stuck row resolves to ProbeUnreachable and the reconciler abandons it
+// (status='failed', connection_url NULLed) — it must NEVER reach 'active'.
+//
+// THE ASSERTION: a fakeProber standing in for the real prober reports
+// Unreachable. Only the `UPDATE ... status='failed'` (+ audit) is queued in
+// sqlmock — NO `UPDATE ... status='active'`. sqlmock's ordered expectations
+// fail if the reconciler issues the active-promotion UPDATE. This is exactly
+// the NoopProber behaviour the bug produced; the test fails if it returns.
+func TestProvisionerReconciler_P0_2_RealProberUnreachable_DoesNotPromote(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	resID := uuid.New()
+	token := uuid.New()
+	teamID := uuid.New().String()
+
+	// One stuck 'pending' postgres row whose backend is unreachable.
+	mock.ExpectQuery(`FROM resources`).
+		WillReturnRows(sqlmock.NewRows(reconcilerRowCols).
+			AddRow(resID, token, "postgres", "postgres://encrypted", teamID))
+
+	// The ONLY status UPDATE queued is the abandon path (→ 'failed'). If the
+	// reconciler instead issued `UPDATE ... status='active'` — the NoopProber
+	// regression — sqlmock would see an unexpected statement and fail.
+	mock.ExpectExec(`UPDATE resources\s+SET status = 'failed', connection_url = NULL`).
+		WithArgs(resID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(teamID, "system", "provisioner.reconcile_abandoned", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// A real prober reports the unreachable backend as ProbeUnreachable —
+	// the NoopProber the bug used would instead report ProbeReachable here.
+	prober := &fakeProber{outcome: jobs.ProbeUnreachable, err: errors.New("dial tcp: i/o timeout")}
+	w := jobs.NewProvisionerReconcilerWorker(db, nil, prober)
+	if err := w.Work(context.Background(), fakeJob[jobs.ProvisionerReconcilerArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MR-P0-2 regression: the reconciler issued an unexpected statement — "+
+			"an unreachable stuck row must be abandoned (status='failed'), never promoted "+
+			"to 'active': %v", err)
+	}
+}
