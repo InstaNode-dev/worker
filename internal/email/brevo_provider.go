@@ -20,13 +20,20 @@ package email
 // forwarder doesn't need to know the wire format:
 //
 //   2xx                              → nil                                            (success — forwarder advances cursor)
-//   4xx (401 / 422 / 400 etc.)       → *SendError{Class: SendClassPermanent}          (forwarder advances + logs ERROR)
+//   401 / 403 (auth) / 429 (rate)    → *SendError{Class: SendClassTransient}          (forwarder HOLDS cursor — recoverable)
+//   4xx (400 / 422 payload reject)   → *SendError{Class: SendClassPermanent}          (forwarder advances + logs ERROR)
 //   5xx / network / timeout          → *SendError{Class: SendClassTransient}          (forwarder holds cursor)
 //   no template configured for kind  → *SendError{Class: SendClassSkippedNoTemplate}  (forwarder advances silently)
 //
-// The "4xx-advances" behaviour is deliberate: a single audit row with
-// malformed content shouldn't block every event behind it forever. We
-// log loudly so the poisoned row is visible in the structured-log stream.
+// The "payload-4xx-advances" behaviour is deliberate: a single audit row
+// with malformed content (400/422) shouldn't block every event behind it
+// forever. We log loudly so the poisoned row is visible in the log stream.
+//
+// P0-1 (2026-05-19): 401/403/429 are NOT advanced. A bad/expired/revoked
+// API key (401/403) or a rate-limit (429) is an ACCOUNT-level condition,
+// recoverable without operator data loss — classifying it Permanent made
+// the forwarder silently drop every audit row in every batch. These now
+// map to Transient (cursor held) and log the alert-able auth_wall ERROR.
 
 import (
 	"bytes"
@@ -376,11 +383,53 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		)
 		return nil
 
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		// P0-1 FIX (2026-05-19): 401/403 is an ACCOUNT-LEVEL auth failure
+		// (bad / expired / revoked BREVO_API_KEY) — NOT a per-row payload
+		// problem. It is transient from the queue's point of view: it
+		// resolves the instant an operator rotates the secret. Classifying
+		// it Permanent made the forwarder advance the cursor past every
+		// row in every batch, silently and unrecoverably dropping all
+		// email. Transient holds the cursor so nothing is lost and the
+		// backlog drains once the key is fixed.
+		//
+		// This is logged at ERROR with a distinct, alert-able key
+		// (auth_wall) so an operator is paged before a batch is burned —
+		// the generic email.brevo.permanent_4xx key is for per-row
+		// payload rejects, not account auth failure.
+		slog.Error("email.brevo.auth_wall",
+			"kind", evt.Kind,
+			"recipient", evt.Recipient,
+			"status", resp.StatusCode,
+			"path", string(path),
+			"body", string(respBody),
+			"note", "account-level Brevo auth failure (bad/expired/revoked BREVO_API_KEY) — classified Transient, cursor held, email NOT lost; rotate the secret",
+		)
+		return &SendError{
+			Class:   SendClassTransient,
+			Message: fmt.Sprintf("brevo: auth failure %d %s", resp.StatusCode, string(respBody)),
+		}
+
+	case resp.StatusCode == http.StatusTooManyRequests:
+		// P0-1 FIX (2026-05-19): 429 rate-limited is also recoverable —
+		// the row is fine, Brevo just wants us to back off. Transient so
+		// the cursor holds and the row retries next tick.
+		slog.Warn("email.brevo.rate_limited",
+			"kind", evt.Kind,
+			"recipient", evt.Recipient,
+			"status", resp.StatusCode,
+			"path", string(path),
+			"body", string(respBody),
+		)
+		return &SendError{
+			Class:   SendClassTransient,
+			Message: fmt.Sprintf("brevo: rate limited %d %s", resp.StatusCode, string(respBody)),
+		}
+
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		// 401/403 = bad API key (every row will fail the same way until
-		// someone rotates the secret), 400/422 = bad payload for this row.
-		// In both cases advancing the cursor is correct: holding it pins
-		// the whole queue on one bad row.
+		// 400/422 and other 4xx = genuine per-row payload rejection. The
+		// row will never produce a valid send, so advancing the cursor is
+		// correct: holding it pins the whole queue on one bad row.
 		slog.Error("email.brevo.permanent_4xx",
 			"kind", evt.Kind,
 			"recipient", evt.Recipient,

@@ -131,9 +131,12 @@ func TestBrevoProvider_2xxReturnsNil(t *testing.T) {
 }
 
 // TestBrevoProvider_4xxReturnsPermanent verifies the "advance past poisoned
-// row" contract: a 401 (or any 4xx) → *SendError{Class: SendClassPermanent}.
+// row" contract: a genuine per-row payload reject (400/422) →
+// *SendError{Class: SendClassPermanent}. NOTE 401/403/429 are deliberately
+// EXCLUDED here — they are account-level/recoverable and now classify
+// Transient; see TestBrevoProvider_AuthFailureIsTransient (P0-1 regression).
 func TestBrevoProvider_4xxReturnsPermanent(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusUnprocessableEntity} {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusNotFound, http.StatusConflict} {
 		srv, _ := fakeBrevo(t, status)
 		p := newTestProvider(t, srv, nil)
 
@@ -151,7 +154,40 @@ func TestBrevoProvider_4xxReturnsPermanent(t *testing.T) {
 			continue
 		}
 		if se.Class != SendClassPermanent {
-			t.Errorf("SendEvent on %d → Class=%v; want SendClassPermanent — holding cursor on auth errors pins the queue forever", status, se.Class)
+			t.Errorf("SendEvent on %d → Class=%v; want SendClassPermanent — a payload reject must advance past the poisoned row", status, se.Class)
+		}
+	}
+}
+
+// TestBrevoProvider_AuthFailureIsTransient is the P0-1 regression test.
+//
+// BUG: a bad/expired/revoked BREVO_API_KEY returns 401/403. The provider
+// classified that Permanent → the forwarder advanced the cursor → every
+// audit row in every batch was silently, unrecoverably dropped. A 429
+// rate-limit had the same fate. This test FAILS against the pre-fix code
+// (which returned SendClassPermanent for 401/403/429) and PASSES only
+// when those statuses are classified Transient so the cursor is held and
+// the email is recoverable once the operator rotates the key / backs off.
+func TestBrevoProvider_AuthFailureIsTransient(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests} {
+		srv, _ := fakeBrevo(t, status)
+		p := newTestProvider(t, srv, nil)
+
+		err := p.SendEvent(context.Background(), EventEmail{
+			Kind:      "subscription.upgraded",
+			Recipient: "x@example.com",
+		})
+		if err == nil {
+			t.Errorf("SendEvent on %d = nil; want SendError(Transient)", status)
+			continue
+		}
+		var se *SendError
+		if !errors.As(err, &se) {
+			t.Errorf("SendEvent on %d returned %T; want *SendError", status, err)
+			continue
+		}
+		if se.Class != SendClassTransient {
+			t.Errorf("SendEvent on %d → Class=%v; want SendClassTransient — auth/rate failure must HOLD the cursor, not advance and drop email silently", status, se.Class)
 		}
 	}
 }

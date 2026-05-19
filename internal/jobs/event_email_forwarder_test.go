@@ -11,7 +11,9 @@ package jobs
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,20 +27,27 @@ import (
 )
 
 // memCursor is an in-memory eventCursorStore for tests. Goroutine-safe.
+//
+// missing reports whether the store has no persisted cursor — read()
+// returns it as the second value so tests can exercise the P1-2
+// seed-to-now path. The zero value (missing=false) behaves like an
+// existing zero cursor, preserving every pre-P1-2 test unchanged.
 type memCursor struct {
-	mu sync.Mutex
-	c  eventCursor
+	mu      sync.Mutex
+	c       eventCursor
+	missing bool
 }
 
-func (m *memCursor) read(_ context.Context) (eventCursor, error) {
+func (m *memCursor) read(_ context.Context) (eventCursor, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.c, nil
+	return m.c, m.missing, nil
 }
 func (m *memCursor) write(_ context.Context, c eventCursor) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.c = c
+	m.missing = false
 	return nil
 }
 
@@ -705,5 +714,405 @@ func TestEventForwarder_NoopProvider_AdvancesCursor(t *testing.T) {
 	}
 	if cursor.c.ID != "noop-row" {
 		t.Errorf("cursor.ID = %q; want noop-row (NoopProvider must let the cursor advance)", cursor.c.ID)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BugBash 2026-05-19 regression tests. Each FAILS against the pre-fix code
+// and PASSES only with the corresponding fix in place.
+// ─────────────────────────────────────────────────────────────────────────
+
+// recentTimeArg is a sqlmock argument matcher that passes when the value
+// is a time.Time within `window` of now — used to assert the P1-2 48h
+// fetchBatch age floor is computed from the current time.
+type recentTimeArg struct {
+	window time.Duration
+}
+
+func (m recentTimeArg) Match(v driver.Value) bool {
+	tv, ok := v.(time.Time)
+	if !ok {
+		return false
+	}
+	delta := time.Since(tv)
+	return delta > 0 && delta < m.window
+}
+
+// fakeLedger is the test double for sentLedger. claimed controls what
+// markSent returns; markCalls / releaseCalls count invocations so a test
+// can assert idempotency behavior. seen records claimed audit_ids so a
+// re-run against the SAME fakeLedger behaves like the real ON CONFLICT.
+type fakeLedger struct {
+	mu           sync.Mutex
+	seen         map[string]bool
+	markCalls    int
+	releaseCalls int
+	markErr      error
+}
+
+func newFakeLedger() *fakeLedger { return &fakeLedger{seen: map[string]bool{}} }
+
+func (l *fakeLedger) markSent(_ context.Context, auditID string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.markCalls++
+	if l.markErr != nil {
+		return false, l.markErr
+	}
+	if l.seen[auditID] {
+		return false, nil // already claimed — duplicate
+	}
+	l.seen[auditID] = true
+	return true, nil
+}
+
+func (l *fakeLedger) release(_ context.Context, auditID string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.releaseCalls++
+	delete(l.seen, auditID)
+	return nil
+}
+
+// TestEventForwarder_FetchBatch_HasAgeFloor is the P1-2 regression test.
+//
+// BUG: a Redis wipe reset the cursor to the zero value and fetchBatch —
+// which had NO age bound — re-scanned and re-emailed the ENTIRE audit_log
+// history. This test runs Work with a zero cursor and asserts the SQL
+// query carries a recent (within 48h) age-floor argument. It FAILS
+// against the pre-fix query (which had only 4 args, no age floor).
+func TestEventForwarder_FetchBatch_HasAgeFloor(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// The query MUST include `a.created_at > $5` and pass a now()-anchored
+	// timestamp as the 5th arg. recentTimeArg asserts that arg is within
+	// the 48h window — i.e. the floor exists and is freshly computed.
+	mock.ExpectQuery(`a\.created_at > \$5`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			eventEmailBatchLimit, recentTimeArg{window: eventEmailMaxAge + time.Minute}).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols))
+
+	w := newEventEmailForwarderWorkerForTest(db, &memCursor{}, &fakeProvider{})
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("fetchBatch did not apply the 48h age floor: %v", err)
+	}
+}
+
+// TestEventForwarder_MissingCursor_SeedsToNow is the other half of P1-2.
+//
+// BUG: a missing cursor fell through as the zero value, so fetchBatch
+// scanned from the beginning of time. With the fix, a missing cursor is
+// seeded to now()-grace. This test sets the cursor store to missing=true
+// and asserts the cursor predicate ($2) handed to the query is a recent
+// timestamp, NOT the time.Time zero value.
+func TestEventForwarder_MissingCursor_SeedsToNow(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// $2 is the cursor created_at. A seeded cursor → recent timestamp.
+	// A pre-fix zero cursor → the time.Time zero value, which recentTimeArg
+	// rejects (delta from now is centuries, far outside the window).
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WithArgs(sqlmock.AnyArg(),
+			recentTimeArg{window: eventEmailCursorSeedGrace + time.Minute},
+			sqlmock.AnyArg(), eventEmailBatchLimit, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols))
+
+	w := newEventEmailForwarderWorkerForTest(db, &memCursor{missing: true}, &fakeProvider{})
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("missing cursor was not seeded to now()-grace (would re-scan ancient rows): %v", err)
+	}
+}
+
+// TestEventForwarder_Ledger_SendsOnce is the P1-3 regression test.
+//
+// BUG: idempotency rested on a Brevo header that is not a delivery-dedup
+// mechanism, so a cursor reset / crash recovery re-sent every email. With
+// the forwarder_sent ledger, a second run carrying the SAME audit_id must
+// NOT re-send. This test runs Work TWICE against the same fakeLedger (the
+// 2nd run simulates a cursor reset — the cursor is reset to zero) and
+// asserts the provider's SendEvent was called exactly once total.
+func TestEventForwarder_Ledger_SendsOnce(t *testing.T) {
+	createdAt := time.Now().UTC().Add(-time.Hour) // inside the 48h floor
+
+	provider := &fakeProvider{} // default sendFn nil → success
+	ledger := newFakeLedger()
+
+	runOnce := func(cursor *memCursor) {
+		db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer db.Close()
+		mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+			WillReturnRows(sqlmock.NewRows(auditRowsCols).
+				AddRow("dup-audit-id", "team-1", auditKindOnboardingClaimed, "",
+					"team claimed", []byte(`{"signup_source":"github"}`), createdAt, "owner@example.com"))
+		w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+		w.ledger = ledger
+		if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+			t.Fatalf("Work: %v", err)
+		}
+	}
+
+	// Run 1 — normal: claims the ledger, sends.
+	runOnce(&memCursor{})
+	// Run 2 — simulate a cursor reset (fresh zero cursor): the same
+	// audit row is re-fetched. The ledger MUST suppress the re-send.
+	runOnce(&memCursor{})
+
+	if got := provider.callCount(); got != 1 {
+		t.Errorf("SendEvent called %d times across two runs of the same audit_id; want 1 — the forwarder_sent ledger must make re-runs idempotent (P1-3)", got)
+	}
+	if ledger.markCalls != 2 {
+		t.Errorf("ledger.markSent called %d times; want 2 (claimed once, rejected once)", ledger.markCalls)
+	}
+}
+
+// TestEventForwarder_TransientReleasesLedger guards the ledger correctness
+// corner of P1-3: a claim followed by a Transient send failure MUST
+// release the claim, otherwise the retry next tick would see claimed=false
+// and skip the row forever (a permanently-lost email).
+func TestEventForwarder_TransientReleasesLedger(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("transient-id", "team-1", auditKindOnboardingClaimed, "",
+				"claim", []byte(`{}`), createdAt, "owner@example.com"))
+
+	provider := &fakeProvider{
+		sendFn: func(_ context.Context, _ email.EventEmail) error {
+			return &email.SendError{Class: email.SendClassTransient, Message: "5xx"}
+		},
+	}
+	ledger := newFakeLedger()
+	w := newEventEmailForwarderWorkerForTest(db, &memCursor{}, provider)
+	w.ledger = ledger
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if ledger.releaseCalls != 1 {
+		t.Errorf("ledger.release called %d times after a Transient send; want 1 — an un-released claim would skip the row forever on retry", ledger.releaseCalls)
+	}
+	if ledger.seen["transient-id"] {
+		t.Errorf("transient-id still claimed in the ledger after release — the retry next tick would never re-send it")
+	}
+}
+
+// TestEventForwarder_SuppressionUsesSentRecipient is the F5 regression
+// test.
+//
+// BUG: the forwarder checked suppression against row.OwnerEmail but sent
+// to resolveRecipient(row). For an anonymous-tier row whose address lives
+// in metadata.email and whose OwnerEmail column is empty, the suppression
+// check ran against "" (always "not suppressed") while the email went to
+// the real metadata address — so an unsubscribed anon user still got the
+// email. This test feeds a row with EMPTY owner_email and the recipient
+// only in metadata.email, marks that metadata address suppressed, and
+// asserts NO send happens. Pre-fix it sends (checked "" → not suppressed).
+func TestEventForwarder_SuppressionUsesSentRecipient(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	const anonAddr = "anon-unsubscribed@example.com"
+	// owner_email column is EMPTY — the recipient is ONLY in metadata.email.
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("anon-row", "team-anon", auditKindAnonExpiryWarning, "redis",
+				"anon expiry", []byte(`{"email":"`+anonAddr+`","hours_remaining":"6","resource_type":"redis"}`),
+				createdAt, "" /* owner_email empty */))
+
+	provider := &fakeProvider{
+		sendFn: func(_ context.Context, _ email.EventEmail) error {
+			t.Errorf("SendEvent called for an unsubscribed anon recipient — suppression checked the wrong (empty) address")
+			return nil
+		},
+	}
+	w := newEventEmailForwarderWorkerForTest(db, &memCursor{}, provider)
+	// Suppress the metadata.email address — the one the email is sent to.
+	w.suppression = &memSuppression{suppressedEmails: map[string]bool{anonAddr: true}}
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if got := provider.callCount(); got != 0 {
+		t.Errorf("SendEvent called %d times; want 0 — suppression must be checked against resolveRecipient(row), not the empty owner_email column (F5)", got)
+	}
+}
+
+// TestEventForwarder_MissingRenderer_LoudErrorNoAdvance is the F4
+// regression test.
+//
+// BUG: a kind registered in eventEmailBuilders but missing from
+// eventEmailBodyRenderers fell through to the dead Brevo dashboard-
+// template path → SkippedNoTemplate → cursor advanced silently → zero
+// email, zero error, audit row consumed forever. With the fix a missing
+// renderer is a loud ERROR and the cursor is HELD (not advanced). This
+// test temporarily registers a builder-only kind and asserts the cursor
+// does NOT advance and the provider is never called.
+func TestEventForwarder_MissingRenderer_LoudErrorNoAdvance(t *testing.T) {
+	const orphanKind = "test.builder_without_renderer"
+	// Register a builder but deliberately NO renderer; clean up after.
+	eventEmailBuilders[orphanKind] = func(row auditRow) (map[string]string, bool) {
+		return map[string]string{"x": "y"}, true
+	}
+	supportedAuditKinds = append(supportedAuditKinds, orphanKind)
+	t.Cleanup(func() {
+		delete(eventEmailBuilders, orphanKind)
+		supportedAuditKinds = supportedAuditKinds[:len(supportedAuditKinds)-1]
+	})
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("orphan-id", "team-1", orphanKind, "", "no renderer",
+				[]byte(`{}`), createdAt, "owner@example.com"))
+
+	provider := &fakeProvider{
+		sendFn: func(_ context.Context, _ email.EventEmail) error {
+			t.Errorf("SendEvent called for a kind with no renderer — should have errored before send")
+			return nil
+		},
+	}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if !cursor.c.zero() {
+		t.Errorf("cursor advanced past a kind with no renderer (%+v); want HELD — a missing renderer must not silently consume the audit row (F4)", cursor.c)
+	}
+	if got := provider.callCount(); got != 0 {
+		t.Errorf("SendEvent called %d times for a renderer-less kind; want 0", got)
+	}
+}
+
+// TestEventForwarder_IdleTick_NoInfoLog is the log-noise (P1-1)
+// regression test.
+//
+// BUG: an idle forwarder tick (zero new rows) emitted the
+// jobs.event_email_forwarder.no_new_rows line at INFO every 60s — pure
+// heartbeat noise. With the fix it logs at DEBUG. This test installs a
+// slog handler that records every record at INFO level or above and
+// asserts an idle Work() produces NO such record from the forwarder.
+func TestEventForwarder_IdleTick_NoInfoLog(t *testing.T) {
+	rec := &levelRecorder{minLevel: slog.LevelInfo}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(rec))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols)) // zero rows → idle tick
+
+	w := newEventEmailForwarderWorkerForTest(db, &memCursor{}, &fakeProvider{})
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	for _, msg := range rec.messages() {
+		if msg == "jobs.event_email_forwarder.no_new_rows" {
+			t.Errorf("idle tick emitted %q at INFO+ — idle ticks must log at DEBUG (P1-1 log noise)", msg)
+		}
+	}
+}
+
+// levelRecorder is a minimal slog.Handler that records the message of
+// every record at or above minLevel. Used by TestEventForwarder_IdleTick.
+type levelRecorder struct {
+	mu       sync.Mutex
+	minLevel slog.Level
+	msgs     []string
+}
+
+func (r *levelRecorder) Enabled(_ context.Context, l slog.Level) bool { return l >= r.minLevel }
+func (r *levelRecorder) Handle(_ context.Context, rec slog.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.msgs = append(r.msgs, rec.Message)
+	return nil
+}
+func (r *levelRecorder) WithAttrs(_ []slog.Attr) slog.Handler { return r }
+func (r *levelRecorder) WithGroup(_ string) slog.Handler      { return r }
+func (r *levelRecorder) messages() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.msgs))
+	copy(out, r.msgs)
+	return out
+}
+
+// TestEventForwarder_BuilderSkippedRow_NotWarn is the P2-1 regression
+// test (BugBash 2026-05-19).
+//
+// BUG: a row with no resolvable owner email (an expected, benign state
+// for deleted / orphan / test teams) logged builder_skipped_row at WARN.
+// A steady trickle of orphan rows erodes WARN's signal value. The fix
+// demotes it to INFO. This test installs a slog handler recording only
+// WARN+ records and asserts an owner-less row produces NO WARN-level
+// builder_skipped_row line — while the cursor still advances (unchanged).
+func TestEventForwarder_BuilderSkippedRow_NotWarn(t *testing.T) {
+	rec := &levelRecorder{minLevel: slog.LevelWarn}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(rec))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	// owner_email empty AND no metadata.email → builder returns ok=false.
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("orphan-team-row", "team-deleted", auditKindOnboardingClaimed, "",
+				"claim", []byte(`{}`), createdAt, ""))
+
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, &fakeProvider{})
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	for _, msg := range rec.messages() {
+		if msg == "jobs.event_email_forwarder.builder_skipped_row" {
+			t.Errorf("builder_skipped_row logged at WARN+ for an expected no-owner-email row — must be INFO (P2-1)")
+		}
+	}
+	// Cursor-advance behavior is unchanged — the orphan row is consumed.
+	if cursor.c.ID != "orphan-team-row" {
+		t.Errorf("cursor.ID = %q; want orphan-team-row — P2-1 keeps the cursor-advance behavior", cursor.c.ID)
 	}
 }

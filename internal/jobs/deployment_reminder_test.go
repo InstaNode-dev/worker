@@ -93,7 +93,7 @@ func TestDeploymentReminderWorker_WritesAuditWithFullMetadata(t *testing.T) {
 
 	// CAS UPDATE.
 	mock.ExpectExec(`UPDATE deployments\s+SET reminders_sent`).
-		WithArgs("deploy-1", 2, sqlmock.AnyArg()).
+		WithArgs("deploy-1", 2, sqlmock.AnyArg(), 3 /* maxDeployReminders */).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Audit INSERT — the BrevoForwarder picks this up on its next tick.
@@ -153,7 +153,7 @@ func TestDeploymentReminderWorker_CASRaceLostNoAudit(t *testing.T) {
 
 	// CAS returns rowsAffected=0 — another tick won.
 	mock.ExpectExec(`UPDATE deployments\s+SET reminders_sent`).
-		WithArgs("deploy-race", 1, sqlmock.AnyArg()).
+		WithArgs("deploy-race", 1, sqlmock.AnyArg(), 3 /* maxDeployReminders */).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	// NO INSERT INTO audit_log expected here.

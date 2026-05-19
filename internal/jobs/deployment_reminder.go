@@ -7,8 +7,14 @@ package jobs
 //   - ttl_policy != 'permanent'
 //   - status NOT IN ('deleted', 'expired')
 //   - expires_at falls within the next 12h
-//   - reminders_sent < 6
+//   - reminders_sent < maxDeployReminders (3)
 //   - last_reminder_at IS NULL OR last_reminder_at < now() - 2h  (cooldown)
+//
+// F3 (BugBash 2026-05-19): the cadence used to be SIX identical emails
+// over the final 12h (T+12/14/16/18/20/22h) — read as spam. It is now a
+// 3-stage escalating cadence ("Heads up" → "Reminder" → "Final reminder")
+// matching anon.expiry_warning's shape. See maxDeployReminders and the
+// reminder_index-keyed subject in renderDeployExpiringSoon.
 //
 // For each candidate, CAS-advance reminders_sent (so two ticks don't fire
 // the same reminder twice), then write a deploy.expiring_soon audit_log
@@ -30,8 +36,9 @@ package jobs
 //     below.
 //
 // Cadence in practice: a deploy that lands at T0 with auto_24h TTL fires
-// reminders at T+12h, T+14h, T+16h, T+18h, T+20h, T+22h — six emails over
-// the final 12h.
+// 3 reminders in the final 12h window — roughly T+12h ("Heads up"),
+// T+14h ("Reminder"), T+16h ("Final reminder") — with the 2h cooldown
+// gating the gap. Three escalating emails, not six identical ones.
 //
 // Audit kind: deploy.expiring_soon. Metadata: {deploy_id, team_id,
 // reminder_index, hours_remaining, expires_at, app_id, deploy_url,
@@ -52,6 +59,12 @@ import (
 
 	"instant.dev/worker/internal/metrics"
 )
+
+// maxDeployReminders caps how many deploy-expiry reminders fire per
+// deployment (F3, BugBash 2026-05-19). 3 stages — "Heads up" / "Reminder"
+// / "Final reminder" — matching the anon.expiry_warning escalating
+// cadence. Was 6, which produced six identical emails over 12h.
+const maxDeployReminders = 3
 
 // DeploymentReminderArgs is the River job payload (no fields — runs as a sweep).
 type DeploymentReminderArgs struct{}
@@ -128,11 +141,11 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 		  AND d.status NOT IN ('deleted', 'expired')
 		  AND d.expires_at > $1
 		  AND d.expires_at <= $2
-		  AND d.reminders_sent < 6
+		  AND d.reminders_sent < $4
 		  AND (d.last_reminder_at IS NULL OR d.last_reminder_at <= $3)
 		ORDER BY d.expires_at ASC
 		LIMIT 500
-	`, now, windowEnd, cooldownBefore)
+	`, now, windowEnd, cooldownBefore, maxDeployReminders)
 	if err != nil {
 		return fmt.Errorf("DeploymentReminderWorker: query failed: %w", err)
 	}
@@ -160,7 +173,10 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 	w.sampleTTLGauge(ctx)
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.deployment_reminder.completed",
+		// P1-1 (BugBash 2026-05-19): idle tick — demoted INFO → DEBUG.
+		// deployment_reminder runs every 60s; an idle INFO every minute
+		// is heartbeat noise. Liveness via jobs.middleware.work_ok.
+		slog.Debug("jobs.deployment_reminder.completed",
 			"sent", 0,
 			"candidates", 0,
 			"duration_ms", time.Since(start).Milliseconds(),
@@ -284,9 +300,9 @@ func advanceReminderCAS(ctx context.Context, db *sql.DB, deployIDStr string, exp
 		    last_reminder_at = now()
 		WHERE id = $1
 		  AND reminders_sent = $2
-		  AND reminders_sent < 6
+		  AND reminders_sent < $4
 		  AND (last_reminder_at IS NULL OR last_reminder_at <= $3)
-	`, deployIDStr, expectedRemindersSent, cooldownBefore)
+	`, deployIDStr, expectedRemindersSent, cooldownBefore, maxDeployReminders)
 	if err != nil {
 		return false, err
 	}

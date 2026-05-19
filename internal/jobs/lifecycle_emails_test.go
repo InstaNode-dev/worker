@@ -212,3 +212,49 @@ func TestLifecycleEmail_SubjectsAreKindSpecific(t *testing.T) {
 		seen[subject] = kind
 	}
 }
+
+// TestDeployExpiringSoon_EscalatingCadence is the F3 regression test
+// (BugBash 2026-05-19).
+//
+// BUG: deployment_reminder fired SIX identical "expires in Nh" emails per
+// deploy over 12h — read as spam. The fix is a 3-stage escalating cadence
+// (maxDeployReminders == 3) with a reminder_index-keyed subject prefix
+// ("Heads up" / "Reminder" / "Final reminder"), matching
+// anon.expiry_warning. This test pins both: the cap is 3, and the three
+// stages produce three DISTINCT, escalating subject prefixes. It FAILS
+// against the pre-fix renderer (which ignored reminder_index — all six
+// subjects were identical).
+func TestDeployExpiringSoon_EscalatingCadence(t *testing.T) {
+	if maxDeployReminders != 3 {
+		t.Fatalf("maxDeployReminders = %d; want 3 — F3 reduced the deploy reminder cadence from 6 to a 3-stage escalation", maxDeployReminders)
+	}
+
+	subjects := map[string]string{}
+	for _, idx := range []string{"1", "2", "3"} {
+		subject, _, _ := renderDeployExpiringSoon(map[string]string{
+			"reminder_index":  idx,
+			"hours_remaining": "6",
+			"deploy_name":     "myapp",
+		})
+		subjects[idx] = subject
+	}
+
+	// All three must be distinct — escalation, not six identical emails.
+	if subjects["1"] == subjects["2"] || subjects["2"] == subjects["3"] || subjects["1"] == subjects["3"] {
+		t.Errorf("deploy-reminder subjects are not escalating (1=%q 2=%q 3=%q) — every stage must read differently (F3)",
+			subjects["1"], subjects["2"], subjects["3"])
+	}
+	// The final stage must signal urgency.
+	if !strings.HasPrefix(subjects["3"], "Final reminder") {
+		t.Errorf("reminder_index=3 subject = %q; want a \"Final reminder\" prefix", subjects["3"])
+	}
+	if !strings.HasPrefix(subjects["1"], "Heads up") {
+		t.Errorf("reminder_index=1 subject = %q; want a gentle \"Heads up\" prefix", subjects["1"])
+	}
+	// An absent reminder_index must default to the gentlest stage — never
+	// a false "Final reminder".
+	dflt, _, _ := renderDeployExpiringSoon(map[string]string{"hours_remaining": "6", "deploy_name": "myapp"})
+	if !strings.HasPrefix(dflt, "Heads up") {
+		t.Errorf("missing reminder_index subject = %q; want the gentle \"Heads up\" default", dflt)
+	}
+}

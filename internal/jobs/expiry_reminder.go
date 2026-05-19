@@ -210,7 +210,10 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.expiry_reminder.completed",
+		// P1-1 (BugBash 2026-05-19): idle tick — demoted INFO → DEBUG.
+		// expiry_reminder runs every 60s; an idle INFO line every minute
+		// is pure heartbeat noise. Liveness via jobs.middleware.work_ok.
+		slog.Debug("jobs.expiry_reminder.completed",
 			"emitted", 0,
 			"candidates", 0,
 			"duration_ms", time.Since(start).Milliseconds(),

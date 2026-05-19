@@ -555,13 +555,35 @@ func renderChurnRiskFlagged(params map[string]string) (string, string, string) {
 	return subject, html, text
 }
 
+// deployReminderStagePrefix returns the escalating subject-line prefix for
+// a deploy-expiry reminder, keyed on reminder_index (F3, BugBash
+// 2026-05-19). The 3-stage cadence mirrors anon.expiry_warning's
+// "Heads up" / "Reminder" / "Final reminder" escalation so a customer
+// can tell the urgency apart instead of receiving identical emails.
+//
+// reminder_index is "1".."3" (see deployment_reminder.go, capped at
+// maxDeployReminders). An absent / unparseable value defaults to the
+// gentlest "Heads up" — never a false "Final reminder".
+func deployReminderStagePrefix(reminderIndex string) string {
+	switch reminderIndex {
+	case "2":
+		return "Reminder"
+	case "3":
+		return "Final reminder"
+	default:
+		return "Heads up"
+	}
+}
+
 // renderDeployExpiringSoon — pairs with buildDeployExpiringSoon
 // (deploy.expiring_soon). This IS an expiry kind — the subject genuinely
 // references expiry, but with the real hours_remaining, not a hardcoded 6.
 func renderDeployExpiringSoon(params map[string]string) (string, string, string) {
 	hours := orDefault(params["hours_remaining"], "a few")
 	name := orDefault(params["deploy_name"], "your deployment")
-	subject := "Your instanode deployment " + name + " expires in " + hours + "h"
+	// F3: escalating subject prefix keyed on reminder_index.
+	prefix := deployReminderStagePrefix(params["reminder_index"])
+	subject := prefix + ": your instanode deployment " + name + " expires in " + hours + "h"
 	heading := "Your deployment is about to expire"
 	body := renderBody(bodyDeployExpiringSoon, viewDeployExpiring{
 		DeployName: params["deploy_name"], HoursRemaining: params["hours_remaining"], ExpiresAt: params["expires_at"],
