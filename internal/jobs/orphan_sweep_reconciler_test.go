@@ -23,6 +23,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -72,11 +73,14 @@ func (f *fakeOrphanCanceler) CancelSubscription(_ context.Context, subID string)
 }
 
 // fakeNamespaceLister extends fakeNamespaceDeleter behaviour with the
-// cluster-wide list PASS 3 needs.
+// cluster-wide list PASS 3 needs. listErr, when set, makes
+// ListDeployNamespaces return that error — used to exercise the fail-open
+// posture for an RBAC Forbidden / transient k8s failure.
 type fakeNamespaceLister struct {
 	namespaces []string
 	deleted    []string
 	failOn     map[string]error
+	listErr    error
 }
 
 func newFakeNamespaceLister(namespaces ...string) *fakeNamespaceLister {
@@ -104,6 +108,9 @@ func (f *fakeNamespaceLister) NamespaceExists(_ context.Context, ns string) (boo
 }
 
 func (f *fakeNamespaceLister) ListDeployNamespaces(_ context.Context) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make([]string, len(f.namespaces))
 	copy(out, f.namespaces)
 	return out, nil
@@ -352,5 +359,101 @@ func TestOrphanSweep_AllPasses_NoOrphans_Idempotent(t *testing.T) {
 	if len(exec.processed) != 0 || len(canceler.cancelled) != 0 || len(lister.deleted) != 0 {
 		t.Errorf("clean-state sweep took actions: processed=%v cancelled=%v deleted=%v",
 			exec.processed, canceler.cancelled, lister.deleted)
+	}
+}
+
+// ── scenario 6: PASS 3 namespace-list Forbidden → fail-open, job succeeds ─
+//
+// Regression for the prod ERROR-spam regression: when the worker's
+// ServiceAccount lacks the cluster-scoped `namespaces` list permission,
+// ListDeployNamespaces returns a k8s Forbidden error. The reconciler must
+// NOT fail the whole job over it — that has River retry the dispatch every
+// ~60s and spam ERROR logs over a missing RBAC grant. Instead PASS 3
+// degrades to exactly one structured WARN and a zero-orphan result; PASS 1
+// (stuck-pending teardown) and PASS 2 (orphaned-subscription cancel) still
+// run and the job returns success.
+func TestOrphanSweep_Pass3_ForbiddenNamespaceList_FailsOpen(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	logs := captureSlog(t)
+
+	pendingTeamID := uuid.New()
+	subTeamID := uuid.New()
+	subID := "sub_orphaned_failopen"
+
+	// PASS 1: one stuck deletion_pending team — must still be reconciled.
+	mock.ExpectQuery(`FROM teams\s+WHERE status = 'deletion_pending'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "deletion_requested_at"}).
+			AddRow(pendingTeamID, time.Now().UTC().Add(-40*24*time.Hour)))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(pendingTeamID, "system", auditKindOrphanReclaimed,
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// PASS 2: one orphaned subscription — must still be cancelled.
+	mock.ExpectQuery(`FROM teams\s+WHERE status IN \('tombstoned', 'deletion_pending'\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "stripe_customer_id"}).
+			AddRow(subTeamID, subID))
+	mock.ExpectExec(`UPDATE teams SET stripe_customer_id = NULL`).
+		WithArgs(subTeamID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(subTeamID, "system", auditKindOrphanReclaimed,
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// PASS 3: the namespace List is Forbidden. NO further DB query is
+	// queued — the live-app-ids query must NOT run once the list fails.
+	exec := &fakeTeardownExecutor{failFor: map[uuid.UUID]error{}}
+	canceler := &fakeOrphanCanceler{failFor: map[string]error{}}
+	lister := newFakeNamespaceLister()
+	lister.listErr = errors.New(`namespaces is forbidden: User ` +
+		`"system:serviceaccount:instant-infra:instant-worker" cannot list ` +
+		`resource "namespaces" in API group "" at the cluster scope`)
+
+	w := NewOrphanSweepReconciler(db, exec, canceler, lister)
+
+	// The job MUST succeed despite the Forbidden namespace list.
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work must fail-open on a Forbidden namespace list, got error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+
+	// PASS 1 still ran — the stuck team was reconciled.
+	if len(exec.processed) != 1 || exec.processed[0] != pendingTeamID {
+		t.Errorf("PASS 1 did not run: executor.processed = %v, want [%s]",
+			exec.processed, pendingTeamID)
+	}
+	// PASS 2 still ran — the orphaned subscription was cancelled.
+	if len(canceler.cancelled) != 1 || canceler.cancelled[0] != subID {
+		t.Errorf("PASS 2 did not run: cancelled = %v, want [%s]",
+			canceler.cancelled, subID)
+	}
+	// PASS 3 deleted nothing — the list failed.
+	if len(lister.deleted) != 0 {
+		t.Errorf("PASS 3 deleted namespaces despite a failed list: %v", lister.deleted)
+	}
+
+	// Exactly one WARN for the failed namespace list — no ERROR, no spam.
+	var pass3Warns int
+	for _, r := range *logs {
+		if r.msg == "jobs.orphan_sweep.pass3_namespace_list_failed" {
+			if r.level != slog.LevelWarn {
+				t.Errorf("pass3 namespace-list-failed log level = %v, want WARN", r.level)
+			}
+			pass3Warns++
+		}
+		if r.level >= slog.LevelError {
+			t.Errorf("fail-open sweep emitted an ERROR log: %q %v", r.msg, r.attrs)
+		}
+	}
+	if pass3Warns != 1 {
+		t.Errorf("expected exactly one pass3_namespace_list_failed WARN, got %d", pass3Warns)
 	}
 }
