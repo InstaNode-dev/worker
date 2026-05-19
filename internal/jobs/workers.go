@@ -530,8 +530,44 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			s3Deleter = newMinIOBackupDeleter(concrete)
 		}
 	}
+	// k8s namespace deleter — shared by the team-deletion executor (deletes
+	// a deleted team's instant-deploy-* namespaces) and the orphan-sweep
+	// reconciler. nil when no cluster is reachable (CI / docker-compose) —
+	// both consumers then skip the k8s teardown step with a WARN log.
+	var nsClient K8sNamespaceDeleter
+	if nc, nsErr := NewK8sNamespaceClient(); nsErr != nil {
+		slog.Warn("jobs.k8s_namespace_client.unavailable",
+			"error", nsErr, "effect", "team-deletion k8s teardown + orphan-sweep PASS 3 disabled")
+	} else {
+		nsClient = nc
+	}
+
+	teamDeletionExecutor := NewTeamDeletionExecutorWorker(db, provClient, s3Deleter, nsClient, cfg.ObjectStoreBucket)
+	river.AddWorker(workers, WithObservability(teamDeletionExecutor, nrApp))
+
+	// Orphan-sweep reconciler — the eventually-consistent safety net that
+	// finishes any partial team deletion. Runs every 15 minutes:
+	//   PASS 1 re-runs the executor's teardown for stuck deletion_pending
+	//          teams (idempotent),
+	//   PASS 2 cancels Razorpay subscriptions still live on tombstoned /
+	//          deletion_pending teams (the "stop the money" backstop),
+	//   PASS 3 deletes instant-deploy-* namespaces with no live owner.
+	// The Razorpay canceler is nil when RAZORPAY_KEY_ID is unset — PASS 2
+	// then skips. nsClient (a K8sNamespaceDeleter) is asserted up to the
+	// K8sNamespaceLister the reconciler needs; the concrete
+	// k8sNamespaceClient satisfies both.
+	var orphanCanceler OrphanSubscriptionCanceler
+	if oc, ocErr := NewRazorpayOrphanCanceler(); ocErr != nil {
+		slog.Warn("jobs.orphan_sweep.canceler_init_failed", "error", ocErr)
+	} else {
+		orphanCanceler = oc // may be nil when Razorpay is unconfigured
+	}
+	var nsLister K8sNamespaceLister
+	if l, ok := nsClient.(K8sNamespaceLister); ok {
+		nsLister = l
+	}
 	river.AddWorker(workers, WithObservability(
-		NewTeamDeletionExecutorWorker(db, provClient, s3Deleter, cfg.ObjectStoreBucket),
+		NewOrphanSweepReconciler(db, teamDeletionExecutor, orphanCanceler, nsLister),
 		nrApp,
 	))
 	// Provisioner-reconciler (W5-A). Every 2min, recovers or abandons
@@ -1006,6 +1042,23 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return TeamDeletionExecutorArgs{}, periodicInsertOpts(dailyPeriod)
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Orphan-sweep reconciler — every 15min. The eventually-consistent
+		// safety net for team/account deletion: completes any partial
+		// teardown (stuck deletion_pending teams), cancels orphaned
+		// Razorpay subscriptions still charging a tombstoned customer's
+		// card, and deletes instant-deploy-* namespaces with no live
+		// owner. RunOnStart=true so a worker restart immediately checks
+		// for orphans that piled up while it was down — a deleted
+		// customer being billed is time-sensitive enough to warrant the
+		// boot-time scan. Routed to the reconcile queue so a default-
+		// queue fan-out cannot starve the billing-safety sweep.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(orphanSweepInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return OrphanSweepReconcilerArgs{}, reconcileInsertOpts(orphanSweepInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 		// Provisioner-reconciler (W5-A) — every 2min, reconcile queue.
 		// RunOnStart=true.

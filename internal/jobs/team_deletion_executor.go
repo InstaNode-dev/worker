@@ -18,26 +18,40 @@ package jobs
 //   - Per qualifying team (status='deletion_requested' AND
 //     deletion_requested_at + 30d < now()):
 //
+//      0. Flip teams.status deletion_requested → deletion_pending. From this
+//         instant the team is in the "destruction in flight" state — the API
+//         restore endpoint refuses, and a crash mid-pipeline leaves the row
+//         in deletion_pending (NOT half-tombstoned) so the orphan-sweep
+//         reconciler can resume it. A team already in deletion_pending (a
+//         previous run failed mid-way) is re-processed: every step below is
+//         idempotent.
 //      1. Hard-delete S3 backups under instant-shared/backups/<token>/ for
 //         every resource owned by the team.
 //      2. DeprovisionResource per active row (drops customer DB / cache /
-//         mongo / etc).
-//      3. NULL connection_url, metadata (key_prefix counts as metadata) on
+//         mongo / etc). Idempotent — a re-run over an already-dropped
+//         resource is a no-op on the provisioner side.
+//      3. Delete every instant-deploy-<appID> k8s namespace owned by the
+//         team (the customer's running applications + their build/deploy
+//         objects). Idempotent — a NotFound namespace is treated as
+//         already-gone.
+//      4. NULL connection_url, metadata (key_prefix counts as metadata) on
 //         every resource row owned by the team. Leave id, team_id,
 //         created_at, tombstoned_at-equivalent (paused_at + status) for
 //         downstream audit-trail integrity.
-//      4. Erase PII from team + user rows: NULL email, name, github_id,
+//      5. Erase PII from team + user rows: NULL email, name, github_id,
 //         google_id, stripe_customer_id (the Razorpay subscription id
 //         column). Keep `id` so foreign-key references downstream remain
 //         valid but inert.
-//      5. teams.status='tombstoned', tombstoned_at=now().
-//      6. Emit team.tombstoned audit with metadata
-//         {resource_count_destroyed, s3_bytes_freed, duration_seconds}.
+//      6. teams.status='tombstoned', tombstoned_at=now().
+//      7. Emit team.tombstoned audit with metadata
+//         {resource_count_destroyed, namespaces_deleted, s3_bytes_freed,
+//         duration_seconds}.
 //
-//   - On per-team error (one resource fails to deprovision, S3 batch errors,
-//     etc.): log + emit team.deletion_failed audit row, DO NOT mark
-//     tombstoned. The team stays in deletion_requested state so an operator
-//     can investigate and re-run the next nightly sweep.
+//   - On per-team error (one resource fails to deprovision, a namespace
+//     delete errors, S3 batch errors, etc.): log + emit team.deletion_failed
+//     audit row, DO NOT mark tombstoned. The team stays in deletion_pending
+//     state so an operator AND the orphan-sweep reconciler can investigate
+//     and retry. Every step is idempotent so the retry completes cleanly.
 //
 // ── Module boundary notes ────────────────────────────────────────────────
 //
@@ -96,6 +110,24 @@ const teamDeletionBatchLimit = 50
 // Matches the convention used by quota_wall_nudge.go and churn_predictor.go.
 const teamDeletionActor = "system"
 
+// deployNamespacePrefixTDE mirrors deployNamespace(appID) in the api's k8s
+// compute provider: namespace = "instant-deploy-" + appID. Duplicated here
+// (not imported) because the worker and api are separate Go modules — same
+// pattern deploy_status_reconcile.go uses (deployNamespacePrefix). Suffixed
+// TDE to avoid colliding with that file's identically-valued const within
+// the package.
+const deployNamespacePrefixTDE = "instant-deploy-"
+
+// deployNamespaceForApp returns the k8s namespace housing a customer
+// deployment's pods + build objects. "" appID yields "" so callers skip
+// the delete rather than targeting the prefix-only namespace.
+func deployNamespaceForApp(appID string) string {
+	if appID == "" {
+		return ""
+	}
+	return deployNamespacePrefixTDE + appID
+}
+
 // dailyAt3UTCAfterBackup is reused from churn_predictor's schedule. The
 // brief says "daily 03:00 UTC, after the platform-db-backup job at 02:00
 // UTC." Existing dailyAt3UTCSchedule already fits — see workers.go.
@@ -130,21 +162,39 @@ type S3BackupDeleter interface {
 	RemoveObjects(ctx context.Context, bucketName string, objectsCh <-chan minio.ObjectInfo, opts minio.RemoveObjectsOptions) <-chan minio.RemoveObjectError
 }
 
+// K8sNamespaceDeleter is the narrow surface the executor + the orphan-sweep
+// reconciler need to tear down a customer's deployment namespace. Lifted to
+// an interface so tests pass a fake and CI (no cluster) passes nil.
+//
+// Contract:
+//   - DeleteNamespace removes the namespace and everything in it
+//     (Deployments, Services, Ingresses, build Jobs). It MUST treat a
+//     NotFound namespace as success (return nil) so the call is idempotent
+//     across re-runs of a partially-failed teardown.
+//   - NamespaceExists reports whether the namespace is still present. The
+//     orphan-sweep reconciler uses it to decide whether a tombstoned team
+//     still has live compute to reclaim.
+type K8sNamespaceDeleter interface {
+	DeleteNamespace(ctx context.Context, namespace string) error
+	NamespaceExists(ctx context.Context, namespace string) (bool, error)
+}
+
 // TeamDeletionExecutorWorker drives the post-grace destruction phase.
 type TeamDeletionExecutorWorker struct {
 	river.WorkerDefaults[TeamDeletionExecutorArgs]
 	db          *sql.DB
 	provisioner *provisioner.Client // nil = deprovisioning skipped (fail open)
 	s3          S3BackupDeleter     // nil = S3 backup destruction skipped
+	k8s         K8sNamespaceDeleter // nil = deploy-namespace teardown skipped
 	bucketName  string              // typically "instant-shared"
 }
 
-// NewTeamDeletionExecutorWorker constructs the executor. provClient and s3
-// can both be nil (e.g. CI / docker-compose where neither is reachable);
-// the worker logs at WARN and skips the corresponding step rather than
-// hard-failing the entire run. This matches the fail-open conventions of
-// the other workers (storage_minio scanner, deploy_status_reconciler).
-func NewTeamDeletionExecutorWorker(db *sql.DB, provClient *provisioner.Client, s3 S3BackupDeleter, bucketName string) *TeamDeletionExecutorWorker {
+// NewTeamDeletionExecutorWorker constructs the executor. provClient, s3, and
+// k8s can all be nil (e.g. CI / docker-compose where none is reachable); the
+// worker logs at WARN and skips the corresponding step rather than hard-
+// failing the entire run. This matches the fail-open conventions of the
+// other workers (storage_minio scanner, deploy_status_reconciler).
+func NewTeamDeletionExecutorWorker(db *sql.DB, provClient *provisioner.Client, s3 S3BackupDeleter, k8s K8sNamespaceDeleter, bucketName string) *TeamDeletionExecutorWorker {
 	if bucketName == "" {
 		bucketName = "instant-shared"
 	}
@@ -152,6 +202,7 @@ func NewTeamDeletionExecutorWorker(db *sql.DB, provClient *provisioner.Client, s
 		db:          db,
 		provisioner: provClient,
 		s3:          s3,
+		k8s:         k8s,
 		bucketName:  bucketName,
 	}
 }
@@ -217,19 +268,28 @@ func (w *TeamDeletionExecutorWorker) Work(ctx context.Context, job *river.Job[Te
 	return nil
 }
 
-// fetchCandidates returns every team whose 30-day grace window has elapsed.
+// fetchCandidates returns every team whose 30-day grace window has elapsed
+// AND every team already in deletion_pending (a previous run started
+// destruction and failed mid-pipeline — those are retried, no grace check
+// needed because the grace window already elapsed when they were first
+// swept).
 //
-// The candidate query is the inverse of the API restore guard: API allows
-// restore IFF deletion_requested_at + 30d > now(); this worker tombstones
-// IFF deletion_requested_at + 30d < now(). The two predicates partition the
-// pending-deletion population — no team can be simultaneously restorable
-// and tombstone-eligible.
+// The deletion_requested half of the query is the inverse of the API
+// restore guard: API allows restore IFF deletion_requested_at + 30d >
+// now(); this worker begins teardown IFF deletion_requested_at + 30d <
+// now(). The two predicates partition the deletion_requested population —
+// no team can be simultaneously restorable and teardown-eligible.
+//
+// The deletion_pending half has no time predicate: once a team is in
+// deletion_pending its destruction is in flight and a retry should run on
+// the very next sweep, not wait another 30 days.
 func (w *TeamDeletionExecutorWorker) fetchCandidates(ctx context.Context) ([]teamPendingDeletion, error) {
 	rows, err := w.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT id, deletion_requested_at
 		  FROM teams
-		 WHERE status = 'deletion_requested'
-		   AND deletion_requested_at + interval '%d days' < now()
+		 WHERE (status = 'deletion_requested'
+		        AND deletion_requested_at + interval '%d days' < now())
+		    OR status = 'deletion_pending'
 		 ORDER BY deletion_requested_at ASC
 		 LIMIT %d
 	`, teamDeletionGraceDays, teamDeletionBatchLimit))
@@ -259,6 +319,21 @@ func (w *TeamDeletionExecutorWorker) fetchCandidates(ctx context.Context) ([]tea
 func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPendingDeletion) error {
 	start := time.Now()
 
+	// Step 0: flip deletion_requested → deletion_pending. From here the
+	// team is "destruction in flight" — the API restore endpoint refuses
+	// and a crash below leaves the row in deletion_pending (recoverable by
+	// the orphan-sweep reconciler), never half-tombstoned. A team already
+	// in deletion_pending (a previous run failed mid-pipeline) gets 0 rows
+	// affected here; that is EXPECTED and we proceed — every step below is
+	// idempotent so the retry completes cleanly.
+	if _, err := w.db.ExecContext(ctx, `
+		UPDATE teams
+		   SET status = 'deletion_pending'
+		 WHERE id = $1 AND status = 'deletion_requested'
+	`, c.teamID); err != nil {
+		return fmt.Errorf("mark deletion_pending: %w", err)
+	}
+
 	// Step 1+2: enumerate the team's resources for both the S3 delete
 	// (which keys on token) and the gRPC deprovision (which keys on
 	// resource_type + provider_resource_id).
@@ -281,9 +356,11 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 	}
 
 	// Step 2: deprovision every active resource via the gRPC provisioner.
-	// A single failure aborts the team — the row stays in
-	// deletion_requested state, the audit_log carries the failure, and
-	// the next nightly run will retry.
+	// A single failure aborts the team — the row stays in deletion_pending
+	// state, the audit_log carries the failure, and the next sweep (or the
+	// orphan-sweep reconciler) retries. Deprovision is idempotent on the
+	// provisioner side, so a retry over an already-dropped resource is a
+	// no-op.
 	if w.provisioner != nil {
 		for _, r := range resources {
 			resType := expireResourceTypeToProto(r.resourceType)
@@ -306,12 +383,35 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 		}
 	}
 
-	// Step 3-5: a single transaction that NULLs connection_url +
+	// Step 3: delete every instant-deploy-<appID> k8s namespace the team
+	// owns — this stops the customer's running applications and reclaims
+	// the paid compute. Without this step a deleted Pro/Team customer's
+	// pods keep running (and keep costing) forever. Idempotent: a NotFound
+	// namespace is treated as already-gone by the deleter.
+	var namespacesDeleted int
+	if w.k8s != nil {
+		appIDs, derr := w.fetchTeamDeployAppIDs(ctx, c.teamID)
+		if derr != nil {
+			return fmt.Errorf("fetch deploy app ids: %w", derr)
+		}
+		for _, appID := range appIDs {
+			ns := deployNamespaceForApp(appID)
+			if ns == "" {
+				continue
+			}
+			if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
+				return fmt.Errorf("delete namespace %s: %w", ns, delErr)
+			}
+			namespacesDeleted++
+		}
+	}
+
+	// Step 4-6: a single transaction that NULLs connection_url +
 	// metadata + key_prefix on resources, NULLs PII on users + the team
 	// row, flips status='tombstoned', stamps tombstoned_at.
 	//
 	// Wrapping these in a transaction prevents a partial tombstone state
-	// (PII gone but status still 'deletion_requested') if the connection
+	// (PII gone but status still 'deletion_pending') if the connection
 	// drops between steps. Either the team is fully tombstoned or it
 	// isn't.
 	tx, err := w.db.BeginTx(ctx, nil)
@@ -323,10 +423,10 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 		_ = tx.Rollback()
 	}()
 
-	// Step 3: NULL the customer-data fields on every resource row.
+	// Step 4: NULL the customer-data fields on every resource row.
 	// Leave id, team_id, created_at, status, paused_at so the dashboard
 	// can still render "deleted resource X" historically without leaking
-	// secrets.
+	// secrets. Idempotent — re-NULLing already-NULL columns is a no-op.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE resources
 		   SET connection_url = NULL,
@@ -337,7 +437,7 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 		return fmt.Errorf("null resource pii: %w", err)
 	}
 
-	// Step 4: NULL PII on user rows + team row. Email is set to a
+	// Step 5: NULL PII on user rows + team row. Email is set to a
 	// per-id placeholder rather than NULL because the users.email
 	// column is NOT NULL UNIQUE (see migration 001) — a real NULL
 	// would fail the constraint. The deleted-<id>@tombstoned.invalid
@@ -350,15 +450,19 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 		       github_id = NULL,
 		       google_id = NULL
 		 WHERE team_id = $1
+		   AND email NOT LIKE 'deleted-%@tombstoned.invalid'
 	`, c.teamID); err != nil {
 		return fmt.Errorf("null user pii: %w", err)
 	}
 
-	// Step 5: flip the team row. stripe_customer_id holds the Razorpay
-	// subscription id (legacy column name); we NULL it here so the
-	// post-tombstone billing scans don't try to reconcile a destroyed
-	// subscription. teams.name (the visible slug) is NULLed too — the
-	// dashboard's tombstoned-team view will fall back to the id.
+	// Step 6: flip the team row deletion_pending → tombstoned.
+	// stripe_customer_id holds the Razorpay subscription id (legacy column
+	// name); we NULL it here so the post-tombstone billing scans don't try
+	// to reconcile a destroyed subscription. teams.name (the visible slug)
+	// is NULLed too — the dashboard's tombstoned-team view falls back to
+	// the id. The WHERE guards on 'deletion_pending' (set by step 0); a
+	// re-run that already tombstoned the row gets 0 rows affected, which is
+	// the idempotent success case — we still commit and emit the audit.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE teams
 		   SET status               = 'tombstoned',
@@ -366,7 +470,7 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 		       name                 = NULL,
 		       stripe_customer_id   = NULL
 		 WHERE id = $1
-		   AND status = 'deletion_requested'
+		   AND status = 'deletion_pending'
 	`, c.teamID); err != nil {
 		return fmt.Errorf("flip team status: %w", err)
 	}
@@ -375,18 +479,48 @@ func (w *TeamDeletionExecutorWorker) processTeam(ctx context.Context, c teamPend
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Step 6: emit team.tombstoned audit. Best-effort — a failure here
+	// Step 7: emit team.tombstoned audit. Best-effort — a failure here
 	// is logged but does NOT roll the tombstone back. The row's
 	// status='tombstoned' is itself the operator-visible signal.
-	w.emitTombstoned(ctx, c.teamID, int64(len(resources)), s3BytesFreed, time.Since(start))
+	w.emitTombstoned(ctx, c.teamID, int64(len(resources)), int64(namespacesDeleted), s3BytesFreed, time.Since(start))
 
 	slog.Info("jobs.team_deletion.tombstoned",
 		"team_id", c.teamID.String(),
 		"resource_count_destroyed", len(resources),
+		"namespaces_deleted", namespacesDeleted,
 		"s3_bytes_freed", s3BytesFreed,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return nil
+}
+
+// fetchTeamDeployAppIDs returns the app_id of every non-deleted deployment
+// owned by the team. The k8s namespace for each is instant-deploy-<appID>;
+// the executor deletes those namespaces in step 3. We scan all non-'deleted'
+// rows (including 'expired' / 'failed') because a namespace can outlive its
+// logical deployment row's status.
+func (w *TeamDeletionExecutorWorker) fetchTeamDeployAppIDs(ctx context.Context, teamID uuid.UUID) ([]string, error) {
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT DISTINCT app_id
+		  FROM deployments
+		 WHERE team_id = $1
+		   AND app_id IS NOT NULL
+		   AND app_id != ''
+	`, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var appID string
+		if err := rows.Scan(&appID); err != nil {
+			return nil, err
+		}
+		out = append(out, appID)
+	}
+	return out, rows.Err()
 }
 
 // fetchTeamResources returns every non-deleted row owned by the team.
@@ -485,16 +619,17 @@ func (w *TeamDeletionExecutorWorker) deleteS3BackupsForToken(ctx context.Context
 // emitTombstoned writes the success audit row. Best-effort: a failure to
 // insert does NOT roll the tombstone back — the tombstone is the
 // operator-visible signal.
-func (w *TeamDeletionExecutorWorker) emitTombstoned(ctx context.Context, teamID uuid.UUID, resourceCount, s3Bytes int64, duration time.Duration) {
+func (w *TeamDeletionExecutorWorker) emitTombstoned(ctx context.Context, teamID uuid.UUID, resourceCount, namespacesDeleted, s3Bytes int64, duration time.Duration) {
 	meta := map[string]any{
 		"resource_count_destroyed": resourceCount,
+		"namespaces_deleted":       namespacesDeleted,
 		"s3_bytes_freed":           s3Bytes,
 		"duration_seconds":         int(duration.Seconds()),
 	}
 	metaBytes, _ := json.Marshal(meta)
 	summary := fmt.Sprintf(
-		"team tombstoned — destroyed %d resources, freed %d bytes of S3 backups in %ds",
-		resourceCount, s3Bytes, int(duration.Seconds()),
+		"team tombstoned — destroyed %d resources, deleted %d k8s namespaces, freed %d bytes of S3 backups in %ds",
+		resourceCount, namespacesDeleted, s3Bytes, int(duration.Seconds()),
 	)
 	if _, err := w.db.ExecContext(ctx, `
 		INSERT INTO audit_log (team_id, actor, kind, summary, metadata)
@@ -524,6 +659,10 @@ func (w *TeamDeletionExecutorWorker) emitDeletionFailed(ctx context.Context, tea
 		failStep = "s3_delete"
 	case containsAny(msg, "deprovision"):
 		failStep = "deprovision"
+	case containsAny(msg, "delete namespace"), containsAny(msg, "deploy app ids"):
+		failStep = "delete_namespace"
+	case containsAny(msg, "mark deletion_pending"):
+		failStep = "mark_deletion_pending"
 	case containsAny(msg, "null resource pii"):
 		failStep = "null_resource_pii"
 	case containsAny(msg, "null user pii"):
