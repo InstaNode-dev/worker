@@ -42,6 +42,19 @@ type ExpireAnonymousArgs struct{}
 
 func (ExpireAnonymousArgs) Kind() string { return "expire_anonymous" }
 
+// ResourceDeprovisioner is the narrow seam the reaper uses to tear down a
+// resource's physical backend (DROP DATABASE / DROP USER / delete NATS pod).
+// Lifted to an interface so a test can inject a fake that fails the
+// deprovision and assert the reaper does NOT then mark the row deleted
+// (MR-P0-1a, BugBash 2026-05-20). The concrete *provisioner.Client satisfies
+// it. nil = deprovision skipped (fail open) — same posture as before.
+type ResourceDeprovisioner interface {
+	DeprovisionResource(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType) error
+}
+
+// compile-time assertion: the real provisioner client satisfies the seam.
+var _ ResourceDeprovisioner = (*provisioner.Client)(nil)
+
 // ExpireAnonymousWorker expires anonymous resources that have passed their expires_at time.
 // It calls the provisioner to DROP the physical resource (DB/ACL user/Mongo user) before
 // marking the row as deleted, so credentials stop working immediately rather than lingering
@@ -49,8 +62,8 @@ func (ExpireAnonymousArgs) Kind() string { return "expire_anonymous" }
 type ExpireAnonymousWorker struct {
 	river.WorkerDefaults[ExpireAnonymousArgs]
 	db          *sql.DB
-	provisioner *provisioner.Client // nil = deprovision skipped (fail open)
-	minioClient *madmin.AdminClient // nil = MinIO IAM-user cleanup skipped (legacy self-hosted MinIO backend)
+	provisioner ResourceDeprovisioner // nil = deprovision skipped (fail open)
+	minioClient *madmin.AdminClient   // nil = MinIO IAM-user cleanup skipped (legacy self-hosted MinIO backend)
 	// objectDeleter deletes a storage resource's objects under its tenant
 	// prefix on the S3-compatible OBJECT_STORE_* backend (DO Spaces in prod).
 	// This is the only path that actually removes a tenant's objects on
@@ -65,15 +78,34 @@ type ExpireAnonymousWorker struct {
 }
 
 // NewExpireAnonymousWorker constructs an ExpireAnonymousWorker.
-// Pass nil for provClient to skip physical deprovisioning (e.g. in tests or when the
-// provisioner is unavailable — the DB row is still marked deleted).
+// Pass nil for provClient to skip physical deprovisioning (e.g. in tests or
+// when the provisioner is unavailable — the deprovision step is then skipped,
+// and per MR-P0-1a the row is left in its reapable status for a later retry,
+// NOT marked deleted).
 // Pass nil for minioClient to skip MinIO IAM user cleanup.
 //
 // The storage-object deleter and bucket are wired separately via
 // WithObjectDeleter — callers that don't set it leave storage expiry as a
 // logged WARN (no silent no-op) rather than dropping the tenant's objects.
 func NewExpireAnonymousWorker(db *sql.DB, provClient *provisioner.Client, minioClient *madmin.AdminClient) *ExpireAnonymousWorker {
-	return &ExpireAnonymousWorker{db: db, provisioner: provClient, minioClient: minioClient}
+	w := &ExpireAnonymousWorker{db: db, minioClient: minioClient}
+	// A typed-nil *provisioner.Client stored straight into the interface
+	// field would make `w.provisioner != nil` true and panic on call. Only
+	// assign when the pointer is genuinely non-nil so the nil-skip guard in
+	// Work() behaves.
+	if provClient != nil {
+		w.provisioner = provClient
+	}
+	return w
+}
+
+// WithDeprovisioner overrides the deprovisioner seam — used by tests to
+// inject a fake that fails the deprovision call so the MR-P0-1a regression
+// (a failed deprovision must NOT mark the row deleted) can be exercised
+// without a live provisioner. Returns the worker for chaining.
+func (w *ExpireAnonymousWorker) WithDeprovisioner(d ResourceDeprovisioner) *ExpireAnonymousWorker {
+	w.provisioner = d
+	return w
 }
 
 // WithObjectDeleter wires the S3-compatible object deleter used to remove a
@@ -160,11 +192,26 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 		return nil
 	}
 
-	// Step 2: For each candidate, deprovision the physical resource then mark the row deleted.
-	// Errors on either step are logged but never propagate — fail open so one bad resource
-	// does not block the expiry of the remaining batch.
+	// Step 2: For each candidate, deprovision the physical resource then mark
+	// the row deleted. One bad resource never blocks the expiry of the rest of
+	// the batch (fail open).
+	//
+	// MR-P0-1a (BugBash 2026-05-20, cross-confirmed by T1/T5/T20/T24): the row
+	// is marked status='deleted' ONLY when the backend teardown genuinely
+	// succeeded (or there was nothing to tear down). A 'deleted' row is
+	// terminal and invisible to every reconciler — so marking it deleted while
+	// the physical Postgres DB / Redis ACL / Mongo user / NATS pod is still
+	// live orphans that backend forever (it bills real money and consumes
+	// shared-cluster capacity). On a deprovision failure we instead leave the
+	// row in its current reapable status: the next reaper tick (or the team-
+	// deletion executor) retries the teardown.
 	var expired int
 	for _, r := range candidates {
+		// deprovisionFailed gates the mark-deleted UPDATE below. true = a
+		// backend teardown call returned an error this tick; the row stays
+		// reapable so a later tick retries it instead of stranding the infra.
+		deprovisionFailed := false
+
 		// Deprovision — credentials become invalid immediately.
 		switch r.resourceType {
 		case "storage":
@@ -199,16 +246,33 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 					if deprovErr := w.provisioner.DeprovisionResource(
 						ctx, r.token, r.providerResourceID, resType,
 					); deprovErr != nil {
+						// MR-P0-1a: a failed teardown must NOT advance the
+						// row to 'deleted'. Flag it so the mark-deleted
+						// UPDATE below is skipped; the row stays reapable
+						// and the next tick retries the DROP.
+						deprovisionFailed = true
 						slog.Warn("jobs.expire_anonymous.deprovision_failed",
 							"error", deprovErr,
 							"resource_id", r.id,
 							"resource_type", r.resourceType,
 							"token", r.token,
 							"job_id", job.ID,
+							"effect", "row left reapable for retry; NOT marked deleted (MR-P0-1a)",
 						)
 					}
 				}
 			}
+		}
+
+		// MR-P0-1a: skip the mark-deleted UPDATE when the backend teardown
+		// failed this tick. Marking a row 'deleted' (a terminal, non-reapable
+		// status) with live backend infra behind it permanently orphans that
+		// infra — no reconciler ever revisits a 'deleted' row. Leaving the row
+		// reapable means the next reaper tick re-selects it and retries the
+		// DROP until it genuinely succeeds.
+		if deprovisionFailed {
+			metrics.ExpireDeprovisionFailedTotal.Inc()
+			continue
 		}
 
 		// Guarded UPDATE: mark deleted only from a non-terminal status, matching

@@ -12,6 +12,18 @@ var (
 		Help: "Anonymous resources expired (DB row marked deleted) by the worker",
 	})
 
+	// ExpireDeprovisionFailedTotal counts resources whose physical backend
+	// teardown (DeprovisionResource) returned an error during an expiry tick.
+	// Per MR-P0-1a (BugBash 2026-05-20) the reaper now LEAVES such a row in
+	// its reapable status (it is NOT marked deleted) so the next tick retries
+	// — preventing the namespace/DB leak. A sustained non-zero rate means the
+	// provisioner is failing teardowns and customer infra is accumulating.
+	// NR alert: rate(instant_expire_deprovision_failed_total[15m]) > 0 → P2.
+	ExpireDeprovisionFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_expire_deprovision_failed_total",
+		Help: "Resources whose backend deprovision failed during expiry (row left reapable for retry, MR-P0-1a).",
+	})
+
 	// ActiveAnonymousResources is the count of active anonymous resources with a TTL (updated each expiry job run).
 	ActiveAnonymousResources = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "instant_active_anonymous_resources",

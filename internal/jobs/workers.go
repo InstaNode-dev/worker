@@ -571,9 +571,16 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		nrApp,
 	))
 	// Provisioner-reconciler (W5-A). Every 2min, recovers or abandons
-	// stuck pending resources. NoopProber default — real prober lands in
-	// L2 follow-up. See prober.go for rationale.
-	river.AddWorker(workers, WithObservability(NewProvisionerReconcilerWorker(db, rdb, nil), nrApp))
+	// stuck pending resources.
+	//
+	// MR-P0-2 (BugBash 2026-05-20): this previously passed nil → NoopProber,
+	// whose every probe returns ProbeReachable — so the reconciler would
+	// blindly flip every stuck 'pending' row to 'active' WITHOUT checking the
+	// backend, handing the customer a credentials-less resource the platform
+	// claims is healthy. Wire the SAME real prober resource_heartbeat uses two
+	// lines below (NewRealProber): a stuck pending row is now only promoted to
+	// 'active' if its backend is genuinely reachable, else abandoned/retried.
+	river.AddWorker(workers, WithObservability(NewProvisionerReconcilerWorker(db, rdb, NewRealProber(cfg)), nrApp))
 	// Resource-heartbeat (W5-A). Hourly (dev: 1min) probe of every active
 	// resource. Sets degraded=true on probe failure, emits state-change
 	// audit rows.

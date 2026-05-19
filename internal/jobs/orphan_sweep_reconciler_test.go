@@ -73,14 +73,17 @@ func (f *fakeOrphanCanceler) CancelSubscription(_ context.Context, subID string)
 }
 
 // fakeNamespaceLister extends fakeNamespaceDeleter behaviour with the
-// cluster-wide list PASS 3 needs. listErr, when set, makes
-// ListDeployNamespaces return that error — used to exercise the fail-open
+// cluster-wide lists PASS 3 (deploy namespaces) and PASS 4 (customer
+// namespaces) need. listErr / customerListErr, when set, make the
+// corresponding List return that error — used to exercise the fail-open
 // posture for an RBAC Forbidden / transient k8s failure.
 type fakeNamespaceLister struct {
-	namespaces []string
-	deleted    []string
-	failOn     map[string]error
-	listErr    error
+	namespaces         []string // instant-deploy-* — returned by ListDeployNamespaces
+	customerNamespaces []string // instant-customer-* — returned by ListCustomerNamespaces
+	deleted            []string
+	failOn             map[string]error
+	listErr            error
+	customerListErr    error
 }
 
 func newFakeNamespaceLister(namespaces ...string) *fakeNamespaceLister {
@@ -88,6 +91,13 @@ func newFakeNamespaceLister(namespaces ...string) *fakeNamespaceLister {
 		namespaces: namespaces,
 		failOn:     map[string]error{},
 	}
+}
+
+// withCustomerNamespaces sets the instant-customer-* namespaces the fake
+// reports to PASS 4. Returns the fake for chaining.
+func (f *fakeNamespaceLister) withCustomerNamespaces(ns ...string) *fakeNamespaceLister {
+	f.customerNamespaces = ns
+	return f
 }
 
 func (f *fakeNamespaceLister) DeleteNamespace(_ context.Context, ns string) error {
@@ -114,6 +124,25 @@ func (f *fakeNamespaceLister) ListDeployNamespaces(_ context.Context) ([]string,
 	out := make([]string, len(f.namespaces))
 	copy(out, f.namespaces)
 	return out, nil
+}
+
+func (f *fakeNamespaceLister) ListCustomerNamespaces(_ context.Context) ([]string, error) {
+	if f.customerListErr != nil {
+		return nil, f.customerListErr
+	}
+	out := make([]string, len(f.customerNamespaces))
+	copy(out, f.customerNamespaces)
+	return out, nil
+}
+
+// expectEmptyPass4 queues the sqlmock expectation for PASS 4's live-token
+// query returning nothing — used when the fake reports customer namespaces
+// but a test only cares about the earlier passes, OR when the fake reports
+// no customer namespaces (PASS 4 short-circuits before the query, so callers
+// with an empty customer-namespace set must NOT queue this).
+func expectEmptyPass4(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"token"}))
 }
 
 // captureBytesArgOSR captures a JSONB column's bytes for audit assertions.
@@ -455,5 +484,97 @@ func TestOrphanSweep_Pass3_ForbiddenNamespaceList_FailsOpen(t *testing.T) {
 	}
 	if pass3Warns != 1 {
 		t.Errorf("expected exactly one pass3_namespace_list_failed WARN, got %d", pass3Warns)
+	}
+}
+
+// ── scenario 7: PASS 4 reclaims orphaned instant-customer-* namespaces ────
+//
+// TestOrphanSweep_Pass4_ReclaimsOrphanedCustomerNamespace is the MR-P0-1b
+// regression guard (BugBash 2026-05-20, cross-confirmed by T1/T5/T20/T24 — the
+// headline finding).
+//
+// THE BUG: every db/redis/mongo/queue resource gets a dedicated
+// instant-customer-<token> namespace. The reaper used to mark a resources row
+// 'deleted' even when its backend teardown FAILED (MR-P0-1a); a 'deleted' row
+// is terminal and invisible to PASS 1's per-team path, so the namespace — with
+// a live Postgres/Redis pod inside — was orphaned forever. The orphan-sweep
+// reconciler's PASS 3 only ever swept instant-deploy-* namespaces; NOTHING
+// swept instant-customer-*. 188 such namespaces leaked in prod, pushing the
+// cluster to 98–99% CPU.
+//
+// THE FIX: PASS 4 lists every instant-customer-* namespace and deletes any
+// whose <token> has no active/paused/suspended resources row.
+//
+// THE ASSERTION: given two customer namespaces — one whose token IS still a
+// live resource, one whose token is NOT — PASS 4 deletes ONLY the orphan and
+// leaves the live one untouched. If a future edit drops the PASS 4 sweep, the
+// orphan is never deleted and this test fails.
+func TestOrphanSweep_Pass4_ReclaimsOrphanedCustomerNamespace(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	liveToken := "tok-live-resource"
+	orphanToken := "tok-orphan-no-row"
+	liveNS := customerNamespacePrefix + liveToken
+	orphanNS := customerNamespacePrefix + orphanToken
+
+	// PASS 1 + 2 skipped (nil executor, nil canceler).
+	// PASS 3: the live-deploy-app-ids query returns nothing (no deploy
+	// namespaces reported by the fake).
+	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+	// PASS 4: the live-resource-tokens query returns ONLY liveToken — so
+	// orphanNS (whose token has no active/paused/suspended row) is the orphan.
+	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources\s+WHERE status IN \('active', 'paused', 'suspended'\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"token"}).AddRow(liveToken))
+	// The reclaimed customer namespace gets a cluster-scoped orphan_reclaimed
+	// event — emitted as a structured log (teamID is uuid.Nil), no audit row.
+
+	lister := newFakeNamespaceLister().withCustomerNamespaces(liveNS, orphanNS)
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	// ONLY the orphan namespace is deleted; the namespace backed by a live
+	// resource row is left alone.
+	if len(lister.deleted) != 1 || lister.deleted[0] != orphanNS {
+		t.Errorf("MR-P0-1b regression: deleted customer namespaces = %v, want [%s] "+
+			"(the orphan must be reclaimed; the live-resource namespace must be kept)",
+			lister.deleted, orphanNS)
+	}
+}
+
+// TestOrphanSweep_Pass4_NoCustomerNamespaces_NoQuery proves PASS 4 short-
+// circuits when the cluster has no instant-customer-* namespaces — it must
+// NOT run the live-token query (and so a test with an empty customer set need
+// not queue it). Also guards against a delete-everything bug if the query is
+// ever moved before the empty check.
+func TestOrphanSweep_Pass4_NoCustomerNamespaces_NoQuery(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// PASS 3 query only — no customer namespaces means PASS 4 queues nothing.
+	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+
+	lister := newFakeNamespaceLister() // no deploy, no customer namespaces
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if len(lister.deleted) != 0 {
+		t.Errorf("PASS 4 deleted namespaces on an empty customer set: %v", lister.deleted)
 	}
 }

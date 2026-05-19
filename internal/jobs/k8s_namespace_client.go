@@ -95,15 +95,31 @@ func (c *k8sNamespaceClient) NamespaceExists(ctx context.Context, namespace stri
 // on any API failure so the reconciler skips the k8s-orphan phase rather
 // than acting on a truncated list.
 func (c *k8sNamespaceClient) ListDeployNamespaces(ctx context.Context) ([]string, error) {
+	return c.listNamespacesWithPrefix(ctx, deployNamespacePrefixTDE)
+}
+
+// ListCustomerNamespaces returns the names of every instant-customer-*
+// namespace currently in the cluster. The orphan-sweep reconciler's PASS 4
+// uses this to find customer namespaces whose backing resources row is gone
+// (the MR-P0-1b leak: a reaper that marked the row 'deleted' while the
+// namespace's backend stayed live). Returns an error on any API failure so
+// the reconciler skips the customer-orphan phase rather than acting on a
+// truncated list — never delete a namespace off an incomplete picture.
+func (c *k8sNamespaceClient) ListCustomerNamespaces(ctx context.Context) ([]string, error) {
+	return c.listNamespacesWithPrefix(ctx, customerNamespacePrefix)
+}
+
+// listNamespacesWithPrefix is the shared cluster-scoped namespace List used
+// by both ListDeployNamespaces and ListCustomerNamespaces.
+func (c *k8sNamespaceClient) listNamespacesWithPrefix(ctx context.Context, prefix string) ([]string, error) {
 	list, err := c.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("k8sNamespaceClient.ListDeployNamespaces: %w", err)
+		return nil, fmt.Errorf("k8sNamespaceClient.listNamespacesWithPrefix %q: %w", prefix, err)
 	}
 	var out []string
 	for i := range list.Items {
 		name := list.Items[i].Name
-		if len(name) >= len(deployNamespacePrefixTDE) &&
-			name[:len(deployNamespacePrefixTDE)] == deployNamespacePrefixTDE {
+		if len(name) >= len(prefix) && name[:len(prefix)] == prefix {
 			out = append(out, name)
 		}
 	}

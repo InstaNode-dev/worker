@@ -2,6 +2,8 @@ package jobs_test
 
 import (
 	"context"
+	"database/sql/driver"
+	"errors"
 	"sync"
 	"testing"
 
@@ -10,8 +12,34 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
 
+	commonv1 "instant.dev/proto/common/v1"
 	"instant.dev/worker/internal/jobs"
 )
+
+// recordingArg is a sqlmock.Argument matcher that records whether it was ever
+// evaluated. It matches ANY value — its only job is to observe that the
+// statement it gates was actually executed. Used by the MR-P0-1a regression
+// test to detect that the reaper attempted the mark-deleted UPDATE.
+type recordingArg struct{ hit bool }
+
+func (r *recordingArg) Match(_ driver.Value) bool {
+	r.hit = true
+	return true
+}
+
+// fakeDeprovisioner is a jobs.ResourceDeprovisioner test double. It records
+// every DeprovisionResource call and can be told to fail — used by the
+// MR-P0-1a regression test to assert the reaper does NOT mark a row deleted
+// when the backend teardown errors.
+type fakeDeprovisioner struct {
+	calls   int
+	failErr error // non-nil → every DeprovisionResource call fails
+}
+
+func (f *fakeDeprovisioner) DeprovisionResource(_ context.Context, _, _ string, _ commonv1.ResourceType) error {
+	f.calls++
+	return f.failErr
+}
 
 // fakeObjectDeleter is a fake S3BackupDeleter used to assert the storage-
 // expiry path actually drives an object delete against the object store.
@@ -291,5 +319,109 @@ func TestExpireAnonymousWorker_StorageExpiry_NoDeleterWarns(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestExpireAnonymousWorker_P0_1a_DeprovisionFailure_DoesNotMarkDeleted is the
+// MR-P0-1a regression guard (BugBash 2026-05-20, cross-confirmed by
+// T1/T5/T20/T24 — the headline namespace/resource leak).
+//
+// THE BUG: the reaper called provisioner.DeprovisionResource, and on an error
+// logged a WARN but FELL THROUGH to the guarded `UPDATE resources SET
+// status='deleted'`. A 'deleted' row is terminal and invisible to every
+// reconciler — so the backend (the customer's instant-customer-<token> k8s
+// namespace and its live Postgres/Redis/Mongo pod) was orphaned forever,
+// billing real money. 188 such namespaces leaked in prod.
+//
+// THE FIX: on a deprovision error the row is LEFT in its reapable status; the
+// next reaper tick retries the teardown. The row is marked 'deleted' only
+// after a genuinely successful backend teardown.
+//
+// THE ASSERTION: with a deprovisioner that always fails, the worker must
+// issue NO `UPDATE resources SET status='deleted'`. sqlmock has ordered
+// expectations — only the SELECT and the trailing active-anon COUNT are
+// queued; an unexpected UPDATE makes ExpectationsWereMet fail. If a future
+// edit reintroduces the unconditional mark-deleted, this test fails.
+func TestExpireAnonymousWorker_P0_1a_DeprovisionFailure_DoesNotMarkDeleted(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// One expired postgres resource — has a real provider_resource_id so the
+	// reaper attempts a deprovision RPC.
+	mock.ExpectQuery(`SELECT id::text`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
+			AddRow("id-leak", "tok-leak", "postgres", "db_tok_leak"))
+	// The mark-deleted UPDATE IS queued — but gated by markDeletedSpy, a
+	// recording argument matcher. With the fix the reaper SKIPS this UPDATE
+	// (deprovision failed), so the matcher never fires and markDeletedSpy.hit
+	// stays false. With the bug the reaper FALLS THROUGH to this UPDATE, the
+	// matcher fires, and hit flips true — failing the test. Queuing it (rather
+	// than omitting it) is what makes the buggy path observable: an omitted
+	// expectation just produces a swallowed sqlmock error inside the reaper's
+	// fail-open `continue`, which ExpectationsWereMet does NOT surface.
+	markDeletedSpy := &recordingArg{}
+	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
+		WithArgs(markDeletedSpy).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	// The trailing active-anon count always runs.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	deprov := &fakeDeprovisioner{failErr: errors.New("provisioner unreachable: context deadline exceeded")}
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil).WithDeprovisioner(deprov)
+
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The reaper must have actually attempted the teardown.
+	if deprov.calls != 1 {
+		t.Errorf("DeprovisionResource calls = %d, want 1 (the reaper must attempt teardown)", deprov.calls)
+	}
+	// THE LOAD-BEARING ASSERTION: the mark-deleted UPDATE must NOT have run.
+	// markDeletedSpy.hit is true iff the reaper executed `UPDATE ... SET
+	// status='deleted'` for the row whose deprovision failed — the exact bug
+	// that orphans the customer's instant-customer-<token> namespace forever.
+	if markDeletedSpy.hit {
+		t.Error("MR-P0-1a regression: the reaper marked the row status='deleted' " +
+			"even though DeprovisionResource FAILED. A 'deleted' row is terminal and " +
+			"invisible to every reconciler — the backend (customer k8s namespace + its " +
+			"live DB/Redis pod) is now orphaned forever. On a failed deprovision the row " +
+			"must stay reapable so the next tick retries.")
+	}
+}
+
+// TestExpireAnonymousWorker_P0_1a_DeprovisionSuccess_StillMarksDeleted is the
+// companion to the above: it pins that the fix did NOT break the happy path —
+// when the backend teardown genuinely succeeds, the row IS marked 'deleted'.
+func TestExpireAnonymousWorker_P0_1a_DeprovisionSuccess_StillMarksDeleted(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT id::text`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
+			AddRow("id-ok", "tok-ok", "postgres", "db_tok_ok"))
+	// Deprovision succeeds → the mark-deleted UPDATE MUST run.
+	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	deprov := &fakeDeprovisioner{} // failErr nil → succeeds
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil).WithDeprovisioner(deprov)
+
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deprov.calls != 1 {
+		t.Errorf("DeprovisionResource calls = %d, want 1", deprov.calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("happy path regressed: a successful deprovision must still mark the row deleted: %v", err)
 	}
 }

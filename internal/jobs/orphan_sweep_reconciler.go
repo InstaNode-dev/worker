@@ -44,12 +44,26 @@ package jobs
 //            at all — is paid compute with no owner. The reconciler deletes
 //            it.
 //
+//   PASS 4 — orphaned k8s customer namespaces (MR-P0-1b, BugBash 2026-05-20).
+//            Every provisioned db/redis/mongo/queue resource gets a dedicated
+//            instant-customer-<token> namespace. When the reaper marks a
+//            resources row 'deleted' but the backend teardown failed (the
+//            MR-P0-1a bug — now fixed, but 188 such namespaces had already
+//            leaked in prod, 121 reclaimed by hand), the namespace is left
+//            running a live Postgres/Redis pod with no active DB record.
+//            PASS 4 lists every instant-customer-* namespace and deletes any
+//            whose <token> has NO non-terminal (active/paused/suspended)
+//            resources row — i.e. nothing the platform still considers a
+//            live resource. This is the durable fix that stops the leak from
+//            recurring.
+//
 // Each reclaimed orphan emits a team.orphan_reclaimed audit row; each orphan
 // the reconciler cannot reclaim emits team.orphan_sweep_failed so an
-// operator is alerted. Customer-DB / storage-prefix orphans are reclaimed
-// transitively by PASS 1 (the executor's per-team path deprovisions every
-// resource and deletes every S3 backup prefix), so they need no dedicated
-// pass.
+// operator is alerted. Customer-DB / storage-prefix orphans for a cleanly
+// deleted team are reclaimed transitively by PASS 1 (the executor's per-team
+// path deprovisions every resource and deletes every S3 backup prefix); PASS
+// 4 is the backstop for the case PASS 1 cannot see — a namespace whose row is
+// already 'deleted' so no per-team teardown will ever revisit it.
 //
 // IDEMPOTENCY
 //
@@ -112,7 +126,18 @@ const (
 	orphanKindStuckPendingTeam = "stuck_pending_team"
 	orphanKindRazorpaySub      = "razorpay_subscription"
 	orphanKindK8sNamespace     = "k8s_namespace"
+	orphanKindK8sCustomerNS    = "k8s_customer_namespace"
 )
+
+// customerNamespacePrefix is the prefix of every per-resource customer
+// namespace. The provisioner derives namespace = "instant-customer-<token>"
+// for each provisioned db/redis/mongo/queue resource. PASS 4 lists by this
+// prefix; the token is the namespace name with the prefix stripped.
+//
+// Kept here (not reusing entitlement_reconciler.go's redisK8sNsPrefix, which
+// has the same value but a redis-scoped name) so PASS 4's intent is explicit
+// and a future rename of the redis constant cannot silently break the sweep.
+const customerNamespacePrefix = "instant-customer-"
 
 // OrphanSubscriptionCanceler is the narrow seam the reconciler uses to
 // cancel a still-live Razorpay subscription belonging to an already-
@@ -125,13 +150,15 @@ type OrphanSubscriptionCanceler interface {
 }
 
 // K8sNamespaceLister extends K8sNamespaceDeleter with the cluster-wide
-// list the reconciler's PASS 3 needs. The concrete k8sNamespaceClient
-// satisfies it (see k8s_namespace_client.go). Kept as a separate interface
-// so the executor — which only deletes namespaces it already knows by
-// name — does not depend on the list capability.
+// lists the reconciler's PASS 3 (deploy namespaces) and PASS 4 (customer
+// namespaces) need. The concrete k8sNamespaceClient satisfies it (see
+// k8s_namespace_client.go). Kept as a separate interface so the executor —
+// which only deletes namespaces it already knows by name — does not depend
+// on the list capability.
 type K8sNamespaceLister interface {
 	K8sNamespaceDeleter
 	ListDeployNamespaces(ctx context.Context) ([]string, error)
+	ListCustomerNamespaces(ctx context.Context) ([]string, error)
 }
 
 // teamTeardownExecutor is the slice of the team-deletion executor the
@@ -194,13 +221,14 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		return fmt.Errorf("OrphanSweepReconciler: subscription pass failed: %w", err)
 	}
 
-	// PASS 3 is fail-open: a forbidden/transient k8s error degrades to a
-	// single WARN and a zero-orphan result. It must NEVER fail the job —
-	// PASS 1 (money) and PASS 2 (money) have already run, and an ERROR
-	// here would have River retry the whole dispatch every ~60s, spamming
-	// ERROR logs over a missing RBAC permission. sweepOrphanedNamespaces
-	// therefore never returns a non-nil error.
+	// PASS 3 + PASS 4 are fail-open: a forbidden/transient k8s error degrades
+	// to a single WARN and a zero-orphan result. They must NEVER fail the job
+	// — PASS 1 (money) and PASS 2 (money) have already run, and an ERROR here
+	// would have River retry the whole dispatch every ~60s, spamming ERROR
+	// logs over a missing RBAC permission. Neither sweep returns a non-nil
+	// error.
 	nsDeleted, nsFailed := w.sweepOrphanedNamespaces(ctx)
+	custNSDeleted, custNSFailed := w.sweepOrphanedCustomerNamespaces(ctx)
 
 	slog.Info("jobs.orphan_sweep.completed",
 		"pending_teams_finished", pendingFinished,
@@ -209,6 +237,8 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		"orphan_subscriptions_failed", subsFailed,
 		"orphan_namespaces_deleted", nsDeleted,
 		"orphan_namespaces_failed", nsFailed,
+		"orphan_customer_namespaces_deleted", custNSDeleted,
+		"orphan_customer_namespaces_failed", custNSFailed,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"job_id", job.ID,
 	)
@@ -435,6 +465,116 @@ func (w *OrphanSweepReconciler) fetchLiveDeployAppIDs(ctx context.Context) (map[
 			return nil, scanErr
 		}
 		out[appID] = true
+	}
+	return out, rows.Err()
+}
+
+// ── PASS 4 — orphaned k8s customer namespaces (MR-P0-1b) ─────────────────
+
+// sweepOrphanedCustomerNamespaces lists every instant-customer-<token>
+// namespace and deletes the ones whose <token> has NO non-terminal
+// (active/paused/suspended) resources row — i.e. nothing the platform still
+// considers a live resource.
+//
+// THE LEAK THIS CLOSES. Every db/redis/mongo/queue resource gets a dedicated
+// instant-customer-<token> namespace. The reaper used to mark a resources
+// row 'deleted' even when the backend teardown FAILED (MR-P0-1a); a 'deleted'
+// row is terminal and invisible to PASS 1's per-team path, so the namespace —
+// still running a live Postgres/Redis pod — was orphaned forever. 188 such
+// namespaces leaked in prod. MR-P0-1a stops new ones; this pass reclaims any
+// that slip through (and is the recurrence guard).
+//
+// SAFETY. A namespace is deleted ONLY when its token has no active /paused/
+// suspended row. A token that still has such a row is a live resource — left
+// alone. The "no backing row at all" case is also an orphan: a namespace
+// whose row was hard-deleted or never existed is paid compute with no owner.
+//
+// FAIL-OPEN. Identical posture to PASS 3: a namespace List failure or a DB
+// blip on the live-token query degrades to one WARN and a zero-orphan result.
+// The pass never returns an error — PASS 1/2/3 have already run.
+func (w *OrphanSweepReconciler) sweepOrphanedCustomerNamespaces(ctx context.Context) (deleted, failed int) {
+	if w.k8s == nil {
+		slog.Warn("jobs.orphan_sweep.pass4_skipped_no_k8s")
+		return 0, 0
+	}
+
+	namespaces, err := w.k8s.ListCustomerNamespaces(ctx)
+	if err != nil {
+		slog.Warn("jobs.orphan_sweep.pass4_namespace_list_failed",
+			"error", err.Error(),
+			"detail", "customer-namespace orphan cleanup skipped this sweep; "+
+				"PASS 1/2/3 still ran; check instant-worker RBAC for cluster-scoped namespaces list")
+		return 0, 0
+	}
+	if len(namespaces) == 0 {
+		return 0, 0
+	}
+
+	liveTokens, err := w.fetchLiveResourceTokens(ctx)
+	if err != nil {
+		// A DB blip on the live-token query must NOT cause a delete decision
+		// off an empty set — that would tear down every customer namespace.
+		// Skip the pass this sweep.
+		slog.Warn("jobs.orphan_sweep.pass4_live_tokens_failed",
+			"error", err.Error(),
+			"detail", "customer-namespace orphan cleanup skipped this sweep; PASS 1/2/3 still ran")
+		return 0, 0
+	}
+
+	for _, ns := range namespaces {
+		token := ns[len(customerNamespacePrefix):]
+		if token == "" {
+			continue
+		}
+		if liveTokens[token] {
+			continue // a live resource still backs this namespace — leave it
+		}
+		// Orphan: no active/paused/suspended resources row for this token.
+		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
+			failed++
+			slog.Error("jobs.orphan_sweep.customer_namespace_delete_failed",
+				"namespace", ns, "error", delErr)
+			w.emitOrphanSweepFailed(ctx, uuid.Nil, orphanKindK8sCustomerNS, ns, delErr)
+			continue
+		}
+		deleted++
+		slog.Info("jobs.orphan_sweep.customer_namespace_reclaimed",
+			"namespace", ns,
+			"detail", "instant-customer-* namespace with no active resources row deleted (MR-P0-1b)")
+		w.emitOrphanReclaimed(ctx, uuid.Nil, orphanKindK8sCustomerNS, ns,
+			"deleted orphaned k8s customer namespace (no backing active resource)")
+	}
+	return deleted, failed
+}
+
+// fetchLiveResourceTokens returns the set of resource tokens that still have
+// a non-terminal (active / paused / suspended) row in the resources table —
+// i.e. every token PASS 4 must NOT reclaim the namespace for.
+//
+// Crucially this does NOT include 'deleted' or 'expired' (terminal) rows: a
+// terminal row's backend is expected to be torn down, so its namespace, if
+// still present, IS an orphan. The token column is cast to text so the
+// in-Go namespace-suffix comparison is exact.
+func (w *OrphanSweepReconciler) fetchLiveResourceTokens(ctx context.Context) (map[string]bool, error) {
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT DISTINCT token::text
+		  FROM resources
+		 WHERE status IN ('active', 'paused', 'suspended')
+		   AND token IS NOT NULL
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var token string
+		if scanErr := rows.Scan(&token); scanErr != nil {
+			return nil, scanErr
+		}
+		if token != "" {
+			out[token] = true
+		}
 	}
 	return out, rows.Err()
 }
