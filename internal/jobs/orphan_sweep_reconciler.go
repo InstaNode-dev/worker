@@ -194,10 +194,13 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		return fmt.Errorf("OrphanSweepReconciler: subscription pass failed: %w", err)
 	}
 
-	nsDeleted, nsFailed, err := w.sweepOrphanedNamespaces(ctx)
-	if err != nil {
-		return fmt.Errorf("OrphanSweepReconciler: namespace pass failed: %w", err)
-	}
+	// PASS 3 is fail-open: a forbidden/transient k8s error degrades to a
+	// single WARN and a zero-orphan result. It must NEVER fail the job —
+	// PASS 1 (money) and PASS 2 (money) have already run, and an ERROR
+	// here would have River retry the whole dispatch every ~60s, spamming
+	// ERROR logs over a missing RBAC permission. sweepOrphanedNamespaces
+	// therefore never returns a non-nil error.
+	nsDeleted, nsFailed := w.sweepOrphanedNamespaces(ctx)
 
 	slog.Info("jobs.orphan_sweep.completed",
 		"pending_teams_finished", pendingFinished,
@@ -342,15 +345,31 @@ func (w *OrphanSweepReconciler) sweepOrphanedSubscriptions(ctx context.Context) 
 // sweepOrphanedNamespaces lists every instant-deploy-* namespace and deletes
 // the ones whose backing deployment row is owned by a tombstoned /
 // deletion_pending team, or has no backing row at all.
-func (w *OrphanSweepReconciler) sweepOrphanedNamespaces(ctx context.Context) (deleted, failed int, err error) {
+//
+// FAIL-OPEN. This pass never returns an error. The namespace List is a
+// cluster-scoped k8s call that can be denied (RBAC Forbidden) or fail
+// transiently (API outage). When that happens the pass logs exactly one
+// structured WARN and returns a zero-orphan result so the overall job
+// still succeeds — PASS 1 and PASS 2 (the money-stopping passes) have
+// already run, and surfacing an error here would have River retry the
+// whole dispatch every ~60s, spamming ERROR logs over a missing
+// permission. A namespace orphan that goes un-reclaimed for one interval
+// is harmless; an ERROR-spamming retry loop is not.
+func (w *OrphanSweepReconciler) sweepOrphanedNamespaces(ctx context.Context) (deleted, failed int) {
 	if w.k8s == nil {
 		slog.Warn("jobs.orphan_sweep.pass3_skipped_no_k8s")
-		return 0, 0, nil
+		return 0, 0
 	}
 
 	namespaces, err := w.k8s.ListDeployNamespaces(ctx)
 	if err != nil {
-		return 0, 0, err
+		// Forbidden (missing RBAC) or any transient k8s error: degrade
+		// gracefully. One WARN, no error — the job still succeeds.
+		slog.Warn("jobs.orphan_sweep.pass3_namespace_list_failed",
+			"error", err.Error(),
+			"detail", "namespace-orphan cleanup skipped this sweep; "+
+				"PASS 1/2 still ran; check instant-worker RBAC for cluster-scoped namespaces list")
+		return 0, 0
 	}
 
 	// Build the set of app_ids whose namespace is legitimately live: the
@@ -359,7 +378,12 @@ func (w *OrphanSweepReconciler) sweepOrphanedNamespaces(ctx context.Context) (de
 	// orphan.
 	liveAppIDs, err := w.fetchLiveDeployAppIDs(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("fetch live deploy app ids: %w", err)
+		// Same fail-open posture: a DB blip on the live-app-ids query
+		// must not fail the job. Skip the delete decisions this sweep.
+		slog.Warn("jobs.orphan_sweep.pass3_live_app_ids_failed",
+			"error", err.Error(),
+			"detail", "namespace-orphan cleanup skipped this sweep; PASS 1/2 still ran")
+		return 0, 0
 	}
 
 	for _, ns := range namespaces {
@@ -382,7 +406,7 @@ func (w *OrphanSweepReconciler) sweepOrphanedNamespaces(ctx context.Context) (de
 		w.emitOrphanReclaimed(ctx, uuid.Nil, orphanKindK8sNamespace, ns,
 			"deleted orphaned k8s deploy namespace")
 	}
-	return deleted, failed, nil
+	return deleted, failed
 }
 
 // fetchLiveDeployAppIDs returns the set of deployment app_ids that are
