@@ -32,7 +32,9 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -137,4 +139,86 @@ func (c *k8sNamespaceClient) listNamespacesWithPrefix(ctx context.Context, prefi
 		}
 	}
 	return out, nil
+}
+
+// GetNamespaceAge returns time.Since(namespace.CreationTimestamp). NotFound
+// maps to (0, nil) — the orphan_sweep PASS 3 caller treats that as "the
+// namespace was reaped by another path; nothing to do this tick".
+func (c *k8sNamespaceClient) GetNamespaceAge(ctx context.Context, namespace string) (time.Duration, error) {
+	ns, err := c.cs.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("k8sNamespaceClient.GetNamespaceAge %q: %w", namespace, err)
+	}
+	created := ns.CreationTimestamp.Time
+	if created.IsZero() {
+		// A namespace with no CreationTimestamp is anomalous — be
+		// conservative and report it as freshly created so the
+		// no_db_row reap path skips it this tick.
+		return 0, nil
+	}
+	return time.Since(created), nil
+}
+
+// k8sPodStateClient is the production PodStateProvider used by PASS 6.
+// Wraps the same kubernetes.Clientset used by k8sNamespaceClient — both
+// are constructed in StartWorkers from a single newDeployK8sClientset()
+// call so they share a TCP connection pool to the k8s API.
+type k8sPodStateClient struct {
+	cs *kubernetes.Clientset
+}
+
+// NewK8sPodStateClient builds the PASS 6 pod-state seam. Returns (nil, err)
+// when no cluster is reachable — caller passes nil to
+// (*OrphanSweepReconciler).WithPodStateProvider and PASS 6 stays disabled.
+func NewK8sPodStateClient() (PodStateProvider, error) {
+	cs, err := newDeployK8sClientset()
+	if err != nil {
+		return nil, err
+	}
+	return &k8sPodStateClient{cs: cs}, nil
+}
+
+// ListPodWaitingReasons returns the waiting-state reason of every pod's
+// primary container in `namespace`. A pod whose primary container is NOT
+// in Waiting (Running, ContainerCreating that has progressed, Terminated)
+// contributes "" to the slice — the PASS 6 caller treats any "" as
+// "build is progressing; leave alone".
+//
+// A NotFound on the namespace yields (nil, nil) — the namespace was reaped
+// by another path before PASS 6 could check it.
+func (c *k8sPodStateClient) ListPodWaitingReasons(ctx context.Context, namespace string) ([]string, error) {
+	list, err := c.cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("k8sPodStateClient.ListPodWaitingReasons %q: %w", namespace, err)
+	}
+	out := make([]string, 0, len(list.Items))
+	for i := range list.Items {
+		pod := &list.Items[i]
+		out = append(out, podPrimaryContainerWaitingReason(pod))
+	}
+	return out, nil
+}
+
+// podPrimaryContainerWaitingReason returns the Waiting.Reason of the
+// pod's first container, or "" when not in Waiting state. Returning the
+// first container's state is sufficient for PASS 6: instant-deploy-*
+// pods are single-container by construction (the api's k8s provider
+// creates exactly one app container per Deployment).
+func podPrimaryContainerWaitingReason(pod *corev1.Pod) string {
+	if len(pod.Status.ContainerStatuses) == 0 {
+		// Pod hasn't reached the container status step yet (Pending +
+		// scheduling). Report empty — caller treats as progressing.
+		return ""
+	}
+	cs := pod.Status.ContainerStatuses[0]
+	if cs.State.Waiting != nil {
+		return cs.State.Waiting.Reason
+	}
+	return ""
 }

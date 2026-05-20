@@ -507,6 +507,68 @@ var (
 		Name: "readyz_check_status",
 		Help: "Per-component readiness status (1=ok, 0.5=degraded, 0=failed). Set by /readyz on every probe.",
 	}, []string{"service", "check"})
+
+	// ── orphan_sweep_reconciler — reap counters (2026-05-20) ──────────────────
+	//
+	// Every namespace / DB row the orphan-sweep reconciler reaps (or flips to
+	// failed) increments this counter, labelled by `reason`. Distinct reasons
+	// reflect distinct failure modes — operators alert on each independently:
+	//
+	//   reason="team_tombstoned"      — PASS 3: instant-deploy-* namespace whose
+	//                                   team is tombstoned/deletion_pending or
+	//                                   whose DB row has status='deleted'.
+	//   reason="no_db_row"            — PASS 3: instant-deploy-* namespace with
+	//                                   NO matching DB row (the P0-3 atomic-
+	//                                   provision symptom — and the leading
+	//                                   indicator alert for it).
+	//   reason="failed_old_deployment" — PASS 3: instant-deploy-* namespace
+	//                                   whose row has status='failed' AND
+	//                                   created_at < 6h ago. The autopsy stays
+	//                                   in deployment_events; the namespace
+	//                                   doesn't need to linger paying compute.
+	//   reason="failed_build"          — PASS 6: deployments row status IN
+	//                                   ('building','deploying') for >30min
+	//                                   whose pod is in
+	//                                   ImagePullBackOff/ErrImagePull/
+	//                                   CrashLoopBackOff. The reconciler flips
+	//                                   the row to 'failed' so PASS 3 reaps
+	//                                   the namespace 6h later.
+	//   reason="customer_no_row"      — PASS 4: instant-customer-<token>
+	//                                   namespace whose token has no
+	//                                   active/paused/suspended resources row
+	//                                   (the MR-P0-1b backstop).
+	//   reason="stack_no_row"         — PASS 5: instant-stack-<id> namespace
+	//                                   whose id has no stacks row (the
+	//                                   T6 P0-1 prefix-mismatch backstop).
+	//
+	// NR alert (mandatory):
+	//   sum(rate(instant_orphan_sweep_reaped_total{reason="no_db_row"}[1h])) > 0
+	//     → P0 page. A no_db_row event means a deploy was provisioned (k8s
+	//     namespace created) but the deployments INSERT never landed — the
+	//     P0-3 atomic-provision bug surfacing in prod. Investigate same hour.
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_orphan_sweep_reaped_total{reason="failed_build"}[15m])) > 5
+	//     → P2 page. A burst of failed-build reaps means the kaniko/GHCR path
+	//     is degraded for many customers at once.
+	OrphanSweepReapedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_orphan_sweep_reaped_total",
+		Help: "Orphan-sweep reconciler reaps, labelled by reason. no_db_row is the P0-3 atomic-provision leading indicator.",
+	}, []string{"reason"})
+
+	// OrphanSweepReapFailedTotal counts reaps the reconciler tried but could
+	// not complete (k8s API error, DB write failure). Paired with
+	// OrphanSweepReapedTotal so the per-reason ratio reveals "reconciler
+	// detected the orphan but couldn't clean it" sustained failure modes.
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_orphan_sweep_reap_failed_total[15m])) by (reason) > 0
+	//     for 30+ minutes → P2 page. A single transient failure is fine; a
+	//     sustained rate means the reap path itself is broken.
+	OrphanSweepReapFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_orphan_sweep_reap_failed_total",
+		Help: "Orphan-sweep reconciler reap attempts that failed (k8s API error or DB write failure), labelled by reason.",
+	}, []string{"reason"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check on this service.

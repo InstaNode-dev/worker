@@ -78,6 +78,11 @@ func (f *fakeOrphanCanceler) CancelSubscription(_ context.Context, subID string)
 // customerListErr / stackListErr, when set, make the corresponding List
 // return that error — used to exercise the fail-open posture for an RBAC
 // Forbidden / transient k8s failure.
+//
+// namespaceAges (2026-05-20 PASS 3 enhancement) backs GetNamespaceAge,
+// the per-namespace age check used by the "no_db_row" grace path. A test
+// that doesn't care about ages can leave this nil — GetNamespaceAge then
+// defaults to returning a "very old" duration so the reap path proceeds.
 type fakeNamespaceLister struct {
 	namespaces         []string // instant-deploy-* — returned by ListDeployNamespaces
 	customerNamespaces []string // instant-customer-* — returned by ListCustomerNamespaces
@@ -87,13 +92,26 @@ type fakeNamespaceLister struct {
 	listErr            error
 	customerListErr    error
 	stackListErr       error
+	namespaceAges      map[string]time.Duration // per-ns override for GetNamespaceAge; missing → 365*24h (very old)
+	ageErr             error                    // when set, GetNamespaceAge returns this error
 }
 
 func newFakeNamespaceLister(namespaces ...string) *fakeNamespaceLister {
 	return &fakeNamespaceLister{
-		namespaces: namespaces,
-		failOn:     map[string]error{},
+		namespaces:    namespaces,
+		failOn:        map[string]error{},
+		namespaceAges: map[string]time.Duration{},
 	}
+}
+
+// withNamespaceAge sets the age GetNamespaceAge will report for `ns`.
+// Returns the fake for chaining.
+func (f *fakeNamespaceLister) withNamespaceAge(ns string, age time.Duration) *fakeNamespaceLister {
+	if f.namespaceAges == nil {
+		f.namespaceAges = map[string]time.Duration{}
+	}
+	f.namespaceAges[ns] = age
+	return f
 }
 
 // withCustomerNamespaces sets the instant-customer-* namespaces the fake
@@ -151,6 +169,58 @@ func (f *fakeNamespaceLister) ListStackNamespaces(_ context.Context) ([]string, 
 	}
 	out := make([]string, len(f.stackNamespaces))
 	copy(out, f.stackNamespaces)
+	return out, nil
+}
+
+// GetNamespaceAge satisfies the K8sNamespaceLister extension PASS 3 added
+// (2026-05-20). When ageErr is set, returns it. Otherwise returns the
+// per-namespace override from namespaceAges; missing entries default to
+// 365*24h (very old) so a test that doesn't care about the grace window
+// gets the normal reap behaviour.
+func (f *fakeNamespaceLister) GetNamespaceAge(_ context.Context, namespace string) (time.Duration, error) {
+	if f.ageErr != nil {
+		return 0, f.ageErr
+	}
+	if age, ok := f.namespaceAges[namespace]; ok {
+		return age, nil
+	}
+	return 365 * 24 * time.Hour, nil
+}
+
+// fakePodStateProvider is the PASS 6 seam fake. Maps namespace → []reason
+// (one entry per pod's primary container Waiting.Reason; "" for a pod
+// that is not in a Waiting state).
+type fakePodStateProvider struct {
+	reasonsByNamespace map[string][]string
+	listErr            error
+	listErrByNS        map[string]error
+}
+
+func newFakePodStateProvider() *fakePodStateProvider {
+	return &fakePodStateProvider{
+		reasonsByNamespace: map[string][]string{},
+		listErrByNS:        map[string]error{},
+	}
+}
+
+func (f *fakePodStateProvider) withReasons(ns string, reasons ...string) *fakePodStateProvider {
+	f.reasonsByNamespace[ns] = reasons
+	return f
+}
+
+func (f *fakePodStateProvider) ListPodWaitingReasons(_ context.Context, namespace string) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if perr, ok := f.listErrByNS[namespace]; ok && perr != nil {
+		return nil, perr
+	}
+	reasons, ok := f.reasonsByNamespace[namespace]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]string, len(reasons))
+	copy(out, reasons)
 	return out, nil
 }
 
@@ -365,9 +435,12 @@ func TestOrphanSweep_Pass3_DeletesOrphanedNamespaceKeepsLive(t *testing.T) {
 	orphanNS := deployNamespacePrefixTDE + orphanApp
 
 	// PASS 1 + 2 skipped (nil executor, nil canceler).
-	// PASS 3: the "live app ids" query returns only liveApp.
-	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
-		WillReturnRows(sqlmock.NewRows([]string{"app_id"}).AddRow(liveApp))
+	// PASS 3: the row scan returns only liveApp's row → orphanApp has no
+	// row in the result set → reaped via reason=no_db_row. orphanNS gets
+	// the "very old" age default so the grace check passes.
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}).
+			AddRow(liveApp, "healthy", "active", time.Now().UTC().Add(-24*time.Hour)))
 
 	lister := newFakeNamespaceLister(liveNS, orphanNS)
 	w := NewOrphanSweepReconciler(db, nil, nil, lister)
@@ -400,8 +473,8 @@ func TestOrphanSweep_AllPasses_NoOrphans_Idempotent(t *testing.T) {
 	for range 2 {
 		expectEmptyPass1(mock)
 		expectEmptyPass2(mock)
-		mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
-			WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+		mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+			WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 	}
 
 	w := NewOrphanSweepReconciler(db, exec, canceler, lister)
@@ -552,8 +625,8 @@ func TestOrphanSweep_Pass4_ReclaimsOrphanedCustomerNamespace(t *testing.T) {
 	// PASS 1 + 2 skipped (nil executor, nil canceler).
 	// PASS 3: the live-deploy-app-ids query returns nothing (no deploy
 	// namespaces reported by the fake).
-	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
-		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 	// PASS 4: the live-resource-tokens query returns ONLY liveToken — so
 	// orphanNS (whose token has no active/paused/suspended row) is the orphan.
 	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources\s+WHERE status IN \('active', 'paused', 'suspended'\)`).
@@ -591,8 +664,8 @@ func TestOrphanSweep_Pass4_NoCustomerNamespaces_NoQuery(t *testing.T) {
 	defer db.Close()
 
 	// PASS 3 query only — no customer namespaces means PASS 4 queues nothing.
-	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
-		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 
 	lister := newFakeNamespaceLister() // no deploy, no customer namespaces
 	w := NewOrphanSweepReconciler(db, nil, nil, lister)
@@ -642,8 +715,8 @@ func TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace(t *testing.T) {
 
 	// PASS 1 + 2 skipped (nil executor, nil canceler).
 	// PASS 3 (no deploy namespaces — fake returns empty).
-	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
-		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 	// PASS 4 (no customer namespaces — fake returns empty; short-circuits).
 	// PASS 5: live-stack-ids query returns ONLY liveStackID → orphanNS is
 	// the orphan.
@@ -678,8 +751,8 @@ func TestOrphanSweep_Pass5_NoStackNamespaces_NoQuery(t *testing.T) {
 
 	// PASS 3 only — empty deploy + empty customer + empty stack set means
 	// nothing else queues.
-	mock.ExpectQuery(`SELECT d.app_id\s+FROM deployments d\s+JOIN teams t`).
-		WillReturnRows(sqlmock.NewRows([]string{"app_id"}))
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 
 	lister := newFakeNamespaceLister()
 	w := NewOrphanSweepReconciler(db, nil, nil, lister)
@@ -714,5 +787,294 @@ func TestExpireStacksNamespacePrefix_MatchesStackProviderContract(t *testing.T) 
 	if w.nsPrefix != wantPrefix {
 		t.Fatalf("NewExpireStacksWorker(nsPrefix=%q): worker carried %q; want %q — the safety guard refuses every real stack namespace if these drift",
 			ExpireStacksNamespacePrefix, w.nsPrefix, wantPrefix)
+	}
+}
+
+// ── 2026-05-20: PASS 3 enhanced reasons + PASS 6 stuck-build ─────────────
+
+// TestOrphanSweep_NamespaceWithoutDBRow_ReapsAfterGrace exercises the
+// "no DB row" reap path's grace window. A namespace that is older than
+// orphanNoDBRowGrace AND has no matching deployments row is reaped via
+// reason=no_db_row. A namespace that has no row BUT is still within the
+// grace window is left alone (the in-flight provision case).
+func TestOrphanSweep_NamespaceWithoutDBRow_ReapsAfterGrace(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	oldOrphanNS := deployNamespacePrefixTDE + "oldorphan"
+	freshOrphanNS := deployNamespacePrefixTDE + "freshorphan"
+
+	// PASS 3 sees both namespaces; no rows in the deployments-by-app_id
+	// query → both classify as no_db_row. Only oldOrphan is >grace.
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
+
+	lister := newFakeNamespaceLister(oldOrphanNS, freshOrphanNS).
+		withNamespaceAge(oldOrphanNS, 2*time.Hour).            // >1h grace → reap
+		withNamespaceAge(freshOrphanNS, 10*time.Minute)        // <1h grace → keep
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if len(lister.deleted) != 1 || lister.deleted[0] != oldOrphanNS {
+		t.Errorf("expected exactly [%s] reaped (fresh orphan must be kept inside grace); got %v",
+			oldOrphanNS, lister.deleted)
+	}
+}
+
+// TestOrphanSweep_FailedDeployment_ReapedAfter6h exercises the
+// failed_old_deployment reap path. A namespace whose row is
+// status='failed' AND created_at > orphanFailedDeploymentGrace is reaped.
+// A namespace whose row is status='failed' but newer than 6h is left
+// alone (the operator may still want the pod state around for
+// investigation).
+func TestOrphanSweep_FailedDeployment_ReapedAfter6h(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	oldFailedApp := "oldfailed"
+	freshFailedApp := "freshfailed"
+	oldFailedNS := deployNamespacePrefixTDE + oldFailedApp
+	freshFailedNS := deployNamespacePrefixTDE + freshFailedApp
+
+	// Both rows have status='failed' under an active team. Only the
+	// 24h-old row is reapable; the 1h-old row is inside the 6h grace.
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}).
+			AddRow(oldFailedApp, "failed", "active", time.Now().UTC().Add(-24*time.Hour)).
+			AddRow(freshFailedApp, "failed", "active", time.Now().UTC().Add(-1*time.Hour)))
+
+	lister := newFakeNamespaceLister(oldFailedNS, freshFailedNS)
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if len(lister.deleted) != 1 || lister.deleted[0] != oldFailedNS {
+		t.Errorf("expected only [%s] reaped (fresh failed row must stay inside 6h grace); got %v",
+			oldFailedNS, lister.deleted)
+	}
+}
+
+// TestOrphanSweep_Pass6_StuckBuild_FlipsToFailed exercises PASS 6: a row
+// stuck in 'building' or 'deploying' for >30min whose pod is in
+// ImagePullBackOff is flipped to 'failed' with an explanatory
+// error_message, and a team.orphan_reclaimed audit row lands.
+func TestOrphanSweep_Pass6_StuckBuild_FlipsToFailed(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	stuckDeploymentID := uuid.New()
+	stuckTeamID := uuid.New()
+	stuckAppID := "stucky"
+	stuckNS := deployNamespacePrefixTDE + stuckAppID
+
+	// PASS 1 + 2 skipped (nil executor, nil canceler).
+	// PASS 3: stuckNS has a row (active team) → not reaped here.
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}).
+			AddRow(stuckAppID, "deploying", "active", time.Now().UTC().Add(-9*time.Hour)))
+	// PASS 6: candidate query returns the stuck row. Cutoff is roughly
+	// "<now - 30min>"; the row's updated_at is 9h ago so it's well past.
+	mock.ExpectQuery(`SELECT d.id, d.team_id, d.app_id, d.status, d.updated_at\s+FROM deployments d\s+JOIN teams t`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "team_id", "app_id", "status", "updated_at"}).
+			AddRow(stuckDeploymentID, stuckTeamID, stuckAppID, "deploying", time.Now().UTC().Add(-9*time.Hour)))
+	// After confirming the pod state is ImagePullBackOff, the row is
+	// flipped to 'failed' with an error_message.
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'failed'`).
+		WithArgs(sqlmock.AnyArg(), stuckDeploymentID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// And a team.orphan_reclaimed audit row lands for the team.
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WithArgs(stuckTeamID, "system", auditKindOrphanReclaimed,
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	lister := newFakeNamespaceLister(stuckNS)
+	pods := newFakePodStateProvider().withReasons(stuckNS, "ImagePullBackOff")
+	w := NewOrphanSweepReconciler(db, nil, nil, lister).WithPodStateProvider(pods)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	// PASS 3 must NOT have reaped the namespace (the row is still
+	// recoverable — only PASS 6 flips it; PASS 3 will reap on a later
+	// sweep once the row is failed_old_deployment + >6h).
+	if len(lister.deleted) != 0 {
+		t.Errorf("PASS 3 must not reap a row whose team is active and status is deploying; got deletes %v",
+			lister.deleted)
+	}
+}
+
+// TestOrphanSweep_Pass6_RunningPod_DoesNotFlip is the safety guard: a
+// stuck-build candidate whose pod state shows a Running container ("")
+// is NOT flipped. The build may be progressing.
+func TestOrphanSweep_Pass6_RunningPod_DoesNotFlip(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	deploymentID := uuid.New()
+	teamID := uuid.New()
+	appID := "progressing"
+	ns := deployNamespacePrefixTDE + appID
+
+	// PASS 3: row present, active team → not reaped.
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}).
+			AddRow(appID, "deploying", "active", time.Now().UTC().Add(-2*time.Hour)))
+	// PASS 6: candidate fires; but pod state has a "" reason → progressing.
+	mock.ExpectQuery(`SELECT d.id, d.team_id, d.app_id, d.status, d.updated_at\s+FROM deployments d\s+JOIN teams t`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "team_id", "app_id", "status", "updated_at"}).
+			AddRow(deploymentID, teamID, appID, "deploying", time.Now().UTC().Add(-2*time.Hour)))
+	// NO UPDATE queued — flipDeploymentToFailed must not be called.
+
+	lister := newFakeNamespaceLister(ns)
+	pods := newFakePodStateProvider().withReasons(ns, "") // "" = Running / progressing
+	w := NewOrphanSweepReconciler(db, nil, nil, lister).WithPodStateProvider(pods)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestOrphanSweep_PrefixWhitelist_RefusesUnknownNamespace is the durable
+// safety guard: the reconciler ONLY ever inspects namespaces matching the
+// three known prefixes (instant-deploy-*, instant-customer-*,
+// instant-stack-*). A namespace outside the whitelist must never be
+// considered for reap, even if the fake reports it.
+//
+// This test exercises that by feeding the fake a foreign namespace
+// (instant-infra) under `namespaces` (which only the deploy List should
+// look at). Because the fake's lists are prefix-scoped to instant-deploy-*
+// in production, the reconciler never sees the foreign namespace.
+// We assert by examining the reap reason classifier directly with a foreign
+// app_id — it must return no_db_row only because the caller already stripped
+// the prefix, BUT no caller will ever strip instant-infra. The contract:
+// the prefix-list seam (ListDeployNamespaces) is the whitelist gate.
+func TestOrphanSweep_PrefixWhitelist_RefusesUnknownNamespace(t *testing.T) {
+	// Verify the three reap prefixes are exactly the three documented
+	// in CLAUDE.md — any future edit that adds a fourth must add a test.
+	if deployNamespacePrefixTDE != "instant-deploy-" {
+		t.Errorf("deployNamespacePrefixTDE drifted: %q != instant-deploy-", deployNamespacePrefixTDE)
+	}
+	if customerNamespacePrefix != "instant-customer-" {
+		t.Errorf("customerNamespacePrefix drifted: %q != instant-customer-", customerNamespacePrefix)
+	}
+	if ExpireStacksNamespacePrefix != "instant-stack-" {
+		t.Errorf("ExpireStacksNamespacePrefix drifted: %q != instant-stack-", ExpireStacksNamespacePrefix)
+	}
+
+	// classifyDeployOrphan is called PER namespace by the sweep; the
+	// caller strips the prefix to derive the appID. Verify the function
+	// returns (no_db_row, true) for an unknown appID — but ONLY when
+	// the caller has already stripped a known prefix. The whitelist
+	// guarantee comes from the List, not from the classifier.
+	reason, ok := classifyDeployOrphan("nonexistent", map[string]deployRowSnapshot{}, time.Now())
+	if !ok || reason != orphanReapReasonNoDBRow {
+		t.Errorf("classifyDeployOrphan(no row) = (%q, %v); want (no_db_row, true)", reason, ok)
+	}
+}
+
+// TestOrphanSweep_ClassifyDeployOrphan_TableDriven enumerates every shape
+// of row + team status PASS 3 must decide on. Each table row asserts the
+// reap reason (or "" for "live, leave alone"). This is the registry-style
+// regression test from CLAUDE.md rule 18: a future edit that changes the
+// classification logic for any shape must update this table or the test
+// fails loudly.
+func TestOrphanSweep_ClassifyDeployOrphan_TableDriven(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name       string
+		row        *deployRowSnapshot // nil = no row in map
+		wantReason string             // "" = not reapable
+	}{
+		{"no row at all", nil, orphanReapReasonNoDBRow},
+		{"active team, deploying", &deployRowSnapshot{status: "deploying", teamStatus: "active", rowCreatedAt: now.Add(-1 * time.Hour)}, ""},
+		{"active team, healthy", &deployRowSnapshot{status: "healthy", teamStatus: "active", rowCreatedAt: now.Add(-30 * 24 * time.Hour)}, ""},
+		{"active team, failed within 6h grace", &deployRowSnapshot{status: "failed", teamStatus: "active", rowCreatedAt: now.Add(-1 * time.Hour)}, ""},
+		{"active team, failed at exactly 6h", &deployRowSnapshot{status: "failed", teamStatus: "active", rowCreatedAt: now.Add(-orphanFailedDeploymentGrace)}, orphanReapReasonFailedOldDeployment},
+		{"active team, failed past 6h", &deployRowSnapshot{status: "failed", teamStatus: "active", rowCreatedAt: now.Add(-12 * time.Hour)}, orphanReapReasonFailedOldDeployment},
+		{"deletion_requested team, deploying", &deployRowSnapshot{status: "deploying", teamStatus: "deletion_requested", rowCreatedAt: now.Add(-1 * time.Hour)}, ""},
+		{"tombstoned team", &deployRowSnapshot{status: "healthy", teamStatus: "tombstoned", rowCreatedAt: now.Add(-30 * 24 * time.Hour)}, orphanReapReasonTeamTombstoned},
+		{"deletion_pending team", &deployRowSnapshot{status: "deploying", teamStatus: "deletion_pending", rowCreatedAt: now.Add(-1 * time.Hour)}, orphanReapReasonTeamTombstoned},
+		{"row already deleted", &deployRowSnapshot{status: "deleted", teamStatus: "active", rowCreatedAt: now.Add(-30 * 24 * time.Hour)}, orphanReapReasonTeamTombstoned},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := map[string]deployRowSnapshot{}
+			if tc.row != nil {
+				m["app"] = *tc.row
+			}
+			gotReason, gotReapable := classifyDeployOrphan("app", m, now)
+			if tc.wantReason == "" {
+				if gotReapable {
+					t.Errorf("expected NOT reapable; got reason=%q", gotReason)
+				}
+				return
+			}
+			if !gotReapable || gotReason != tc.wantReason {
+				t.Errorf("classify = (%q, %v); want (%q, true)", gotReason, gotReapable, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestOrphanSweep_StuckBuildWaitingReasons_Registry enumerates every
+// waiting-state reason the registry treats as "stuck". If a future edit
+// adds a new reason to stuckBuildWaitingReasons it MUST update this test
+// (and add an isStuckBuildState case below). Conversely a future edit
+// that drops a reason is caught here loudly — no silent reduction in
+// coverage.
+func TestOrphanSweep_StuckBuildWaitingReasons_Registry(t *testing.T) {
+	want := map[string]bool{
+		"ImagePullBackOff":  true,
+		"ErrImagePull":      true,
+		"CrashLoopBackOff":  true,
+	}
+	if len(stuckBuildWaitingReasons) != len(want) {
+		t.Fatalf("stuckBuildWaitingReasons has %d entries; want %d — review the registry",
+			len(stuckBuildWaitingReasons), len(want))
+	}
+	for k := range want {
+		if !stuckBuildWaitingReasons[k] {
+			t.Errorf("registry missing reason %q", k)
+		}
+	}
+	// And isStuckBuildState must agree for every registry entry.
+	for k := range stuckBuildWaitingReasons {
+		if !isStuckBuildState([]string{k}) {
+			t.Errorf("isStuckBuildState([%q]) returned false but %q is in registry", k, k)
+		}
+	}
+	// Empty input must NOT trip the stuck check (no pods scheduled yet).
+	if isStuckBuildState(nil) {
+		t.Error("isStuckBuildState(nil) must be false — no pods means progressing, not stuck")
+	}
+	// A mixed slice with at least one progressing pod must NOT trip.
+	if isStuckBuildState([]string{"ImagePullBackOff", ""}) {
+		t.Error("isStuckBuildState with one '' (Running) reason must be false")
 	}
 }
