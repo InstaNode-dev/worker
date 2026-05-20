@@ -407,4 +407,21 @@ var (
 		Name: "email_missing_renderer_total",
 		Help: "Event-email forwarder hits on an audit_log row whose kind has a builder but no Go renderer. A non-zero rate means a kind is being silently dropped — fix the eventEmailBodyRenderers map.",
 	}, []string{"kind"})
+
+	// readyzCheckStatusGauge — per-component readiness status surfaced by
+	// /readyz on this service's HTTP sidecar (:8091). See the matching
+	// gauge in the api repo at api/internal/metrics/metrics.go for the
+	// full contract. The shared NR alert fires when any check on any
+	// service stays at 0 (failed) for >5 minutes.
+	readyzCheckStatusGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "readyz_check_status",
+		Help: "Per-component readiness status (1=ok, 0.5=degraded, 0=failed). Set by /readyz on every probe.",
+	}, []string{"service", "check"})
 )
+
+// ReadyzCheckStatus updates the gauge for one check on this service.
+// Stamped with service="instant-worker" inside this helper so a caller
+// can't accidentally publish under the wrong label.
+func ReadyzCheckStatus(check string, value float64) {
+	readyzCheckStatusGauge.WithLabelValues("instant-worker", check).Set(value)
+}
