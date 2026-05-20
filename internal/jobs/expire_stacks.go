@@ -185,6 +185,18 @@ func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStac
 		deleted++
 	}
 
+	// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
+	// DEBUG. expire_stacks runs every 1h; an idle tick (deleted==0) is
+	// heartbeat noise. INFO retained when stacks actually expired so the
+	// state-transition row appears in dashboards.
+	if deleted == 0 {
+		slog.Debug("jobs.expire_stacks.completed",
+			"expired_count", 0,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"job_id", job.ID,
+		)
+		return nil
+	}
 	slog.Info("jobs.expire_stacks.completed",
 		"expired_count", deleted,
 		"duration_ms", time.Since(start).Milliseconds(),

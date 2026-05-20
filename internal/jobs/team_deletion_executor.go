@@ -258,13 +258,28 @@ func (w *TeamDeletionExecutorWorker) Work(ctx context.Context, job *river.Job[Te
 		tombstoned++
 	}
 
-	slog.Info("jobs.team_deletion.completed",
-		"swept", swept,
-		"tombstoned", tombstoned,
-		"failed", failed,
-		"duration_ms", time.Since(startSweep).Milliseconds(),
-		"job_id", job.ID,
-	)
+	// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
+	// DEBUG. team_deletion_executor sweeps team_deletion_pending; an idle
+	// tick (no candidates touched) is heartbeat noise. INFO retained for
+	// every state-transitioning tick because team-deletion outcomes are
+	// the kind of audit signal an operator wants to see immediately.
+	if swept == 0 && tombstoned == 0 && failed == 0 {
+		slog.Debug("jobs.team_deletion.completed",
+			"swept", 0,
+			"tombstoned", 0,
+			"failed", 0,
+			"duration_ms", time.Since(startSweep).Milliseconds(),
+			"job_id", job.ID,
+		)
+	} else {
+		slog.Info("jobs.team_deletion.completed",
+			"swept", swept,
+			"tombstoned", tombstoned,
+			"failed", failed,
+			"duration_ms", time.Since(startSweep).Milliseconds(),
+			"job_id", job.ID,
+		)
+	}
 	return nil
 }
 

@@ -184,6 +184,19 @@ func (w *QuotaWallNudgeWorker) Work(ctx context.Context, job *river.Job[QuotaWal
 	if job.JobRow != nil {
 		jobID = job.ID
 	}
+	// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
+	// DEBUG. quota_wall_nudge runs every 30m; nudged>0 OR skipped>0 are
+	// state transitions worth INFO. A pure-idle tick (zero teams touched)
+	// is heartbeat noise. Liveness via jobs.middleware.work_ok.
+	if nudged == 0 && skipped == 0 {
+		slog.Debug("jobs.quota_wall_nudge.completed",
+			"scanned_teams", scanned,
+			"nudged", 0,
+			"skipped_recent", 0,
+			"job_id", jobID,
+		)
+		return nil
+	}
 	slog.Info("jobs.quota_wall_nudge.completed",
 		"scanned_teams", scanned,
 		"nudged", nudged,

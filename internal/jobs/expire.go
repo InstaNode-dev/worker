@@ -242,6 +242,20 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 		metrics.ActiveAnonymousResources.Set(float64(activeAnon))
 	}
 
+	// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
+	// DEBUG. expire_anonymous runs every 1h; an idle tick (zero candidates
+	// AND nothing expired) is heartbeat noise. INFO is reserved for ticks
+	// that actually changed state (expired > 0, or non-zero candidates
+	// that were inspected even if none could be reaped).
+	if expired == 0 && len(candidates) == 0 {
+		slog.Debug("jobs.expire_anonymous.completed",
+			"expired_count", 0,
+			"total_candidates", 0,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"job_id", job.ID,
+		)
+		return nil
+	}
 	slog.Info("jobs.expire_anonymous.completed",
 		"expired_count", expired,
 		"total_candidates", len(candidates),

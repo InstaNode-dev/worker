@@ -181,7 +181,12 @@ func (w *ResourceHeartbeatWorker) Work(ctx context.Context, job *river.Job[Resou
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.resource_heartbeat.completed",
+		// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
+		// DEBUG. resource_heartbeat runs every 1h in prod (every 1m in dev);
+		// a no-candidates tick is heartbeat noise. Liveness via
+		// jobs.middleware.work_ok. The non-idle .completed (line ~232)
+		// stays at INFO because it carries probe-outcome state.
+		slog.Debug("jobs.resource_heartbeat.completed",
 			"probed", 0,
 			"ok", 0,
 			"failed", 0,

@@ -225,6 +225,22 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 		inserted++
 	}
 
+	// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
+	// DEBUG. customer_backup_scheduler runs every 1h; an idle tick (no
+	// candidates AND nothing inserted/skipped) is heartbeat noise. INFO
+	// retained for any state-transitioning tick.
+	if inserted == 0 && skippedHobbyOffSlot == 0 && skippedDedup == 0 && len(candidates) == 0 {
+		slog.Debug("jobs.customer_backup_scheduler.completed",
+			"candidates", 0,
+			"inserted", 0,
+			"skipped_hobby_off_slot", 0,
+			"skipped_dedup", 0,
+			"hour_utc", hourUTC,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"job_id", job.ID,
+		)
+		return nil
+	}
 	slog.Info("jobs.customer_backup_scheduler.completed",
 		"candidates", len(candidates),
 		"inserted", inserted,
