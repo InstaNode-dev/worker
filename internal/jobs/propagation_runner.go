@@ -59,6 +59,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -70,6 +71,7 @@ import (
 	"go.opentelemetry.io/otel"
 
 	commonv1 "instant.dev/proto/common/v1"
+	"instant.dev/worker/internal/metrics"
 )
 
 // ─── named constants ──────────────────────────────────────────────────────────
@@ -93,9 +95,15 @@ const (
 // Mirrors api/internal/models/audit_kinds.go's AuditKindPropagation*
 // constants. Same drift contract as propagationKindTierElevation above.
 const (
-	auditKindPropagationApplied      = "propagation.applied"
-	auditKindPropagationRetrying     = "propagation.retrying"
-	auditKindPropagationDeadLettered = "propagation.dead_lettered"
+	auditKindPropagationApplied        = "propagation.applied"
+	auditKindPropagationRetrying       = "propagation.retrying"
+	auditKindPropagationDeadLettered   = "propagation.dead_lettered"
+	auditKindPropagationUnexpectedSkip = "propagation.unexpected_skip"
+	// CHAOS F2 (CHAOS-DRILL-2026-05-20): distinct audit kind for the
+	// old-worker/new-api rollout-skew dead-letter path. Lets the operator
+	// filter the image-skew signal independently of real-failure dead-letters
+	// via `audit_log.kind`. Mirrors api/internal/models/audit_kinds.go.
+	auditKindPropagationUnknownKindDeadLettered = "propagation.unknown_kind_dead_lettered"
 )
 
 // propagationActor is the audit_log.actor value the runner writes. Distinct
@@ -151,6 +159,105 @@ var propagationBackoffSchedule = []time.Duration{
 // pending_propagations.last_error. Avoids unbounded growth from a chatty
 // gRPC error string.
 const propagationLastErrorMax = 1000
+
+// propagationAllowedSkipSubstrings enumerates the SkipReason fragments that
+// the provisioner uses to signal a TRUE no-op (idempotent re-apply / a
+// resource type with no regrade arm). Anything else is an unexpected_skip
+// and triggers retry/dead-letter per F1 (CHAOS-DRILL-2026-05-20).
+//
+// Held centrally (not inline) so the test surface and the bucketSkipReason
+// helper can share the list. Adding an entry here changes the silent-skip
+// surface; do it only when the provisioner adds a new "this is fine"
+// outcome that genuinely doesn't need a retry.
+var propagationAllowedSkipSubstrings = []string{
+	"already correct",
+	"unsupported resource type",
+	"backend does not support",
+}
+
+// isPropagationAllowedSkip returns true when the provisioner's SkipReason
+// is one of the allowed no-op signals.
+func isPropagationAllowedSkip(reason string) bool {
+	for _, sub := range propagationAllowedSkipSubstrings {
+		if strings.Contains(reason, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// propagationUnexpectedSkipDetail captures one offending resource for an
+// unexpected_skip retry. Multiple resources can fail in one dispatch; the
+// operator wants to see every one in last_error so they can fix the
+// underlying issue in batch.
+type propagationUnexpectedSkipDetail struct {
+	ResourceID   string
+	ResourceType string
+	SkipReason   string
+}
+
+// propagationUnexpectedSkipErr is the error returned by handleTierElevation
+// when at least one resource's RegradeResource returned (Applied=false,
+// SkipReason=<not in propagationAllowedSkipSubstrings>). The runner's
+// markRetry / markDeadLettered path detects this via errors.Is and emits
+// propagation.unexpected_skip audit kind (not propagation.applied) — the
+// operator-page signal for F1.
+//
+// CHAOS-DRILL-2026-05-20 F1: pre-fix the handler WARN-and-applied this
+// case (firstErr stayed nil); the row got stamped applied_at and the
+// regrade never landed. A paying customer's infra cap silently stayed at
+// the old tier and no alert fired. This error type forces the case to
+// retry → dead-letter and surfaces it loudly via a distinct audit kind +
+// Prometheus counter.
+type propagationUnexpectedSkipErr struct {
+	Resources []propagationUnexpectedSkipDetail
+}
+
+func (e *propagationUnexpectedSkipErr) Error() string {
+	if e == nil || len(e.Resources) == 0 {
+		return "unexpected_skip: <empty>"
+	}
+	parts := make([]string, 0, len(e.Resources))
+	for _, r := range e.Resources {
+		parts = append(parts, fmt.Sprintf("%s (%s): %s", r.ResourceID, r.ResourceType, r.SkipReason))
+	}
+	return "unexpected_skip from provisioner: " + strings.Join(parts, "; ")
+}
+
+// errPropagationUnexpectedSkipSentinel is the comparison target for
+// errors.Is. The Is method on propagationUnexpectedSkipErr matches it so
+// callers can switch on the class without depending on the concrete type.
+var errPropagationUnexpectedSkipSentinel = errors.New("propagation: unexpected_skip from provisioner")
+
+// Is satisfies errors.Is for the sentinel — any propagationUnexpectedSkipErr
+// matches errPropagationUnexpectedSkipSentinel.
+func (e *propagationUnexpectedSkipErr) Is(target error) bool {
+	return target == errPropagationUnexpectedSkipSentinel
+}
+
+// bucketSkipReason maps the raw provisioner SkipReason to a short canonical
+// bucket suitable for a Prometheus label. Keeps cardinality bounded — never
+// pass the raw SkipReason as a metric label. Adding a new bucket here is
+// safe; the default "other" catches anything unrecognised.
+func bucketSkipReason(reason string) string {
+	r := strings.ToLower(reason)
+	switch {
+	case strings.Contains(r, "postgres-admin secret") || strings.Contains(r, "postgres_admin"):
+		return "postgres_admin_secret_missing"
+	case strings.Contains(r, "redis-auth secret"):
+		return "redis_auth_secret_missing"
+	case strings.Contains(r, "namespace not found"):
+		return "namespace_not_found"
+	case strings.Contains(r, "not reachable") || strings.Contains(r, "unreachable"):
+		return "resource_not_reachable"
+	case strings.Contains(r, "pod not found") || strings.Contains(r, "no pod"):
+		return "pod_not_found"
+	case strings.Contains(r, "legacy resource") || strings.Contains(r, "legacy pod"):
+		return "legacy_resource"
+	default:
+		return "other"
+	}
+}
 
 // ─── job definition + handler registry ────────────────────────────────────────
 
@@ -282,8 +389,31 @@ func (w *PropagationRunnerWorker) Work(ctx context.Context, job *river.Job[Propa
 			// image could see a row from a newer api enqueue. Treat as a
 			// retryable failure so the row is NOT dead-lettered before
 			// the worker rolls forward.
+			//
+			// CHAOS F2 (CHAOS-DRILL-2026-05-20): apply the SAME maxAttempts
+			// ceiling here that real-failure rows get below. Without this,
+			// an old worker pod that doesn't recognise a freshly-enqueued
+			// kind retries forever — the chaos drill on 2026-05-20 saw a
+			// chaos_test_unknown_kind row reach attempts=10 in 4 minutes
+			// without ever transitioning to failed_at. Bounding the
+			// unknown-kind path on the same dead-letter horizon as a real
+			// failure (a) caps the eventual blast radius of an old image
+			// surviving the rollout window, (b) gives the operator a clean
+			// alert-able signal via instant_propagation_dead_lettered_total{reason="unknown_kind"}
+			// rather than an unbounded retry storm. The per-tick image-skew
+			// indicator stays in PropagationUnknownKindTotal — that fires on
+			// EVERY tick while the row is alive, so the operator can react
+			// in seconds instead of waiting the ~24h backoff for a
+			// dead-letter to fire.
 			unknownKind++
-			w.markRetry(ctx, row, fmt.Errorf("no handler registered for kind %q", row.kind))
+			metrics.PropagationUnknownKindTotal.WithLabelValues(row.kind).Inc()
+			dispatchErr := fmt.Errorf("no handler registered for kind %q", row.kind)
+			if row.attempts+1 >= propagationMaxAttempts {
+				deadLettered++
+				w.markUnknownKindDeadLettered(ctx, row, dispatchErr)
+				continue
+			}
+			w.markRetry(ctx, row, dispatchErr)
 			continue
 		}
 
@@ -424,10 +554,18 @@ func propagationBackoffFor(attempts int) time.Duration {
 }
 
 // markRetry persists attempts+1, schedules next_attempt_at via
-// propagationBackoffFor, persists last_error, and emits a DEBUG-level
-// propagation.retrying audit row. Best-effort: a DB failure here only
-// means the next tick may re-process the same row (idempotent handler
-// makes that safe) and the audit row is missing.
+// propagationBackoffFor, persists last_error, and emits an audit row.
+//
+// Audit kind selection (CHAOS-DRILL-2026-05-20 F1):
+//   - errors.Is(dispatchErr, errPropagationUnexpectedSkipSentinel) →
+//     propagation.unexpected_skip audit row + WARN slog (the F1 loud
+//     signal: provisioner returned applied=false with a skip reason
+//     outside the allowed set — regrade did NOT land).
+//   - else → propagation.retrying audit row + DEBUG slog (routine retry).
+//
+// Best-effort: a DB failure here only means the next tick may re-process
+// the same row (idempotent handler makes that safe) and the audit row is
+// missing.
 func (w *PropagationRunnerWorker) markRetry(ctx context.Context, row propagationRow, dispatchErr error) {
 	delay := propagationBackoffFor(row.attempts)
 	nextAttempt := w.now().Add(delay)
@@ -463,22 +601,46 @@ func (w *PropagationRunnerWorker) markRetry(ctx context.Context, row propagation
 		return
 	}
 
-	// DEBUG audit row — retries are routine during a Razorpay/provisioner
-	// outage; logging at WARN would spam. Operators inspect the row's
-	// `attempts` + `last_error` columns directly for diagnosis.
-	w.insertPropagationAuditRow(ctx, row, auditKindPropagationRetrying, fmt.Sprintf(
-		"%s propagation for team %s retrying (attempt %d/%d)",
-		row.kind, row.teamID.String(), row.attempts+1, propagationMaxAttempts,
+	// Audit kind: unexpected_skip is the loud F1 signal; retrying is the
+	// routine path. Both share the same DB UPDATE above — only the audit
+	// row + log line differ, so operators can grep/alert on the F1 class
+	// without false-positiving on a transient Razorpay outage.
+	isUnexpectedSkip := errors.Is(dispatchErr, errPropagationUnexpectedSkipSentinel)
+	auditKind := auditKindPropagationRetrying
+	if isUnexpectedSkip {
+		auditKind = auditKindPropagationUnexpectedSkip
+	}
+
+	w.insertPropagationAuditRow(ctx, row, auditKind, fmt.Sprintf(
+		"%s propagation for team %s retrying (attempt %d/%d, kind=%s)",
+		row.kind, row.teamID.String(), row.attempts+1, propagationMaxAttempts, auditKind,
 	), map[string]any{
-		"propagation_id":   row.id.String(),
-		"kind":             row.kind,
-		"team_id":          row.teamID.String(),
-		"target_tier":      nullableTierString(row.targetTier),
-		"attempts":         row.attempts + 1,
-		"max_attempts":     propagationMaxAttempts,
-		"next_attempt_at":  nextAttempt.UTC().Format(time.RFC3339),
-		"last_error":       lastErr,
+		"propagation_id":  row.id.String(),
+		"kind":            row.kind,
+		"team_id":         row.teamID.String(),
+		"target_tier":     nullableTierString(row.targetTier),
+		"attempts":        row.attempts + 1,
+		"max_attempts":    propagationMaxAttempts,
+		"next_attempt_at": nextAttempt.UTC().Format(time.RFC3339),
+		"last_error":      lastErr,
 	})
+
+	if isUnexpectedSkip {
+		// WARN-level: unexpected_skip is the F1 signal — louder than a
+		// routine retry (DEBUG), quieter than the eventual dead-letter
+		// (ERROR). Pre-fix this case was silently APPLIED, so even WARN
+		// is a step up.
+		slog.Warn("jobs.propagation_runner.unexpected_skip_retrying",
+			"propagation_id", row.id.String(),
+			"team_id", row.teamID.String(),
+			"kind", row.kind,
+			"attempts", row.attempts+1,
+			"max_attempts", propagationMaxAttempts,
+			"next_attempt_at", nextAttempt,
+			"last_error", lastErr,
+		)
+		return
+	}
 
 	slog.Debug("jobs.propagation_runner.retrying",
 		"propagation_id", row.id.String(),
@@ -607,6 +769,24 @@ func (w *PropagationRunnerWorker) markDeadLettered(ctx context.Context, row prop
 	)
 	w.insertPropagationAuditRow(ctx, row, auditKindPropagationDeadLettered, summary, meta)
 
+	// CHAOS F3 (CHAOS-DRILL-2026-05-20): increment the Prom counter. Labels:
+	//   reason = "max_attempts" — the modal real-failure path. F1's
+	//                             unexpected_skip-as-failure, real
+	//                             RegradeResource gRPC errors, AND
+	//                             F1's markApplied DB failures all flow
+	//                             through here once they reach the
+	//                             propagationMaxAttempts ceiling, so a
+	//                             single `reason=max_attempts` covers
+	//                             every "we tried and tried and finally
+	//                             gave up" path.
+	//   kind   = row.kind — bounded by propagationKnownKinds; the
+	//                       unknown_kind path uses
+	//                       markUnknownKindDeadLettered which sets
+	//                       kind="unknown_kind" explicitly to keep
+	//                       cardinality bounded by code, not by
+	//                       attacker-controlled enqueue values.
+	metrics.PropagationDeadLetteredTotal.WithLabelValues("max_attempts", row.kind).Inc()
+
 	// CRITICAL severity: this is THE alert. NR Log alert filters on
 	// audit_kind='propagation.dead_lettered' OR on the message below.
 	slog.Error("jobs.propagation_runner.dead_lettered",
@@ -618,6 +798,98 @@ func (w *PropagationRunnerWorker) markDeadLettered(ctx context.Context, row prop
 		"max_attempts", propagationMaxAttempts,
 		"last_error", lastErr,
 		"action", "operator must reconcile this team's infra against the resource tier snapshot; see runbook for propagation.dead_lettered",
+	)
+}
+
+// markUnknownKindDeadLettered transitions a row to failed_at when its `kind`
+// has no registered handler AND the row has now reached propagationMaxAttempts.
+// Shares 90% of its body with markDeadLettered but emits a DISTINCT audit kind
+// (propagation.unknown_kind_dead_lettered) so an operator can filter on the
+// old-image-rollback signal independently of real provisioner failures, and
+// labels the Prom counter with reason="unknown_kind" + kind="unknown_kind"
+// (we deliberately do NOT pass row.kind into the kind label because the kind
+// is by definition not in propagationKnownKinds — passing it would let an
+// api-side enqueue blow up the worker's label cardinality without a code-side
+// review).
+//
+// CHAOS F2 (CHAOS-DRILL-2026-05-20): without this path, an unknown-kind row
+// retried forever — confirmed live during the chaos drill
+// (chaos_test_unknown_kind reached attempts=10 in 4 minutes without ever
+// transitioning to failed_at). With this path, the row dead-letters after
+// the same 10 attempts as any real failure, the operator sees a
+// propagation.unknown_kind_dead_lettered audit row + a Prom counter increment,
+// and the runaway retry loop ends.
+func (w *PropagationRunnerWorker) markUnknownKindDeadLettered(ctx context.Context, row propagationRow, dispatchErr error) {
+	lastErr := truncatePropagationError(dispatchErr.Error())
+	res, err := w.db.ExecContext(ctx, `
+		UPDATE pending_propagations
+		   SET attempts        = attempts + 1,
+		       last_attempt_at = now(),
+		       last_error      = $1,
+		       failed_at       = now()
+		 WHERE id = $2
+		   AND applied_at IS NULL
+		   AND failed_at IS NULL
+	`, lastErr, row.id)
+	if err != nil {
+		slog.Error("jobs.propagation_runner.unknown_kind_dead_letter_persist_failed",
+			"propagation_id", row.id.String(),
+			"team_id", row.teamID.String(),
+			"kind", row.kind,
+			"error", err,
+			"dispatch_error", lastErr,
+		)
+		return
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		// Already terminal — sibling tick won the race.
+		return
+	}
+
+	// age_seconds — same best-effort pattern as markDeadLettered.
+	var ageSeconds float64
+	var createdAt sql.NullTime
+	if qErr := w.db.QueryRowContext(ctx,
+		`SELECT created_at FROM pending_propagations WHERE id = $1`, row.id,
+	).Scan(&createdAt); qErr == nil && createdAt.Valid {
+		ageSeconds = w.now().Sub(createdAt.Time).Seconds()
+	}
+
+	meta := map[string]any{
+		"propagation_id": row.id.String(),
+		"kind":           row.kind,
+		"team_id":        row.teamID.String(),
+		"target_tier":    nullableTierString(row.targetTier),
+		"attempts":       row.attempts + 1,
+		"max_attempts":   propagationMaxAttempts,
+		"last_error":     lastErr,
+		"age_seconds":    ageSeconds,
+		"failure_reason": "unknown_kind",
+	}
+	summary := fmt.Sprintf(
+		"unknown_kind propagation (kind=%q) for team %s DEAD-LETTERED after %d attempts — worker image is older than api enqueue; finish the rollout",
+		row.kind, row.teamID.String(), propagationMaxAttempts,
+	)
+	// Distinct audit kind so an operator-side NRQL filter can separate
+	// real-failure dead-letters from image-skew dead-letters.
+	w.insertPropagationAuditRow(ctx, row, auditKindPropagationUnknownKindDeadLettered, summary, meta)
+
+	// kind="unknown_kind" (the BUCKET name) — see comment on the counter
+	// declaration in metrics.go for the cardinality rationale.
+	metrics.PropagationDeadLetteredTotal.WithLabelValues("unknown_kind", "unknown_kind").Inc()
+
+	// CRITICAL severity — different action than the real-failure path.
+	// The fix here is an operator rolling the worker forward, NOT
+	// inspecting a specific team's resources.
+	slog.Error("jobs.propagation_runner.unknown_kind_dead_lettered",
+		"propagation_id", row.id.String(),
+		"team_id", row.teamID.String(),
+		"kind", row.kind,
+		"attempts", row.attempts+1,
+		"max_attempts", propagationMaxAttempts,
+		"last_error", lastErr,
+		"action", "worker pod is running an older image than the api enqueued — finish the rollout; manually re-enqueue this row only after the kind has a handler",
 	)
 }
 
@@ -672,10 +944,20 @@ func nullableTierString(s sql.NullString) string {
 // RegradeResource with the resource's per-row tier snapshot (MR-P1-21 — see
 // entitlement_reconciler.go for the snapshot-is-entitlement contract). Any
 // per-resource gRPC error fails the WHOLE row (so the entire row retries
-// with backoff). Per-resource "skip" outcomes (applied=false with
-// skip_reason="already correct" / "unsupported resource type" / "backend
-// does not support regrade") are NOT treated as failures: they are the
-// provisioner's idempotency / type-coverage signal.
+// with backoff). Per-resource "skip" outcomes whose SkipReason is in
+// propagationAllowedSkipSubstrings ("already correct" / "unsupported
+// resource type" / "backend does not support regrade") are NOT treated as
+// failures: they are the provisioner's idempotency / type-coverage signal.
+//
+// CHAOS-DRILL-2026-05-20 F1 fix: any OTHER SkipReason — e.g. "postgres-admin
+// secret not found", "namespace not found", "resource not reachable" — is
+// treated as a retryable failure. The runner detects the returned
+// propagationUnexpectedSkipErr via errors.Is and emits a distinct
+// propagation.unexpected_skip audit row (not propagation.applied). The row
+// retries per the backoff schedule and dead-letters at propagationMaxAttempts.
+// Pre-fix this case WARN-logged and fell through with firstErr==nil, so the
+// row got stamped applied_at and the regrade never landed — paying customers
+// ended up with "Pro on paper, hobby-grade infra" and no alert.
 //
 // Idempotency: re-running this handler is safe because the provisioner's
 // RegradeResource does CONFIG GET / applied_conn_limit comparison before
@@ -727,7 +1009,10 @@ func handleTierElevation(ctx context.Context, db *sql.DB, regrader propagationRe
 		return nil
 	}
 
-	var firstErr error
+	var (
+		firstErr            error
+		unexpectedSkipFound []propagationUnexpectedSkipDetail
+	)
 	for _, r := range resources {
 		resType, supported := resourceTypeFromString(r.resourceType)
 		if !supported {
@@ -752,22 +1037,47 @@ func handleTierElevation(ctx context.Context, db *sql.DB, regrader propagationRe
 			}
 			continue
 		}
-		// applied=false is NOT an error — it's the idempotency signal.
-		// We log only if the skip_reason indicates an actual provisioner-
-		// side problem (not "already correct" / type unsupported).
-		if !out.Applied && out.SkipReason != "" &&
-			!strings.Contains(out.SkipReason, "already correct") &&
-			!strings.Contains(out.SkipReason, "unsupported resource type") &&
-			!strings.Contains(out.SkipReason, "backend does not support") {
+		// applied=false with an ALLOWED SkipReason ("already correct" /
+		// "unsupported resource type" / "backend does not support") is the
+		// idempotency / type-coverage signal — treat as success.
+		//
+		// applied=false with any OTHER SkipReason is an unexpected_skip:
+		// the regrade DID NOT LAND but the provisioner returned no error.
+		// CHAOS-DRILL-2026-05-20 F1 fix: accumulate the offending resources
+		// and return a propagationUnexpectedSkipErr so the runner retries
+		// the row (audit_kind=propagation.unexpected_skip) and dead-letters
+		// at propagationMaxAttempts (audit_kind=propagation.dead_lettered).
+		// Pre-fix this case fell through silently and the row was stamped
+		// applied_at; the customer's infra was never regraded and no alert
+		// fired. The metric counter is the leading indicator the dead-letter
+		// alert is the lagging signal.
+		if !out.Applied && out.SkipReason != "" && !isPropagationAllowedSkip(out.SkipReason) {
 			slog.Warn("jobs.propagation_runner.tier_elevation.unexpected_skip",
 				"propagation_id", row.id.String(),
 				"resource_id", r.id.String(),
 				"resource_type", r.resourceType,
 				"skip_reason", out.SkipReason,
 			)
+			metrics.PropagationUnexpectedSkipTotal.WithLabelValues(
+				row.kind, r.resourceType, bucketSkipReason(out.SkipReason),
+			).Inc()
+			unexpectedSkipFound = append(unexpectedSkipFound, propagationUnexpectedSkipDetail{
+				ResourceID:   r.id.String(),
+				ResourceType: r.resourceType,
+				SkipReason:   out.SkipReason,
+			})
 		}
 	}
-	return firstErr
+
+	// A real gRPC error wins over an unexpected_skip — the gRPC error is
+	// the louder signal and a retry on it will also re-check the skip path.
+	if firstErr != nil {
+		return firstErr
+	}
+	if len(unexpectedSkipFound) > 0 {
+		return &propagationUnexpectedSkipErr{Resources: unexpectedSkipFound}
+	}
+	return nil
 }
 
 // resourceTypeFromString maps the resources.resource_type column value to
