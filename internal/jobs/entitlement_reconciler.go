@@ -646,7 +646,18 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 	// covering Mongo (rather than silently omitting it, which was the bug).
 	mongoChecked, mongoApplied, mongoSkipped, mongoFailed, mongoSkippedTier := w.sweepMongoEntitlements(ctx, teamFilter)
 
-	slog.Info("jobs.entitlement_reconciler.completed",
+	// #146 (BugBash 2026-05-20 idle-tick noise pass): the reconciler runs
+	// every 5 minutes (288 times/day). A true idle tick — no drift, no
+	// regrade, no failure across all three resource types — is operational
+	// silence and goes to DEBUG. INFO any time we moved bits (regraded,
+	// applied), saw drift, or hit a failure.
+	level := slog.LevelInfo
+	if pgDrifted == 0 && pgRegraded == 0 && pgFailed == 0 &&
+		redisApplied == 0 && redisFailed == 0 &&
+		mongoApplied == 0 && mongoFailed == 0 {
+		level = slog.LevelDebug
+	}
+	slog.Log(ctx, level, "jobs.entitlement_reconciler.completed",
 		// Postgres metrics (backward-compatible log keys)
 		"postgres_scanned", pgScanned,
 		"postgres_drifted", pgDrifted,

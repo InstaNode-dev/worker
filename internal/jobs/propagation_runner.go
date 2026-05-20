@@ -317,6 +317,22 @@ func (w *PropagationRunnerWorker) Work(ctx context.Context, job *river.Job[Propa
 		w.markRetry(ctx, row, dispatchErr)
 	}
 
+	// #146 (BugBash 2026-05-20 idle-tick noise pass): the runner ticks every
+	// 30s. On an idle cluster the line fires 2,880 times/day with all
+	// counters at zero, drowning real propagation events in NR Logs.
+	// Demote the all-zero (idle) tick to DEBUG; INFO only when the runner
+	// actually moved a row through the pipeline.
+	if dispatched == 0 && retried == 0 && deadLettered == 0 && unknownKind == 0 {
+		slog.Debug("jobs.propagation_runner.completed",
+			"dispatched", 0,
+			"applied", 0,
+			"retried", 0,
+			"dead_lettered", 0,
+			"unknown_kind", 0,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+		return nil
+	}
 	slog.Info("jobs.propagation_runner.completed",
 		"dispatched", dispatched,
 		"applied", applied,

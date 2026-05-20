@@ -195,7 +195,10 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 	rows.Close()
 
 	if len(candidates) == 0 {
-		slog.Info("jobs.expire_imminent.completed",
+		// #146 (BugBash 2026-05-20 idle-tick noise pass): 10-min tick =
+		// 144 idle lines/day. Demote to DEBUG; the work-done branch
+		// further below stays INFO.
+		slog.Debug("jobs.expire_imminent.completed",
 			"emitted", 0,
 			"candidates", 0,
 			"duration_ms", time.Since(start).Milliseconds(),
