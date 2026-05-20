@@ -220,7 +220,10 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 			deployURL = "https://" + r.appID + ".deployment.instanode.dev"
 		}
 		makePermanentURL := "https://api.instanode.dev/api/v1/deployments/" + r.id + "/make-permanent"
-		emitDeployExpiringSoonAudit(w.db, r, hoursRemaining, deployURL, makePermanentURL)
+		// B19-FIND-2 (BugBash 2026-05-20): pass parent ctx so the audit
+		// INSERT inherits the tracer span — the audit row appears in the
+		// same NR trace as the reminder tick that produced it.
+		emitDeployExpiringSoonAudit(ctx, w.db, r, hoursRemaining, deployURL, makePermanentURL)
 
 		if !r.ownerEmail.Valid || r.ownerEmail.String == "" {
 			// The forwarder's LEFT JOIN users will resolve a recipient at
@@ -332,7 +335,13 @@ func advanceReminderCAS(ctx context.Context, db *sql.DB, deployIDStr string, exp
 // WARN; the CAS still holds, so the row won't be re-tried this cycle.
 // The acceptable failure mode is "one missed reminder" not "no reminder
 // for this run".
-func emitDeployExpiringSoonAudit(db *sql.DB, r deployReminderRow, hoursRemaining int, deployURL, makePermanentURL string) {
+//
+// B19-FIND-2 (BugBash 2026-05-20): accept a parent ctx so the tracer
+// span from Work() is propagated into the audit INSERT. The 3s deadline
+// is now derived from context.WithoutCancel(parent) — keeps trace
+// metadata, decouples cancellation so an outer tick boundary doesn't
+// kill a synchronous audit insert mid-flight.
+func emitDeployExpiringSoonAudit(parent context.Context, db *sql.DB, r deployReminderRow, hoursRemaining int, deployURL, makePermanentURL string) {
 	meta, _ := json.Marshal(map[string]any{
 		"deploy_id":          r.id,
 		"team_id":            r.teamID,
@@ -343,7 +352,7 @@ func emitDeployExpiringSoonAudit(db *sql.DB, r deployReminderRow, hoursRemaining
 		"deploy_url":         deployURL,
 		"make_permanent_url": makePermanentURL,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 3*time.Second)
 	defer cancel()
 	teamUUID, parseErr := uuid.Parse(r.teamID)
 	if parseErr != nil {

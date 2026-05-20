@@ -304,6 +304,32 @@ var (
 		Help: "Teams elevated by the billing reconciler's orphan sweep (paid at Razorpay, no persisted subscription_id).",
 	})
 
+	// BillingChargeUndeliverableTotal counts audit_log rows the worker
+	// observes with kind='billing.charge_undeliverable' on each reconciler
+	// tick. B11-F3 (BugBash 2026-05-20): the api emits this audit row
+	// when a Razorpay webhook arrives carrying a payload the trust pass
+	// cannot resolve to a real team (synthetic team_id, junk plan_id, or
+	// signed payload from an attacker). The api side writes the row
+	// LOUDLY (not a silent 200) but no observability surface fired on it
+	// — no NR/Prom alert was wired, so a steady drip of phishing webhook
+	// payloads or webhook-routing drift was invisible. This counter
+	// surfaces those rows via a worker-side scan so the standard
+	// counter-rate NR alert keys on a single metric independent of which
+	// service emitted the audit.
+	//
+	// The reconciler ticks every 15 min; on each tick it counts the
+	// number of charge_undeliverable rows whose created_at falls inside
+	// the tick window and increments by that delta. Per-tick window keeps
+	// the metric monotonic and lossy-safe — a row created during a worker
+	// downtime is missed (the metric is observability, not authority),
+	// which matches the rest of the worker's fail-open posture.
+	//
+	// NR alert: increase(instant_billing_charge_undeliverable_total[1h]) > 0 → P2.
+	BillingChargeUndeliverableTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_billing_charge_undeliverable_total",
+		Help: "audit_log rows with kind='billing.charge_undeliverable' observed by the worker since pod start. The api emits these when a webhook payload cannot be resolved to a real team (B11-F3 BugBash 2026-05-20).",
+	})
+
 	// GoroutinePanicsRecovered counts panics caught by the shared
 	// fire-and-forget goroutine recovery helper (jobs.SafeGo). A non-zero
 	// value means a background goroutine panicked but the worker pod
