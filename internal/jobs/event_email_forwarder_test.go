@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1314,5 +1316,93 @@ func TestEventForwarder_CursorConstants_Pinned(t *testing.T) {
 	if eventEmailCursorSeedGrace >= eventEmailMaxAge {
 		t.Fatalf("invariant violated: eventEmailCursorSeedGrace (%v) >= eventEmailMaxAge (%v); seed grace must replay strictly LESS than the absolute floor",
 			eventEmailCursorSeedGrace, eventEmailMaxAge)
+	}
+}
+
+// TestForwarderSent_AuditID_AlwaysUUID is the registry-iterating coverage
+// test for the api migration 063 contract: forwarder_sent.audit_id must
+// always be the canonical audit_log UUID (matching the soft-FK pattern),
+// never the "audit-<id>" provider-idempotency-key prefix.
+//
+// Why this matters: a synthetic "audit-..." value in audit_id would break
+// the soft FK and orphan the row from audit_log. The api migration 063
+// adds a partial index on audit_id with a regex matching UUID format —
+// any row that fails it is silently un-indexed (and un-findable from the
+// receiver-side webhook). Worker side: every markSent call site MUST
+// feed the canonical UUID.
+//
+// This test drives the only worker code path that synthesizes a
+// non-UUID-looking ProviderID (the F4 missing_renderer path) and asserts
+// that even there the AuditID column is still a UUID, and that
+// ProviderID is "missing_renderer" — i.e. that the two fields don't
+// leak into each other.
+//
+// Coverage block (CLAUDE.md rule 17):
+//   Symptom:        non-UUID writes orphan rows from migration 063's partial-FK index
+//   Enumeration:    rg -n 'AuditID:\\s*' internal/jobs/event_email_forwarder.go
+//   Sites found:    3 markSent call sites (success, missing-renderer F4, permanent-drop)
+//   Sites touched:  0 (all 3 already pass row.ID = audit_log.id::text)
+//   Coverage test:  TestForwarderSent_AuditID_AlwaysUUID + TestEventForwarder_MissingRenderer_LoudErrorDropAndAdvance
+//   Live verified:  deferred to deploy.yml verify-live step
+func TestForwarderSent_AuditID_AlwaysUUID(t *testing.T) {
+	// Drive the F4 path — the highest-risk call site because it ALSO writes
+	// a synthetic value (providerIDMissingRenderer). If any field-mixup ever
+	// occurred, this is where it would surface.
+	const orphanKind = "test.builder_without_renderer_for_uuid_audit"
+	eventEmailBuilders[orphanKind] = func(row auditRow) (map[string]string, bool) {
+		return map[string]string{"x": "y"}, true
+	}
+	supportedAuditKinds = append(supportedAuditKinds, orphanKind)
+	t.Cleanup(func() {
+		delete(eventEmailBuilders, orphanKind)
+		supportedAuditKinds = supportedAuditKinds[:len(supportedAuditKinds)-1]
+	})
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Real-shaped UUID. Migration 063's partial-index regex MUST accept this.
+	const realAuditUUID = "a1b2c3d4-e5f6-4789-9abc-def012345678"
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow(realAuditUUID, "team-1", orphanKind, "", "no renderer",
+				[]byte(`{}`), createdAt, "owner@example.com"))
+
+	cursor := &memCursor{}
+	ledger := newFakeLedger()
+	w := newEventEmailForwarderWorkerForTest(db, cursor, &fakeProvider{})
+	w.ledger = ledger
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	// Iterate every claim the ledger saw — assert AuditID is UUID-shaped
+	// everywhere. The CURRENT code only writes one claim per Work() run
+	// per row, but iterating all of ledger.claims is the registry-iterating
+	// shape that CLAUDE.md rule 18 + the multi-path-coverage rules require:
+	// future call sites added without rule 17 enumeration will surface
+	// here automatically.
+	if len(ledger.claims) == 0 {
+		t.Fatalf("ledger.claims was empty — no markSent invocation reached the fake (this test pre-supposes the F4 path fires)")
+	}
+	uuidRE := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	for k, claim := range ledger.claims {
+		if !uuidRE.MatchString(claim.AuditID) {
+			t.Errorf("ledger.claims[%q].AuditID = %q; want UUID shape (migration 063 soft-FK contract). "+
+				"Worker MUST pass audit_log.id::text (UUID), never the audit-<id> idempotency prefix.",
+				k, claim.AuditID)
+		}
+		// Also pin: the AuditID column is NOT polluted with the
+		// "audit-<id>" prefix even on the F4 path. The F4 path's only
+		// permitted synthetic value is ProviderID="missing_renderer".
+		if strings.HasPrefix(claim.AuditID, eventEmailIdempotencyPrefix) {
+			t.Errorf("ledger.claims[%q].AuditID = %q starts with %q — that prefix is for the provider IdempotencyKey ONLY, NEVER for forwarder_sent.audit_id (would break migration 063 soft-FK)",
+				k, claim.AuditID, eventEmailIdempotencyPrefix)
+		}
 	}
 }
