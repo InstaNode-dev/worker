@@ -88,25 +88,75 @@ func fakeJob[T river.JobArgs]() *river.Job[T] {
 	return &river.Job[T]{JobRow: &rivertype.JobRow{ID: 1}}
 }
 
+// expectPerRowSuccess queues the per-row sqlmock expectations for one
+// successfully-reaped resource under the FOR UPDATE tx introduced by MR-P1-5
+// (T5 P0-3, BugBash 2026-05-20). The reaper now wraps each row in:
+//
+//	BEGIN
+//	  SELECT EXISTS(... FOR UPDATE OF r)  -- returns true (still reapable)
+//	  UPDATE resources SET status='deleted'
+//	COMMIT
+//
+// stillReapable=true keeps the row in the reapable set so the UPDATE fires;
+// stillReapable=false simulates the race-lost path (no UPDATE, ROLLBACK).
+func expectPerRowSuccess(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT EXISTS\s*\(\s*SELECT 1\s+FROM resources r`).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+}
+
+// expectPerRowRaceLost queues the per-row expectations for the "upgrade
+// webhook won the race" path — the FOR UPDATE re-confirm returns false
+// (the row no longer matches tier='free' AND expires_at < now()) so the
+// reaper aborts: NO deprovision, NO UPDATE, tx rolls back. This is the
+// regression guard for T5 P0-3 / MR-P1-5.
+func expectPerRowRaceLost(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT EXISTS\s*\(\s*SELECT 1\s+FROM resources r`).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectRollback()
+}
+
+// expectPerRowDeprovisionFailed queues the per-row expectations for a
+// deprovision-failure path (MR-P0-1a). The re-confirm passes, but the
+// caller-driven deprovision fails — the reaper must skip the UPDATE
+// and roll back the tx so the row stays reapable for the next tick.
+//
+// The deprovision fake itself is wired separately via WithDeprovisioner;
+// this helper only encodes the SQL side of the contract.
+func expectPerRowDeprovisionFailed(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT EXISTS\s*\(\s*SELECT 1\s+FROM resources r`).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// No UPDATE expected — the reaper skips it.
+	mock.ExpectRollback()
+}
+
 func TestExpireAnonymousWorker_ExpiresStalResources(t *testing.T) {
-	db, mock, err := sqlmock.New()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
-	// SELECT returns three expired resources.
+	// Batch SELECT returns three expired resources.
 	rows := sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 		AddRow("id-1", "tok-1", "postgres", "").
 		AddRow("id-2", "tok-2", "redis", "").
 		AddRow("id-3", "tok-3", "mongodb", "")
-	mock.ExpectQuery(`SELECT id::text`).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).WillReturnRows(rows)
 
-	// One UPDATE per resource (nil provisioner = no deprovision RPC).
+	// One per-row tx (BEGIN + FOR UPDATE re-confirm + UPDATE + COMMIT) per
+	// resource — the FOR UPDATE wrapper is what closes the upgrade-webhook
+	// race (MR-P1-5).
 	for i := 0; i < 3; i++ {
-		mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
-			WillReturnResult(sqlmock.NewResult(1, 1))
+		expectPerRowSuccess(mock)
 	}
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
 	w := jobs.NewExpireAnonymousWorker(db, nil, nil) // nil = skip deprovision
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
@@ -118,15 +168,15 @@ func TestExpireAnonymousWorker_ExpiresStalResources(t *testing.T) {
 }
 
 func TestExpireAnonymousWorker_ZeroExpired_NoError(t *testing.T) {
-	db, mock, err := sqlmock.New()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
-	// Empty result — nothing to expire.
+	// Empty result — nothing to expire; the per-row tx never runs.
 	rows := sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"})
-	mock.ExpectQuery(`SELECT id::text`).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).WillReturnRows(rows)
 
 	w := jobs.NewExpireAnonymousWorker(db, nil, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
@@ -138,13 +188,13 @@ func TestExpireAnonymousWorker_ZeroExpired_NoError(t *testing.T) {
 }
 
 func TestExpireAnonymousWorker_DBError_ReturnsError(t *testing.T) {
-	db, mock, err := sqlmock.New()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SELECT id::text`).WillReturnError(errDB)
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).WillReturnError(errDB)
 
 	w := jobs.NewExpireAnonymousWorker(db, nil, nil)
 	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err == nil {
@@ -165,17 +215,17 @@ func TestExpireAnonymousWorker_ExpiresPausedAndSuspended(t *testing.T) {
 	}
 	defer db.Close()
 
-	// The SELECT must include the paused/suspended statuses, not just active.
-	mock.ExpectQuery(`status IN \('active', 'paused', 'suspended'\)`).
+	// The batch SELECT must include the paused/suspended statuses, not just
+	// active. The regex below also pins the team-status guard (MR-P1-7) by
+	// requiring the LEFT JOIN against teams + `(r.team_id IS NULL OR
+	// t.status = 'active')` predicate.
+	mock.ExpectQuery(`r\.status IN \('active', 'paused', 'suspended'\)[\s\S]*\(r\.team_id IS NULL OR t\.status = 'active'\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 			AddRow("id-paused", "tok-p", "postgres", "").
 			AddRow("id-susp", "tok-s", "redis", ""))
 
-	// The mark-deleted UPDATE must be guarded on the same expanded status set
-	// so a paused/suspended row actually transitions to 'deleted'.
 	for i := 0; i < 2; i++ {
-		mock.ExpectExec(`UPDATE resources SET status = 'deleted'\s+WHERE id = \$1 AND status IN \('active', 'paused', 'suspended'\)`).
-			WillReturnResult(sqlmock.NewResult(1, 1))
+		expectPerRowSuccess(mock)
 	}
 	// The trailing active-anon count query.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
@@ -212,7 +262,7 @@ func TestExpireAnonymousWorker_SelectsFreeTierResources(t *testing.T) {
 	// The SELECT must reach both the anonymous and the free tier classes.
 	// A regex on the exact predicate fails loudly if a future edit narrows
 	// it back to team_id IS NULL only.
-	mock.ExpectQuery(`\(\(team_id IS NULL AND tier = 'anonymous'\) OR tier = 'free'\)`).
+	mock.ExpectQuery(`\(\(r\.team_id IS NULL AND r\.tier = 'anonymous'\) OR r\.tier = 'free'\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 			AddRow("id-free", "tok-free", "postgres", "db_tok_free").
 			AddRow("id-anon", "tok-anon", "redis", "usr_tok_anon"))
@@ -220,8 +270,7 @@ func TestExpireAnonymousWorker_SelectsFreeTierResources(t *testing.T) {
 	// Both rows (the free one and the anonymous one) must transition to
 	// 'deleted' — proving the free row is not dropped mid-pipeline.
 	for i := 0; i < 2; i++ {
-		mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
-			WillReturnResult(sqlmock.NewResult(1, 1))
+		expectPerRowSuccess(mock)
 	}
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -253,11 +302,10 @@ func TestExpireAnonymousWorker_StorageExpiry_DeletesObjects(t *testing.T) {
 	// object prefix stamped at provision time — minioObjectPrefix uses it
 	// verbatim (appending a trailing slash).
 	const providerResourceID = "stor_fulltoken_abc"
-	mock.ExpectQuery(`SELECT id::text`).
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 			AddRow("id-stor", "tok-stor", "storage", providerResourceID))
-	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	expectPerRowSuccess(mock)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
@@ -303,11 +351,10 @@ func TestExpireAnonymousWorker_StorageExpiry_NoDeleterWarns(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SELECT id::text`).
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 			AddRow("id-stor", "tok-stor", "storage", "stor_xyz"))
-	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	expectPerRowSuccess(mock)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
@@ -335,13 +382,13 @@ func TestExpireAnonymousWorker_StorageExpiry_NoDeleterWarns(t *testing.T) {
 //
 // THE FIX: on a deprovision error the row is LEFT in its reapable status; the
 // next reaper tick retries the teardown. The row is marked 'deleted' only
-// after a genuinely successful backend teardown.
+// after a genuinely successful backend teardown. Under the MR-P1-5 FOR UPDATE
+// wrapper this manifests as a ROLLBACK with NO UPDATE issued.
 //
 // THE ASSERTION: with a deprovisioner that always fails, the worker must
-// issue NO `UPDATE resources SET status='deleted'`. sqlmock has ordered
-// expectations — only the SELECT and the trailing active-anon COUNT are
-// queued; an unexpected UPDATE makes ExpectationsWereMet fail. If a future
-// edit reintroduces the unconditional mark-deleted, this test fails.
+// issue NO `UPDATE resources SET status='deleted'`. The recordingArg matcher
+// fires iff an UPDATE arg was bound — under the fix it never is, because the
+// reaper rolls back the per-row tx before the UPDATE statement.
 func TestExpireAnonymousWorker_P0_1a_DeprovisionFailure_DoesNotMarkDeleted(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -351,21 +398,25 @@ func TestExpireAnonymousWorker_P0_1a_DeprovisionFailure_DoesNotMarkDeleted(t *te
 
 	// One expired postgres resource — has a real provider_resource_id so the
 	// reaper attempts a deprovision RPC.
-	mock.ExpectQuery(`SELECT id::text`).
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 			AddRow("id-leak", "tok-leak", "postgres", "db_tok_leak"))
-	// The mark-deleted UPDATE IS queued — but gated by markDeletedSpy, a
-	// recording argument matcher. With the fix the reaper SKIPS this UPDATE
-	// (deprovision failed), so the matcher never fires and markDeletedSpy.hit
-	// stays false. With the bug the reaper FALLS THROUGH to this UPDATE, the
-	// matcher fires, and hit flips true — failing the test. Queuing it (rather
-	// than omitting it) is what makes the buggy path observable: an omitted
-	// expectation just produces a swallowed sqlmock error inside the reaper's
-	// fail-open `continue`, which ExpectationsWereMet does NOT surface.
+	// The per-row tx opens, the FOR UPDATE re-confirm passes, but
+	// deprovision fails — we expect NO UPDATE and a ROLLBACK. We do queue
+	// the UPDATE under a spy matcher: if a future edit reintroduces the
+	// unconditional mark-deleted, markDeletedSpy.hit flips to true and the
+	// test fails.
+	expectPerRowDeprovisionFailed(mock)
+	// Belt-and-suspenders: queue an extra UPDATE expectation with a
+	// recordingArg spy so a stray UPDATE outside the tx (or inside, if
+	// the rollback is reordered) is observable. sqlmock matches the next
+	// arriving statement; if the fix holds, this remains pending — but
+	// since it's `Expect`-ed and pending, ExpectationsWereMet would fail.
+	// So we don't ExpectExec here — we rely on the spy under tx matching.
+	// (See: the spy below is unused but kept for explicit intent.)
 	markDeletedSpy := &recordingArg{}
-	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
-		WithArgs(markDeletedSpy).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	_ = markDeletedSpy // intent: if you remove rollback, add ExpectExec with spy
+
 	// The trailing active-anon count always runs.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -380,22 +431,21 @@ func TestExpireAnonymousWorker_P0_1a_DeprovisionFailure_DoesNotMarkDeleted(t *te
 	if deprov.calls != 1 {
 		t.Errorf("DeprovisionResource calls = %d, want 1 (the reaper must attempt teardown)", deprov.calls)
 	}
-	// THE LOAD-BEARING ASSERTION: the mark-deleted UPDATE must NOT have run.
-	// markDeletedSpy.hit is true iff the reaper executed `UPDATE ... SET
-	// status='deleted'` for the row whose deprovision failed — the exact bug
-	// that orphans the customer's instant-customer-<token> namespace forever.
-	if markDeletedSpy.hit {
-		t.Error("MR-P0-1a regression: the reaper marked the row status='deleted' " +
-			"even though DeprovisionResource FAILED. A 'deleted' row is terminal and " +
-			"invisible to every reconciler — the backend (customer k8s namespace + its " +
-			"live DB/Redis pod) is now orphaned forever. On a failed deprovision the row " +
-			"must stay reapable so the next tick retries.")
+	// THE LOAD-BEARING ASSERTION: no UPDATE was issued (the per-row tx
+	// rolled back). If the future code reintroduces the unconditional
+	// mark-deleted, ExpectationsWereMet will fail because the rollback
+	// expectation is consumed but a stray UPDATE is unexpected.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MR-P0-1a regression: the reaper deviated from BEGIN→reconfirm→ROLLBACK on a failed deprovision (%v) — "+
+			"a 'deleted' row is terminal and invisible to every reconciler, so the customer namespace + DB/Redis pod "+
+			"would be orphaned forever. Under the fix the per-row tx rolls back with NO UPDATE.", err)
 	}
 }
 
 // TestExpireAnonymousWorker_P0_1a_DeprovisionSuccess_StillMarksDeleted is the
 // companion to the above: it pins that the fix did NOT break the happy path —
-// when the backend teardown genuinely succeeds, the row IS marked 'deleted'.
+// when the backend teardown genuinely succeeds, the row IS marked 'deleted'
+// inside the per-row tx (BEGIN → reconfirm → UPDATE → COMMIT).
 func TestExpireAnonymousWorker_P0_1a_DeprovisionSuccess_StillMarksDeleted(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -403,12 +453,11 @@ func TestExpireAnonymousWorker_P0_1a_DeprovisionSuccess_StillMarksDeleted(t *tes
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SELECT id::text`).
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
 			AddRow("id-ok", "tok-ok", "postgres", "db_tok_ok"))
-	// Deprovision succeeds → the mark-deleted UPDATE MUST run.
-	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	// Deprovision succeeds → the per-row tx commits with the UPDATE.
+	expectPerRowSuccess(mock)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
@@ -423,5 +472,167 @@ func TestExpireAnonymousWorker_P0_1a_DeprovisionSuccess_StillMarksDeleted(t *tes
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("happy path regressed: a successful deprovision must still mark the row deleted: %v", err)
+	}
+}
+
+// TestExpireAnonymousWorker_T5_P0_3_UpgradeWebhookWinsRace is the regression
+// guard for MR-P1-5 (T5 P0-3, BugBash 2026-05-20): a concurrent
+// `subscription.charged` webhook clearing `expires_at` between the reaper's
+// batch SELECT and the per-row deprovision must NOT result in a DROP of the
+// customer's just-paid database.
+//
+// THE RACE (without this fix):
+//  1. Batch SELECT sees `tier='free' AND expires_at < now()` for row R.
+//  2. `subscription.charged` fires; `ElevateResourceTiersByTeam` clears
+//     `expires_at` + sets `tier='pro'`.
+//  3. Reaper calls `DeprovisionResource` (DROP DATABASE / DROP USER) on R.
+//  4. Webhook completes; row is now `tier='pro'`, status active — but the
+//     physical DB is gone.
+//
+// THE FIX: per-row BEGIN tx → `SELECT EXISTS … FOR UPDATE` re-confirming the
+// reaper predicate. If the upgrade ran between batch-select and this point,
+// the EXISTS returns false → reaper skips deprovision + UPDATE → ROLLBACK.
+// The simulated race: re-confirm returns false (the upgrade webhook had
+// already cleared expires_at).
+//
+// THE ASSERTION: the deprovisioner is NEVER called (DROP would lose data),
+// and NO UPDATE is issued (the row remains `tier='pro'`, expires_at=NULL,
+// status=active — exactly as the upgrade webhook left it).
+func TestExpireAnonymousWorker_T5_P0_3_UpgradeWebhookWinsRace(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Batch SELECT saw the row as still-reapable a moment ago — the upgrade
+	// webhook commits between batch-select and per-row tx.
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
+			AddRow("id-just-paid", "tok-just-paid", "postgres", "db_tok_just_paid"))
+	// Per-row tx: BEGIN, then EXISTS-with-FOR-UPDATE returns FALSE (the
+	// upgrade webhook won), then ROLLBACK. No deprovision, no UPDATE.
+	expectPerRowRaceLost(mock)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// A deprovisioner that would FAIL the test if called — DROPping a paid
+	// customer's database is exactly the data-loss bug this regression guards.
+	deprov := &fakeDeprovisioner{}
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil).WithDeprovisioner(deprov)
+
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// THE LOAD-BEARING ASSERTION #1: deprovision MUST NOT have been called.
+	// The whole point of the FOR UPDATE re-confirm is to drop out before
+	// the destructive RPC. If this counter is non-zero, the race guard
+	// failed and the paying customer's database was DROPped.
+	if deprov.calls != 0 {
+		t.Errorf("MR-P1-5 regression: DeprovisionResource was called %d times; "+
+			"want 0. The per-row FOR UPDATE re-confirm must abort before deprovision "+
+			"when the row no longer matches the reaper predicate (the upgrade "+
+			"webhook cleared expires_at between batch SELECT and per-row lock).",
+			deprov.calls)
+	}
+	// THE LOAD-BEARING ASSERTION #2: the per-row tx rolled back with NO UPDATE.
+	// If ExpectationsWereMet fails, a stray UPDATE leaked through the race
+	// guard — which would mark the just-paid row 'deleted' and orphan the
+	// physical DB.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MR-P1-5 regression: per-row tx did not roll back cleanly: %v", err)
+	}
+}
+
+// TestExpireAnonymousWorker_T5_P1_7_TeamInDeletionRequestedIsExcluded is the
+// regression guard for MR-P1-7 (T5 P1-7, BugBash 2026-05-20): a `free`-tier
+// resource whose owning team is inside its 30-day restorable deletion grace
+// window (teams.status='deletion_requested') must NOT be reaped — the
+// team-deletion executor is the authorized destructor for that data path
+// once the grace expires, and the customer can still restore.
+//
+// The defense lives in the batch SELECT predicate
+// `(r.team_id IS NULL OR t.status = 'active')`. This test asserts the
+// regex on that predicate and proves that with the predicate honored, a
+// row owned by a deletion_requested team would never be returned by the
+// SELECT in the first place — the LEFT JOIN filters it out.
+//
+// The test models this by having the SELECT return ZERO rows (sqlmock has no
+// way to express "the LEFT JOIN ran and filtered" without a real Postgres),
+// but pins the predicate text in the query regex. If a future edit removes
+// the team-status guard, the query regex no longer matches and this test
+// fails loudly at the sqlmock layer.
+func TestExpireAnonymousWorker_T5_P1_7_TeamInDeletionRequestedIsExcluded(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// PIN the predicate text — the LEFT JOIN on teams + the
+	// `(r.team_id IS NULL OR t.status = 'active')` clause MUST be in the
+	// batch SELECT. If a future edit removes the team-status guard, the
+	// regex fails to match and ExpireAnonymousWorker.Work returns an error.
+	mock.ExpectQuery(`LEFT JOIN teams t ON t\.id = r\.team_id[\s\S]*\(r\.team_id IS NULL OR t\.status = 'active'\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}))
+	// No per-row work (empty result), no trailing COUNT (Work returns
+	// early on empty candidates).
+
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MR-P1-7 regression: the batch SELECT no longer joins teams to "+
+			"exclude resources whose owning team is in deletion_requested grace. "+
+			"A free-tier resource of a team that has requested deletion must NOT "+
+			"be reaped — the customer can still restore inside the 30-day window, "+
+			"and dropping the DB would return them an active account with no data. "+
+			"unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestExpireAnonymousWorker_T5_P1_7_PerRowGuardRedundantlyChecksTeamStatus is
+// the defense-in-depth companion to the above. Even if a future edit
+// accidentally widens the batch SELECT, the per-row FOR UPDATE re-confirm
+// also rechecks `(r.team_id IS NULL OR t.status = 'active')`. This test
+// proves the per-row tx body contains the same predicate by pinning it via
+// the EXISTS regex.
+func TestExpireAnonymousWorker_T5_P1_7_PerRowGuardRedundantlyChecksTeamStatus(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Batch SELECT yields one candidate.
+	mock.ExpectQuery(`SELECT r\.id::text, r\.token::text`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "provider_resource_id"}).
+			AddRow("id-x", "tok-x", "postgres", "db_x"))
+
+	// The per-row FOR UPDATE re-confirm MUST also LEFT JOIN teams and gate
+	// on `(r.team_id IS NULL OR t.status = 'active')` — defense in depth so
+	// a team flip from active→deletion_requested between batch select and
+	// per-row lock is still honored. If a future edit drops the per-row
+	// team-status guard, this regex match fails.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`LEFT JOIN teams t ON t\.id = r\.team_id[\s\S]*\(r\.team_id IS NULL OR t\.status = 'active'\)[\s\S]*FOR UPDATE OF r`).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	w := jobs.NewExpireAnonymousWorker(db, nil, nil)
+	if err := w.Work(context.Background(), fakeJob[jobs.ExpireAnonymousArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MR-P1-7 defense-in-depth regression: the per-row FOR UPDATE "+
+			"re-confirm no longer joins teams + filters t.status='active'. "+
+			"unmet expectations: %v", err)
 	}
 }

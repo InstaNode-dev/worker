@@ -24,6 +24,21 @@ var (
 		Help: "Resources whose backend deprovision failed during expiry (row left reapable for retry, MR-P0-1a).",
 	})
 
+	// ExpireRaceSkippedTotal counts rows the reaper skipped at the per-row
+	// FOR UPDATE re-confirm because a concurrent state change (the
+	// `subscription.charged` upgrade webhook, or a team flip to
+	// deletion_requested) had cleared the reapable predicate after batch
+	// SELECT. Per MR-P1-5 / T5 P0-3 (BugBash 2026-05-20) the per-row tx
+	// re-confirms tier+expires_at+team-status under a row lock; a non-zero
+	// rate is *expected* (and a positive signal — the race guard fired and
+	// saved a paying customer's DB from a wrongful DROP). Sustained 0 is
+	// also fine. NR alert: this is not by itself an error metric; pair with
+	// `instant_expire_deprovision_failed_total` to spot patterns.
+	ExpireRaceSkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_expire_race_skipped_total",
+		Help: "Reaper rows skipped at FOR UPDATE re-confirm because an upgrade webhook or deletion-grace transition won the race (MR-P1-5 / T5 P1-7).",
+	})
+
 	// ActiveAnonymousResources is the count of active anonymous resources with a TTL (updated each expiry job run).
 	ActiveAnonymousResources = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "instant_active_anonymous_resources",
