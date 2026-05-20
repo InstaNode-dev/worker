@@ -33,12 +33,22 @@ import (
 // campaign. Providers that don't support dedupe headers must document the
 // duplicate-send risk in their package comment.
 type EmailProvider interface {
-	// SendEvent attempts to send one event email. Returns nil on success.
-	// Returns a *SendError typed by Class so the forwarder can decide:
+	// SendEvent attempts to send one event email. Returns (messageID, nil)
+	// on success. The messageID is the provider's per-send opaque
+	// identifier — Brevo's `messageId` JSON field, SES's MessageID, etc.
+	// — which the forwarder persists into forwarder_sent.provider_id so
+	// the receiver-side webhook (POST /webhooks/brevo/:secret in the api
+	// repo) can match inbound delivery events back to the ledger row.
+	// When a provider doesn't surface a per-send id (NoopProvider, or
+	// providers that return only an HTTP envelope) it MAY return the
+	// empty string — the forwarder falls back to EventEmail.IdempotencyKey
+	// in that case so support queries still have *some* anchor.
+	//
+	// On failure returns ("", *SendError) typed by Class:
 	//   - SendClassPermanent          — skip + advance cursor (auth bad, payload rejected, etc.)
 	//   - SendClassTransient          — don't advance cursor (5xx, network, retry next tick)
 	//   - SendClassSkippedNoTemplate  — skip + advance cursor (this event isn't configured for this provider)
-	SendEvent(ctx context.Context, evt EventEmail) error
+	SendEvent(ctx context.Context, evt EventEmail) (string, error)
 
 	// Name returns the provider identifier for logs/metrics ("brevo", "ses", "noop").
 	// Stable for the lifetime of the binary; safe to use as a label cardinality.

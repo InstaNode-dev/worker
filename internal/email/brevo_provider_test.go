@@ -97,7 +97,7 @@ func TestBrevoProvider_2xxReturnsNil(t *testing.T) {
 	srv, rr := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 42})
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "user@example.com",
 		RecipientName:  "User",
@@ -184,7 +184,7 @@ func TestBrevoProvider_StatusCodeClassification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, _ := fakeBrevo(t, tc.status)
 			p := newTestProvider(t, srv, nil)
-			err := p.SendEvent(context.Background(), EventEmail{
+			_, err := p.SendEvent(context.Background(), EventEmail{
 				Kind:           "subscription.upgraded",
 				Recipient:      "x@example.com",
 				IdempotencyKey: "audit-table-" + tc.name,
@@ -215,7 +215,7 @@ func TestBrevoProvider_5xxReturnsTransient(t *testing.T) {
 	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		srv, _ := fakeBrevo(t, status)
 		p := newTestProvider(t, srv, nil)
-		err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+		_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 		if err == nil {
 			t.Errorf("SendEvent on %d = nil; want SendError(Transient)", status)
 			continue
@@ -239,7 +239,7 @@ func TestBrevoProvider_NetworkErrorReturnsTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.url = "http://127.0.0.1:1/does-not-exist" // closed port
-	gotErr := p.SendEvent(context.Background(), EventEmail{Kind: "x", Recipient: "u@e.com"})
+	_, gotErr := p.SendEvent(context.Background(), EventEmail{Kind: "x", Recipient: "u@e.com"})
 	var se *SendError
 	if !errors.As(gotErr, &se) || se.Class != SendClassTransient {
 		t.Errorf("network error → %v; want SendClassTransient", gotErr)
@@ -253,7 +253,7 @@ func TestBrevoProvider_MissingTemplate_SkipsNoTemplate(t *testing.T) {
 	srv, rr := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 42})
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "experiment.conversion", // not in template map
 		Recipient: "x@example.com",
 	})
@@ -276,7 +276,7 @@ func TestBrevoProvider_EmptyRecipient_ReturnsPermanent(t *testing.T) {
 	srv, _ := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 42})
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "subscription.upgraded",
 		Recipient: "",
 	})
@@ -293,7 +293,7 @@ func TestBrevoProvider_RequestPayloadShape(t *testing.T) {
 	srv, rr := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 7})
 
-	p.SendEvent(context.Background(), EventEmail{
+	_, _ = p.SendEvent(context.Background(), EventEmail{
 		Kind:          "subscription.upgraded",
 		Recipient:     "u@example.com",
 		RecipientName: "U",
@@ -314,7 +314,7 @@ func TestBrevoProvider_RequestPayloadShape(t *testing.T) {
 func TestBrevoProvider_NoIdempotencyKey_OmitsHeader(t *testing.T) {
 	srv, rr := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 7})
-	p.SendEvent(context.Background(), EventEmail{
+	_, _ = p.SendEvent(context.Background(), EventEmail{
 		Kind:      "subscription.upgraded",
 		Recipient: "u@example.com",
 	})
@@ -342,7 +342,7 @@ func TestBrevoProvider_RawHTMLPath_UsesSubjectHTMLSender(t *testing.T) {
 	}
 	p.url = srv.URL
 
-	err = p.SendEvent(context.Background(), EventEmail{
+	_, err = p.SendEvent(context.Background(), EventEmail{
 		Kind:           "anon.expiry_warning",
 		Recipient:      "u@example.com",
 		RecipientName:  "U",
@@ -406,7 +406,7 @@ func TestBrevoProvider_RawHTMLPath_DefaultSender(t *testing.T) {
 		t.Fatalf("NewBrevoProvider: %v", err)
 	}
 	p.url = srv.URL
-	if err := p.SendEvent(context.Background(), EventEmail{
+	if _, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "anon.expiry_warning",
 		Recipient: "u@example.com",
 		Subject:   "S",
@@ -430,7 +430,7 @@ func TestBrevoProvider_RawHTMLPath_DefaultSender(t *testing.T) {
 func TestBrevoProvider_RawHTMLPath_EmptySubject_ReturnsPermanent(t *testing.T) {
 	srv, _ := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, nil)
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "anon.expiry_warning",
 		Recipient: "u@example.com",
 		Subject:   "", // bug — should never happen
@@ -450,7 +450,7 @@ func TestBrevoProvider_RawHTMLPath_BypassesMissingTemplate(t *testing.T) {
 	srv, _ := fakeBrevo(t, http.StatusOK)
 	// Map only knows about a different kind — the kind we send is unmapped.
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 99})
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "anon.expiry_warning", // not in map
 		Recipient: "u@example.com",
 		Subject:   "S",
@@ -491,7 +491,7 @@ func fakeBrevoCustom(t *testing.T, status int, body string) (*httptest.Server, *
 func TestBrevoProvider_EmptyBody200_IsSuccess(t *testing.T) {
 	srv, _ := fakeBrevoCustom(t, http.StatusOK, "")
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 7})
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "u@example.com",
 		IdempotencyKey: "audit-empty-body",
@@ -514,7 +514,7 @@ func TestBrevoProvider_NilResponse_NetworkError(t *testing.T) {
 	}
 	// Use a closed port — no listener will accept, Do returns (nil, err).
 	p.url = "http://127.0.0.1:1/closed"
-	gotErr := p.SendEvent(context.Background(), EventEmail{
+	_, gotErr := p.SendEvent(context.Background(), EventEmail{
 		Kind:           "x",
 		Recipient:      "u@e.com",
 		IdempotencyKey: "audit-net-err",
@@ -595,7 +595,7 @@ func TestBrevoProvider_Metrics_ClassifiesAllErrorPaths(t *testing.T) {
 			before := brevoErrorCounter(t, tc.classification, tc.statusLabel)
 			srv, _ := fakeBrevo(t, tc.status)
 			p := newTestProvider(t, srv, nil)
-			_ = p.SendEvent(context.Background(), EventEmail{
+			_, _ = p.SendEvent(context.Background(), EventEmail{
 				Kind:           "subscription.upgraded",
 				Recipient:      "x@example.com",
 				IdempotencyKey: "audit-metric-" + tc.name,
@@ -622,7 +622,7 @@ func TestBrevoProvider_Metrics_NetworkError_Status0(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.url = "http://127.0.0.1:1/closed"
-	_ = p.SendEvent(context.Background(), EventEmail{
+	_, _ = p.SendEvent(context.Background(), EventEmail{
 		Kind:           "x",
 		Recipient:      "u@e.com",
 		IdempotencyKey: "audit-net-metric",
@@ -648,7 +648,7 @@ func TestBrevoProvider_Metrics_2xxDoesNotIncrement(t *testing.T) {
 	}
 	srv, _ := fakeBrevo(t, http.StatusOK)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 1})
-	if err := p.SendEvent(context.Background(), EventEmail{
+	if _, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "u@e.com",
 		IdempotencyKey: "audit-success",
@@ -688,7 +688,7 @@ func TestBrevoProvider_RetryDecision_Integration(t *testing.T) {
 	// 429 — must retry. Real round-trip through doRequest, not a fake.
 	srv, _ := fakeBrevo(t, http.StatusTooManyRequests)
 	p := newTestProvider(t, srv, map[string]int{"subscription.upgraded": 1})
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "u@e.com",
 		IdempotencyKey: "audit-retry-int-1",
@@ -700,7 +700,7 @@ func TestBrevoProvider_RetryDecision_Integration(t *testing.T) {
 	// 400 — must NOT retry; permanent payload reject.
 	srv2, _ := fakeBrevo(t, http.StatusBadRequest)
 	p2 := newTestProvider(t, srv2, map[string]int{"subscription.upgraded": 1})
-	err2 := p2.SendEvent(context.Background(), EventEmail{
+	_, err2 := p2.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "u@e.com",
 		IdempotencyKey: "audit-retry-int-2",
@@ -712,7 +712,7 @@ func TestBrevoProvider_RetryDecision_Integration(t *testing.T) {
 	// 401 — must retry; account-level recoverable.
 	srv3, _ := fakeBrevo(t, http.StatusUnauthorized)
 	p3 := newTestProvider(t, srv3, map[string]int{"subscription.upgraded": 1})
-	err3 := p3.SendEvent(context.Background(), EventEmail{
+	_, err3 := p3.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "u@e.com",
 		IdempotencyKey: "audit-retry-int-3",
@@ -724,7 +724,7 @@ func TestBrevoProvider_RetryDecision_Integration(t *testing.T) {
 	// SkippedNoTemplate — must NOT retry; operator chose not to map this kind.
 	srv4, _ := fakeBrevo(t, http.StatusOK)
 	p4 := newTestProvider(t, srv4, map[string]int{"other": 1})
-	err4 := p4.SendEvent(context.Background(), EventEmail{
+	_, err4 := p4.SendEvent(context.Background(), EventEmail{
 		Kind:      "subscription.upgraded", // unmapped
 		Recipient: "u@e.com",
 	})

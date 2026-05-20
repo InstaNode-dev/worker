@@ -810,7 +810,7 @@ batchLoop:
 			continue
 		}
 
-		sendErr := w.provider.SendEvent(ctx, evt)
+		sendMessageID, sendErr := w.provider.SendEvent(ctx, evt)
 		class := email.ClassOf(sendErr)
 		switch {
 		case sendErr == nil:
@@ -821,10 +821,28 @@ batchLoop:
 			// where honored). The ledger row carries the audit columns
 			// added by migration 059 so support can reconstruct what got
 			// sent without grepping logs.
+			//
+			// 2026-05-20 brief: persist the REAL upstream messageId
+			// (Brevo's `messageId`, SES's MessageID) when the provider
+			// surfaces one. That id is the lookup key the receiver-side
+			// webhook (api/.../webhooks/brevo/:secret) uses to overwrite
+			// classification + delivered_at with the actual relay
+			// outcome — closes the "201 ≠ delivered" gap.
+			//
+			// Fall back to evt.IdempotencyKey ("audit-<row-id>") when the
+			// provider returns "" (NoopProvider, or a provider whose
+			// envelope didn't parse). The fallback row is benign — it
+			// just won't match any inbound Brevo webhook, which is
+			// already the orphan-event path the receiver handles
+			// gracefully (200 OK + WARN log).
+			providerID := sendMessageID
+			if providerID == "" {
+				providerID = evt.IdempotencyKey
+			}
 			claimed, ledgerErr := w.ledger.markSent(ctx, ledgerClaim{
 				AuditID:        row.ID,
 				Provider:       w.provider.Name(),
-				ProviderID:     evt.IdempotencyKey, // best available — providers don't surface a message id today
+				ProviderID:     providerID,
 				Recipient:      maskRecipientForLedger(recipient),
 				TemplateKind:   row.Kind,
 				Classification: ledgerClassSuccess,

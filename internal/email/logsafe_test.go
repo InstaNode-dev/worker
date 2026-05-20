@@ -87,7 +87,7 @@ func TestWorkerEmailProviders_NoRawRecipientInLogs(t *testing.T) {
 		}
 		p.url = srv.URL
 		out := captureSlog(t, func() {
-			_ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
+			_, _ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
 		})
 		assertNoRawRecipient(t, "brevo:2xx", out, rawLocal, wantMasked)
 	})
@@ -105,7 +105,7 @@ func TestWorkerEmailProviders_NoRawRecipientInLogs(t *testing.T) {
 		}
 		p.url = srv.URL
 		out := captureSlog(t, func() {
-			_ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
+			_, _ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
 		})
 		assertNoRawRecipient(t, "brevo:4xx", out, rawLocal, wantMasked)
 	})
@@ -123,7 +123,7 @@ func TestWorkerEmailProviders_NoRawRecipientInLogs(t *testing.T) {
 		}
 		p.url = srv.URL
 		out := captureSlog(t, func() {
-			_ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
+			_, _ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
 		})
 		assertNoRawRecipient(t, "brevo:auth_wall", out, rawLocal, wantMasked)
 	})
@@ -136,7 +136,7 @@ func TestWorkerEmailProviders_NoRawRecipientInLogs(t *testing.T) {
 			templates: map[string]string{kind: "tmpl-1"},
 		}
 		out := captureSlog(t, func() {
-			_ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
+			_, _ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
 		})
 		assertNoRawRecipient(t, "ses:success", out, rawLocal, wantMasked)
 	})
@@ -149,7 +149,7 @@ func TestWorkerEmailProviders_NoRawRecipientInLogs(t *testing.T) {
 			templates: map[string]string{kind: "tmpl-1"},
 		}
 		out := captureSlog(t, func() {
-			_ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
+			_, _ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
 		})
 		assertNoRawRecipient(t, "ses:rejected", out, rawLocal, wantMasked)
 	})
@@ -162,7 +162,7 @@ func TestWorkerEmailProviders_NoRawRecipientInLogs(t *testing.T) {
 			templates: map[string]string{kind: "tmpl-1"},
 		}
 		out := captureSlog(t, func() {
-			_ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
+			_, _ = p.SendEvent(context.Background(), EventEmail{Kind: kind, Recipient: rawRecipient})
 		})
 		assertNoRawRecipient(t, "ses:transient", out, rawLocal, wantMasked)
 	})
