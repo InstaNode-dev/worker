@@ -54,6 +54,13 @@ func TestIdleTickLogLevel_DemotedToDebug(t *testing.T) {
 		"entitlement_reconciler.go",       // 5min tick
 		"expire_imminent.go",              // 10min tick
 		"event_email_forwarder.go",        // 60s tick
+		// Wave 3 #146 follow-up (2026-05-21) — last residual INFO-on-idle emitters
+		"quota_wall_nudge.go",             // 30min tick
+		"resource_heartbeat.go",           // 1h prod / 1min dev tick
+		"expire.go",                       // 1h tick (anonymous reaper)
+		"expire_stacks.go",                // 1h tick
+		"customer_backup_scheduler.go",    // 1h tick
+		"team_deletion_executor.go",       // sweep cadence
 	}
 
 	// Pattern for an idle-tick INFO line: `slog.Info("jobs.<job>.completed",`
