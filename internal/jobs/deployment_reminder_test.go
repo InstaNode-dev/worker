@@ -223,3 +223,75 @@ func asStr(v interface{}) string {
 	}
 	return ""
 }
+
+// TestDeploymentReminder_StageThresholds_Pinned pins the F3 escalating-cadence
+// shape (Wave 3 follow-up, 2026-05-21). The earlier F3 fix capped reminders
+// at 3 stages but kept a flat 2h cooldown — "Final reminder" landed with
+// ~8h still remaining, which reads as another routine ping instead of an
+// urgent last warning.
+//
+// The escalating cadence gates each subsequent reminder on a strictly
+// tighter time-to-expiry: Stage 1 fires at T-12h, Stage 2 at T-6h,
+// Stage 3 ("Final reminder") at T-1h. This test pins:
+//   1. exactly maxDeployReminders thresholds defined (table-shape invariant)
+//   2. thresholds STRICTLY decreasing (escalating; equality means flat, fails)
+//   3. exact stage values (12h / 6h / 1h) — a future PR that flattens or
+//      loosens any stage trips this and forces an explicit conversation
+//   4. nextReminderThreshold(N) returns 0 for N >= maxDeployReminders
+//      (cleanly stops after the final stage)
+//
+// Coverage block (CLAUDE.md rule 17):
+//   Symptom:        "Final reminder" with 8h still on the clock reads as spam
+//   Enumeration:    rg -n 'deployReminderStageThresholds|nextReminderThreshold' internal/jobs/
+//   Sites found:    1 var declaration + 1 helper fn + 1 SQL query gate
+//   Sites touched:  3 (var, helper, SQL CASE clause); table is single-source
+//   Coverage test:  TestDeploymentReminder_StageThresholds_Pinned (this test)
+func TestDeploymentReminder_StageThresholds_Pinned(t *testing.T) {
+	thresholds := jobs.DeployReminderStageThresholds()
+
+	if got, want := len(thresholds), jobs.MaxDeployReminders; got != want {
+		t.Fatalf("len(deployReminderStageThresholds) = %d; want %d (must match maxDeployReminders)", got, want)
+	}
+
+	// Pinning: exact stage values. A future PR that touches any of these
+	// must update this test deliberately — that's the whole point.
+	wantStages := []time.Duration{
+		12 * time.Hour, // Stage 1: Heads up
+		6 * time.Hour,  // Stage 2: Reminder
+		1 * time.Hour,  // Stage 3: Final reminder
+	}
+	for i, w := range wantStages {
+		if thresholds[i] != w {
+			t.Errorf("Stage %d threshold = %v; want %v — F3 escalating cadence (Wave 3)", i+1, thresholds[i], w)
+		}
+	}
+
+	// Invariant: strictly decreasing — the cadence MUST escalate. A flat
+	// or non-monotonic schedule means "Final reminder" can fire before
+	// "Heads up", which is the bug F3 set out to kill.
+	for i := 1; i < len(thresholds); i++ {
+		if thresholds[i] >= thresholds[i-1] {
+			t.Errorf("invariant violated: thresholds[%d] (%v) >= thresholds[%d] (%v); cadence must STRICTLY escalate (decreasing time-to-expiry per stage)",
+				i, thresholds[i], i-1, thresholds[i-1])
+		}
+	}
+
+	// Boundary: nextReminderThreshold(N) for N out-of-range returns 0
+	// (caller is expected to short-circuit on 0 = no further reminder).
+	if got := jobs.NextReminderThreshold(-1); got != 0 {
+		t.Errorf("NextReminderThreshold(-1) = %v; want 0 (out-of-range)", got)
+	}
+	if got := jobs.NextReminderThreshold(jobs.MaxDeployReminders); got != 0 {
+		t.Errorf("NextReminderThreshold(maxDeployReminders) = %v; want 0 (all stages fired, stop)", got)
+	}
+	if got := jobs.NextReminderThreshold(jobs.MaxDeployReminders + 5); got != 0 {
+		t.Errorf("NextReminderThreshold(N+5) = %v; want 0 (beyond final stage)", got)
+	}
+
+	// Boundary: nextReminderThreshold(N) for N in-range returns the i-th stage.
+	for i := 0; i < jobs.MaxDeployReminders; i++ {
+		if got, want := jobs.NextReminderThreshold(i), thresholds[i]; got != want {
+			t.Errorf("NextReminderThreshold(%d) = %v; want %v", i, got, want)
+		}
+	}
+}
