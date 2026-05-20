@@ -569,9 +569,20 @@ batchLoop:
 		if supErr != nil {
 			// Bounce/spam lookup failure — fail-OPEN: treat as "not
 			// suppressed" so a transient DB blip doesn't pin the queue.
-			slog.Warn("jobs.event_email_forwarder.suppression_check_failed",
+			//
+			// P2 visibility fix (CIRCUIT-RETRY-AUDIT-2026-05-20, worker
+			// brief item 4): each fail-open here increments
+			// instant_worker_fail_open_total{site=...,reason=db_error} so
+			// an SRE can alert on a sustained spike that means we're
+			// silently mailing into a bounce backlog during a DB brownout.
+			// The fail-mode itself is unchanged — see
+			// event_email_forwarder.go SPLIT FAIL POSTURE rationale above.
+			RecordFailOpen(
+				"event_email_forwarder.bounce_suppression",
+				"db_error",
+				supErr,
 				"audit_id", row.ID,
-				"error", supErr,
+				"kind", row.Kind,
 				"note", "fail-open: bounce/spam lookup error — continuing as if recipient is sendable",
 			)
 		}
