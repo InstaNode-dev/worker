@@ -233,7 +233,19 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 	custNSDeleted, custNSFailed := w.sweepOrphanedCustomerNamespaces(ctx)
 	stackNSDeleted, stackNSFailed := w.sweepOrphanedStackNamespaces(ctx)
 
-	slog.Info("jobs.orphan_sweep.completed",
+	// #146 (BugBash 2026-05-20 idle-tick noise pass): 15min tick = 96
+	// lines/day. An all-zero sweep means the cluster is clean — DEBUG.
+	// Any non-zero counter (real reclaim OR failure) is operational
+	// signal — INFO.
+	level := slog.LevelInfo
+	if pendingFinished == 0 && pendingFailed == 0 &&
+		subsCancelled == 0 && subsFailed == 0 &&
+		nsDeleted == 0 && nsFailed == 0 &&
+		custNSDeleted == 0 && custNSFailed == 0 &&
+		stackNSDeleted == 0 && stackNSFailed == 0 {
+		level = slog.LevelDebug
+	}
+	slog.Log(ctx, level, "jobs.orphan_sweep.completed",
 		"pending_teams_finished", pendingFinished,
 		"pending_teams_failed", pendingFailed,
 		"orphan_subscriptions_cancelled", subsCancelled,

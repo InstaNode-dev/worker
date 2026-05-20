@@ -33,10 +33,12 @@ import (
 // idle-tick INFO" — but it catches the modal regression (someone reverts
 // the Info→Debug change on a single job).
 func TestIdleTickLogLevel_DemotedToDebug(t *testing.T) {
-	// The 8 jobs the T21 P1-1 fix touched. A new addition to this list
-	// requires (a) demoting the file's idle-tick completed log to DEBUG,
-	// and (b) adding the file here.
+	// The 8 jobs the T21 P1-1 fix touched, plus 6 more demoted in the
+	// #146 idle-tick noise pass (BugBash 2026-05-20). A new addition to
+	// this list requires (a) demoting the file's idle-tick completed log
+	// to DEBUG, and (b) adding the file here.
 	jobs := []string{
+		// T21 P1-1 (2026-05-20)
 		"deploy_status_reconcile.go",
 		"deploy_notify_webhook.go",
 		"magic_link_reconciler.go",
@@ -45,6 +47,13 @@ func TestIdleTickLogLevel_DemotedToDebug(t *testing.T) {
 		"provisioner_reconciler.go",
 		"customer_backup_runner.go",
 		"customer_restore_runner.go",
+		// #146 (2026-05-20 idle-tick noise extension)
+		"propagation_runner.go",           // 30s tick
+		"custom_domain_reconcile.go",      // 5min tick
+		"orphan_sweep_reconciler.go",      // 15min tick
+		"entitlement_reconciler.go",       // 5min tick
+		"expire_imminent.go",              // 10min tick
+		"event_email_forwarder.go",        // 60s tick
 	}
 
 	// Pattern for an idle-tick INFO line: `slog.Info("jobs.<job>.completed",`
@@ -63,10 +72,14 @@ func TestIdleTickLogLevel_DemotedToDebug(t *testing.T) {
 		}
 		body := string(src)
 
-		// Each file should have a DEBUG branch for the idle path. Pin
-		// that the demotion landed.
-		if !strings.Contains(body, "slog.Debug(") {
-			t.Errorf("%s: T21 P1-1 regression — file no longer carries a slog.Debug(...) call for the idle-tick path. The idle-tick `.completed` INFO line must be demoted to DEBUG (or guarded by a work-done conditional that demotes to DEBUG on processed=0).",
+		// Each file should have evidence of an idle-tick DEBUG branch.
+		// Accept either:
+		//   (a) a direct `slog.Debug(` call (T21 P1-1 shape), OR
+		//   (b) a `slog.LevelDebug` reference (#146 shape, where the
+		//       per-tick level is computed dynamically with slog.Log).
+		// Both are valid demotion shapes.
+		if !strings.Contains(body, "slog.Debug(") && !strings.Contains(body, "slog.LevelDebug") {
+			t.Errorf("%s: idle-tick demotion regression — file no longer carries a slog.Debug(...) call or slog.LevelDebug reference for the idle-tick path. The idle-tick `.completed` INFO line must be demoted to DEBUG (or guarded by a work-done conditional that demotes to DEBUG on processed=0).",
 				f)
 		}
 

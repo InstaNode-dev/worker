@@ -147,7 +147,10 @@ func (w *CustomDomainReconciler) Work(ctx context.Context, job *river.Job[Custom
 	}
 
 	if len(domains) == 0 {
-		slog.Info("jobs.custom_domain_reconcile.completed",
+		// #146 (BugBash 2026-05-20 idle-tick noise pass): 5min tick = 288
+		// idle-tick lines/day per worker pod. Demote to DEBUG; INFO only
+		// when there is non-empty work below.
+		slog.Debug("jobs.custom_domain_reconcile.completed",
 			"total", 0,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"job_id", job.ID,
