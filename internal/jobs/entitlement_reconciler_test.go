@@ -999,3 +999,86 @@ func TestEntitlementReconciler_MongoArm_SweepsMongoResources(t *testing.T) {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// TestEntitlementReconciler_MongoArm_UnsupportedSkip_LogsAtDebug_NotWARN is the
+// regression guard for T8 worker follow-up (BugBash 2026-05-20): until the
+// provisioner's regradeMongo is implemented, every Mongo regrade call returns
+// `{Applied: false, SkipReason: "unsupported resource type for regrade"}`.
+// This is the EXPECTED steady state — once per Mongo resource per 5-minute
+// tick, indefinitely. If that path logs at WARN it spams the production
+// log stream (~12/h/resource × N Mongo customers) and triggers alert fatigue.
+//
+// THE CONTRACT: the unsupported-Mongo skip path logs at DEBUG; the operator-
+// visible signal is the rollup `mongo_skipped` counter on the
+// `.completed` INFO line, not a per-resource per-tick WARN.
+//
+// THE ASSERTION: with a regrader that returns Applied:false for MONGODB, the
+// captured slog stream contains ZERO WARN records whose message starts with
+// `jobs.entitlement_reconciler.mongo.` (the family the unsupported skip
+// belongs to), and the per-row skip event is recorded at DEBUG with the
+// expected skip_reason.
+func TestEntitlementReconciler_MongoArm_UnsupportedSkip_LogsAtDebug_NotWARN(t *testing.T) {
+	records := captureSlog(t)
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	// Postgres + Redis empty; Mongo has one row. The unsupported regrader
+	// below returns Applied:false / SkipReason="unsupported...".
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(entitlementSweepCols))
+	mock.ExpectQuery(`SELECT`).WillReturnRows(emptyRedisRows())
+	mock.ExpectQuery(`SELECT`).WillReturnRows(sqlmock.NewRows(mongoSweepCols).
+		AddRow(id, "tok-mongo-unsup", nil, "pro", "pro"))
+
+	// Regrader returns the exact shape the real provisioner produces today
+	// for MONGODB — Applied:false + SkipReason matching server.go:749.
+	unsupRegrader := &funcRegrader{
+		fn: func(_ context.Context, _, _ string, resType commonv1.ResourceType, _, _ string) (regradeOutcome, error) {
+			if resType == commonv1.ResourceType_RESOURCE_TYPE_MONGODB {
+				return regradeOutcome{Applied: false, SkipReason: "unsupported resource type for regrade"}, nil
+			}
+			return regradeOutcome{Applied: true}, nil
+		},
+	}
+
+	reg := liveRegistry(t)
+	w := NewEntitlementReconcilerWorker(db, reg, unsupRegrader)
+	if err := w.Work(context.Background(), fakeEntitlementJob()); err != nil {
+		t.Fatalf("Work() returned unexpected error: %v", err)
+	}
+
+	// THE LOAD-BEARING ASSERTION: scan the captured records for any WARN
+	// (or higher) record whose message belongs to the Mongo arm family.
+	// The unsupported-skip path must use DEBUG; any WARN here is the
+	// per-tick spam this regression guards against.
+	for _, rec := range *records {
+		if rec.level < slog.LevelWarn {
+			continue
+		}
+		// We tolerate non-Mongo WARNs (other arms unaffected) — only the
+		// `mongo.` family is in-scope for this regression.
+		if msg := rec.msg; len(msg) >= len("jobs.entitlement_reconciler.mongo.") &&
+			msg[:len("jobs.entitlement_reconciler.mongo.")] == "jobs.entitlement_reconciler.mongo." {
+			// The mongo.query_failed / mongo.scan_failed / mongo.rows_failed /
+			// mongo.regrade_failed lines are legitimate WARNs (they signal a
+			// real fault). The bug we guard is mongo.regrade_skipped firing
+			// at WARN — pin its level to DEBUG specifically.
+			if rec.msg == "jobs.entitlement_reconciler.mongo.regrade_skipped" {
+				t.Errorf("T8 worker followup regression: "+
+					"the unsupported-Mongo skip path emitted a %s record — "+
+					"this fires once per Mongo resource per 5-min tick, "+
+					"indefinitely (until provisioner.regradeMongo lands), "+
+					"so it must be DEBUG, not WARN/ERROR. Record: msg=%q attrs=%v",
+					rec.level, rec.msg, rec.attrs)
+			}
+		}
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}

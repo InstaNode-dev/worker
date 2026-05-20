@@ -37,6 +37,17 @@ var reapableStatusSQLList = func() string {
 	return strings.Join(quoted, ", ")
 }()
 
+// toExpire is one candidate row carried from the batch SELECT to the per-row
+// reapOne tx. Package-level (rather than function-local) so reapOne can take
+// it as a parameter — the per-row tx wrapper lives outside Work() so a
+// regression test can drive it directly.
+type toExpire struct {
+	id                 string
+	token              string
+	resourceType       string
+	providerResourceID string
+}
+
 // ExpireAnonymousArgs holds the arguments for the ExpireAnonymousJob.
 // No fields are needed — it's a periodic maintenance job.
 type ExpireAnonymousArgs struct{}
@@ -151,29 +162,39 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	//     provider_resource_id), so it resolves the right backing infra
 	//     regardless of whether team_id is set.
 	//
+	// MR-P1-7 (T5 P1-7, BugBash 2026-05-20): exclude free-tier resources whose
+	// owning team is inside its 30-day restorable deletion grace window
+	// (teams.status='deletion_requested'). Such resources are paused (still
+	// reapable by lifecycle filter) and may carry a past expires_at — without
+	// this guard the reaper would DROP the customer's DB before the 30-day
+	// restore window elapsed, so a subsequent /teams/:id/restore would return
+	// an "active" account whose data is gone. The team-deletion executor is
+	// the authorized destructor for that data path once the grace expires;
+	// the reaper must stay out of it. teams.status='active' is the only
+	// state in which a free row is safe to reap; deletion_pending /
+	// tombstoned teams are out-of-band (their resources have already been
+	// deprovisioned by the executor, or are about to be). 'anonymous' rows
+	// have team_id IS NULL by construction so the LEFT JOIN does not filter
+	// them — they cannot be in a deletion grace window.
+	//
 	// NOTE: api-side models.ExpireAnonymousResources covers both tiers in SQL
 	// but has zero non-test callers (dead code) and only flips the DB row — it
 	// never calls the provisioner. It should be removed from the api repo
 	// (out of scope here); this worker is the sole live reaper.
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT id::text, token::text, resource_type, COALESCE(provider_resource_id, '')
-		FROM resources
-		WHERE ((team_id IS NULL AND tier = 'anonymous') OR tier = 'free')
-		  AND status IN (`+reapableStatusSQLList+`)
-		  AND expires_at IS NOT NULL
-		  AND expires_at < now()
+		SELECT r.id::text, r.token::text, r.resource_type, COALESCE(r.provider_resource_id, '')
+		FROM resources r
+		LEFT JOIN teams t ON t.id = r.team_id
+		WHERE ((r.team_id IS NULL AND r.tier = 'anonymous') OR r.tier = 'free')
+		  AND r.status IN (`+reapableStatusSQLList+`)
+		  AND r.expires_at IS NOT NULL
+		  AND r.expires_at < now()
+		  AND (r.team_id IS NULL OR t.status = 'active')
 	`)
 	if err != nil {
 		return fmt.Errorf("ExpireAnonymousWorker: query failed: %w", err)
 	}
 	defer rows.Close()
-
-	type toExpire struct {
-		id                 string
-		token              string
-		resourceType       string
-		providerResourceID string
-	}
 
 	var candidates []toExpire
 	for rows.Next() {
@@ -208,92 +229,9 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	// deletion executor) retries the teardown.
 	var expired int
 	for _, r := range candidates {
-		// deprovisionFailed gates the mark-deleted UPDATE below. true = a
-		// backend teardown call returned an error this tick; the row stays
-		// reapable so a later tick retries it instead of stranding the infra.
-		deprovisionFailed := false
-
-		// Deprovision — credentials become invalid immediately.
-		switch r.resourceType {
-		case "storage":
-			// Two-part cleanup for a storage resource:
-			//
-			//  1. Object deletion (the part that actually matters). On the
-			//     prod OBJECT_STORE_* backend (DO Spaces, shared key) the
-			//     tenant's objects live under its prefix in the shared
-			//     bucket — they must be deleted explicitly. Relying on the
-			//     24h bucket-lifecycle rule alone meant the row flipped to
-			//     'deleted' while the objects lingered.
-			//  2. Legacy MinIO IAM-user + policy cleanup. Only meaningful on
-			//     the self-hosted MinIO backend (per-customer IAM users).
-			//     With the OBJECT_STORE_* shared-key backend minioClient is
-			//     nil because no per-customer IAM was ever created.
-			deleteStorageObjects(ctx, w.objectDeleter, w.objectBucket, r.token, r.providerResourceID, r.id, job.ID)
-			if w.minioClient != nil {
-				deprovisionMinIOUser(ctx, w.minioClient, r.token, r.id, job.ID)
-			}
-		default:
-			// Physical teardown is keyed purely on resource_type + token +
-			// provider_resource_id — it makes no distinction between an
-			// 'anonymous' row (team_id IS NULL) and a claimed-but-unpaid
-			// 'free' row (team_id set). A free row carries a real
-			// provider_resource_id, so DeprovisionResource resolves the
-			// same backing infra (DROP DATABASE / DROP USER / etc.) and
-			// the credentials become invalid immediately, exactly as for
-			// the anonymous case.
-			if w.provisioner != nil {
-				resType := expireResourceTypeToProto(r.resourceType)
-				if resType != commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED {
-					if deprovErr := w.provisioner.DeprovisionResource(
-						ctx, r.token, r.providerResourceID, resType,
-					); deprovErr != nil {
-						// MR-P0-1a: a failed teardown must NOT advance the
-						// row to 'deleted'. Flag it so the mark-deleted
-						// UPDATE below is skipped; the row stays reapable
-						// and the next tick retries the DROP.
-						deprovisionFailed = true
-						slog.Warn("jobs.expire_anonymous.deprovision_failed",
-							"error", deprovErr,
-							"resource_id", r.id,
-							"resource_type", r.resourceType,
-							"token", logsafe.Token(r.token),
-							"job_id", job.ID,
-							"effect", "row left reapable for retry; NOT marked deleted (MR-P0-1a)",
-						)
-					}
-				}
-			}
+		if w.reapOne(ctx, job.ID, r) {
+			expired++
 		}
-
-		// MR-P0-1a: skip the mark-deleted UPDATE when the backend teardown
-		// failed this tick. Marking a row 'deleted' (a terminal, non-reapable
-		// status) with live backend infra behind it permanently orphans that
-		// infra — no reconciler ever revisits a 'deleted' row. Leaving the row
-		// reapable means the next reaper tick re-selects it and retries the
-		// DROP until it genuinely succeeds.
-		if deprovisionFailed {
-			metrics.ExpireDeprovisionFailedTotal.Inc()
-			continue
-		}
-
-		// Guarded UPDATE: mark deleted only from a non-terminal status, matching
-		// the SELECT above. Gating on status='active' alone would leave the
-		// paused/suspended rows we just deprovisioned stuck in their old status.
-		if _, err := w.db.ExecContext(ctx,
-			`UPDATE resources SET status = '`+resourcestatus.StatusDeleted.String()+`'
-			 WHERE id = $1 AND status IN (`+reapableStatusSQLList+`)`,
-			r.id,
-		); err != nil {
-			slog.Error("jobs.expire_anonymous.mark_deleted_failed",
-				"error", err,
-				"resource_id", r.id,
-				"resource_type", r.resourceType,
-				"job_id", job.ID,
-			)
-			continue
-		}
-		metrics.ExpiredResourcesTotal.Inc()
-		expired++
 	}
 
 	var activeAnon int
@@ -311,6 +249,209 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 		"job_id", job.ID,
 	)
 	return nil
+}
+
+// reapOne deprovisions and marks-deleted a single candidate row under a
+// SERIALIZED row lock so a concurrent `subscription.charged` webhook clearing
+// `expires_at` / promoting `tier` cannot race the reaper into dropping a
+// just-paid customer DB (MR-P1-5 / T5 P0-3, BugBash 2026-05-20).
+//
+// THE RACE (without this guard):
+//  1. Batch SELECT sees `tier='free' AND expires_at < now()` for row R.
+//  2. Customer's `subscription.charged` webhook fires;
+//     `ElevateResourceTiersByTeam` clears `expires_at` + sets `tier='pro'`.
+//  3. Reaper calls `DeprovisionResource` (DROP DATABASE / DROP USER) on R.
+//  4. Webhook completes; row R is now `tier='pro', expires_at=NULL`, status
+//     active — but the physical backing infra is gone.
+//
+// THE FIX: open a tx and `SELECT … FOR UPDATE` the row by id, re-confirming
+// the still-reapable predicate (tier IN ('anonymous','free'), expires_at past,
+// status reapable, team active). If the upgrade has won the race, the
+// re-confirmation returns false and we abort the deprovision. Otherwise we
+// run the deprovision and the mark-deleted UPDATE inside the same tx; the
+// upgrade webhook either blocked on the row lock (and now finds a `deleted`
+// row, its UPDATE is a no-op because `ElevateResourceTiersByTeam` filters
+// non-deleted statuses) or completed before our SELECT (in which case our
+// re-confirm finds the row already non-reapable and we skip).
+//
+// Defense-in-depth for T5 P1-7 ("don't reap a free row whose team is in
+// deletion_requested grace"): the re-confirm also rechecks teams.status. The
+// outer batch SELECT already filters teams.status='active', but a team
+// status flip between batch-select and per-row lock must still be honored.
+//
+// Returns true iff the row was deprovisioned + marked deleted (so the
+// caller increments the `expired` count); false if the row was skipped
+// (race lost / team grace / deprovision failed / commit failed).
+func (w *ExpireAnonymousWorker) reapOne(ctx context.Context, jobID int64, r toExpire) bool {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("jobs.expire_anonymous.begin_tx_failed",
+			"error", err,
+			"resource_id", r.id,
+			"resource_type", r.resourceType,
+			"job_id", jobID,
+		)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// Rollback is safe (and a no-op if we already committed). On the
+			// race-lost / deprovision-failed paths we want the tx aborted so
+			// the row lock releases and the next tick can reacquire it.
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Re-confirm the row still meets the reaper predicate while holding a
+	// row-exclusive lock. A concurrent upgrade webhook is blocked here until
+	// COMMIT/ROLLBACK; if it ran *before* we got the lock, the EXISTS returns
+	// false because tier/expires_at no longer match. We hold the lock across
+	// the deprovision RPC + UPDATE so the upgrade webhook either runs after
+	// the row is `deleted` (and its UPDATE is a no-op — `ElevateResourceTiers
+	// ByTeam` filters non-deleted statuses), or it already committed before
+	// our SELECT (and we abort with race_skipped).
+	//
+	// We don't use SKIP LOCKED — the reaper IS the authorized deletion path
+	// for this row class; if a concurrent updater holds the lock briefly we
+	// want to wait (sub-second), not skip and retry next tick (we already
+	// serialized SELECT→deprovision per row).
+	var stillReapable bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM resources r
+			LEFT JOIN teams t ON t.id = r.team_id
+			WHERE r.id = $1
+			  AND ((r.team_id IS NULL AND r.tier = 'anonymous') OR r.tier = 'free')
+			  AND r.status IN (`+reapableStatusSQLList+`)
+			  AND r.expires_at IS NOT NULL
+			  AND r.expires_at < now()
+			  AND (r.team_id IS NULL OR t.status = 'active')
+			FOR UPDATE OF r
+		)
+	`, r.id).Scan(&stillReapable); err != nil {
+		slog.Error("jobs.expire_anonymous.reconfirm_failed",
+			"error", err,
+			"resource_id", r.id,
+			"resource_type", r.resourceType,
+			"job_id", jobID,
+		)
+		return false
+	}
+	if !stillReapable {
+		// MR-P1-5 race won by the upgrade webhook (or the team flipped to a
+		// deletion grace state since batch-select). The row has been
+		// promoted to a paid tier / had expires_at cleared / the team
+		// entered deletion_requested. DO NOT deprovision — the customer
+		// just paid for, or is restoring, this resource.
+		metrics.ExpireRaceSkippedTotal.Inc()
+		slog.Info("jobs.expire_anonymous.race_skipped",
+			"resource_id", r.id,
+			"resource_type", r.resourceType,
+			"token", logsafe.Token(r.token),
+			"job_id", jobID,
+			"reason", "row no longer matches reaper predicate at FOR UPDATE re-confirm — "+
+				"upgrade webhook or team deletion grace won the race (MR-P1-5 / P1-7)",
+		)
+		return false
+	}
+
+	// deprovisionFailed gates the mark-deleted UPDATE below. true = a
+	// backend teardown call returned an error this tick; the row stays
+	// reapable (tx rolls back) so a later tick retries instead of stranding
+	// the infra.
+	deprovisionFailed := false
+
+	// Deprovision — credentials become invalid immediately.
+	switch r.resourceType {
+	case "storage":
+		// Two-part cleanup for a storage resource:
+		//
+		//  1. Object deletion (the part that actually matters). On the
+		//     prod OBJECT_STORE_* backend (DO Spaces, shared key) the
+		//     tenant's objects live under its prefix in the shared
+		//     bucket — they must be deleted explicitly. Relying on the
+		//     24h bucket-lifecycle rule alone meant the row flipped to
+		//     'deleted' while the objects lingered.
+		//  2. Legacy MinIO IAM-user + policy cleanup. Only meaningful on
+		//     the self-hosted MinIO backend (per-customer IAM users).
+		//     With the OBJECT_STORE_* shared-key backend minioClient is
+		//     nil because no per-customer IAM was ever created.
+		deleteStorageObjects(ctx, w.objectDeleter, w.objectBucket, r.token, r.providerResourceID, r.id, jobID)
+		if w.minioClient != nil {
+			deprovisionMinIOUser(ctx, w.minioClient, r.token, r.id, jobID)
+		}
+	default:
+		// Physical teardown is keyed purely on resource_type + token +
+		// provider_resource_id — it makes no distinction between an
+		// 'anonymous' row (team_id IS NULL) and a claimed-but-unpaid
+		// 'free' row (team_id set). A free row carries a real
+		// provider_resource_id, so DeprovisionResource resolves the
+		// same backing infra (DROP DATABASE / DROP USER / etc.) and
+		// the credentials become invalid immediately, exactly as for
+		// the anonymous case.
+		if w.provisioner != nil {
+			resType := expireResourceTypeToProto(r.resourceType)
+			if resType != commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED {
+				if deprovErr := w.provisioner.DeprovisionResource(
+					ctx, r.token, r.providerResourceID, resType,
+				); deprovErr != nil {
+					// MR-P0-1a: a failed teardown must NOT advance the
+					// row to 'deleted'. Flag it so the mark-deleted
+					// UPDATE below is skipped; the tx rolls back, the
+					// row stays reapable, the next tick retries the DROP.
+					deprovisionFailed = true
+					slog.Warn("jobs.expire_anonymous.deprovision_failed",
+						"error", deprovErr,
+						"resource_id", r.id,
+						"resource_type", r.resourceType,
+						"token", logsafe.Token(r.token),
+						"job_id", jobID,
+						"effect", "tx rollback; row left reapable for retry; NOT marked deleted (MR-P0-1a)",
+					)
+				}
+			}
+		}
+	}
+
+	// MR-P0-1a: skip the mark-deleted UPDATE when the backend teardown
+	// failed this tick. Marking a row 'deleted' (a terminal, non-reapable
+	// status) with live backend infra behind it permanently orphans that
+	// infra — no reconciler ever revisits a 'deleted' row.
+	if deprovisionFailed {
+		metrics.ExpireDeprovisionFailedTotal.Inc()
+		return false
+	}
+
+	// Guarded UPDATE: mark deleted only from a non-terminal status, matching
+	// the SELECT above. Runs inside the same tx as the FOR UPDATE so the row
+	// lock spans SELECT→deprovision→UPDATE.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE resources SET status = '`+resourcestatus.StatusDeleted.String()+`'
+		 WHERE id = $1 AND status IN (`+reapableStatusSQLList+`)`,
+		r.id,
+	); err != nil {
+		slog.Error("jobs.expire_anonymous.mark_deleted_failed",
+			"error", err,
+			"resource_id", r.id,
+			"resource_type", r.resourceType,
+			"job_id", jobID,
+		)
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		slog.Error("jobs.expire_anonymous.commit_failed",
+			"error", err,
+			"resource_id", r.id,
+			"resource_type", r.resourceType,
+			"job_id", jobID,
+		)
+		return false
+	}
+	committed = true
+	metrics.ExpiredResourcesTotal.Inc()
+	return true
 }
 
 // expireResourceTypeToProto maps a resource_type string to the protobuf enum.
