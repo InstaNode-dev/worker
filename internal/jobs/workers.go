@@ -662,6 +662,21 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		entitlementRegrader = entitlementRegraderAdapter{client: provClient}
 	}
 	river.AddWorker(workers, WithObservability(NewEntitlementReconcilerWorker(db, planRegistry, entitlementRegrader), nrApp))
+	// Propagation runner — eager consumer of `pending_propagations` (api
+	// migration 058). For every Razorpay subscription.charged the api
+	// commits the upgrade tx and enqueues one row; this runner drains
+	// the queue on a fast 30s cadence and dead-letters after
+	// propagationMaxAttempts with a `propagation.dead_lettered` audit
+	// row + structured ERROR slog line — the alert-able signal an
+	// operator keys on when the eager retry path can't deliver. The
+	// existing entitlement_reconciler stays the eventually-consistent
+	// 5-min backstop. See propagation_runner.go.
+	//
+	// Reuses entitlementRegrader (same provisioner.RegradeResource shape).
+	// When provClient is nil (PROVISIONER_ADDR unset) the runner is a
+	// WARN-noop each tick, matching the entitlement_reconciler's
+	// fail-open posture.
+	river.AddWorker(workers, WithObservability(NewPropagationRunnerWorker(db, planRegistry, entitlementRegrader), nrApp))
 	// Billing reconciler (P1 Wave-3 Cluster-B Slice 4). Every 15 minutes,
 	// compares Razorpay's live subscription state against teams.plan_tier and
 	// corrects divergence in both directions (upgrade catch-up AND grace/downgrade
@@ -1191,6 +1206,21 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 			river.PeriodicInterval(EntitlementReconcileInterval()),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return EntitlementReconcilerArgs{}, reconcileInsertOpts(EntitlementReconcileInterval())
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Propagation runner — cadence from PROPAGATION_RUNNER_INTERVAL
+		// (Go duration string; default 30s). Drains pending_propagations
+		// (api migration 058) — the event-driven retry path for "user
+		// upgraded but downstream didn't propagate". Routed to the
+		// reconcile queue so the fast 30s tick is isolated from the
+		// default queue's bulk fan-outs. RunOnStart=true so a worker
+		// restart immediately drains any rows that the api enqueued
+		// during the restart window.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(PropagationRunnerInterval()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PropagationRunnerArgs{}, reconcileInsertOpts(PropagationRunnerInterval())
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
