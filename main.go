@@ -20,6 +20,7 @@ import (
 	"instant.dev/worker/internal/db"
 	"instant.dev/worker/internal/handlers"
 	"instant.dev/worker/internal/jobs"
+	"instant.dev/worker/internal/migrations"
 	"instant.dev/worker/internal/obs"
 	"instant.dev/worker/internal/provisioner"
 	"instant.dev/worker/internal/telemetry"
@@ -126,10 +127,24 @@ func main() {
 	// k8s livenessProbe GETs /healthz — a 200 means the process and River are up.
 	// If this process is alive, River is running (startup failure exits above).
 	// If River's goroutines panic after start, Go crashes the process and k8s restarts.
+	//
+	// B14-F9 (BugBash 2026-05-20): /healthz JSON shape was missing the
+	// migration_version / migration_count / migration_status fields that
+	// the api emits, so a uniform cross-fleet health probe couldn't read a
+	// single shape. Worker shares the same platform DB as api so we read
+	// schema_migrations and surface the same three fields. The Reader
+	// caches for 60s — under readiness-probe traffic that means one extra
+	// SELECT per pod per minute.
+	migrationReader := migrations.NewReader(database, 0, nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"ok":true,"service":"instant-worker","commit_id":%q,"build_time":%q,"version":%q}`,
-			buildinfo.GitSHA, buildinfo.BuildTime, buildinfo.Version)
+		mstate := migrationReader.Get(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w,
+			`{"ok":true,"service":"instant-worker","commit_id":%q,"build_time":%q,"version":%q,"migration_version":%q,"migration_count":%d,"migration_status":%q}`,
+			buildinfo.GitSHA, buildinfo.BuildTime, buildinfo.Version,
+			mstate.Filename, mstate.Count, mstate.Status,
+		)
 	})
 	// /readyz — deep readiness probe (platform_db / redis / brevo /
 	// river). Wired to the k8s readinessProbe in the worker deployment

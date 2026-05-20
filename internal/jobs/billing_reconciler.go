@@ -48,6 +48,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,6 +61,15 @@ import (
 	"instant.dev/worker/internal/circuit"
 	"instant.dev/worker/internal/metrics"
 )
+
+// chargeUndeliverableAuditKind is the audit_log.kind value the api emits
+// when a Razorpay webhook trust-pass fails — it cannot resolve the
+// payload to a real team / plan_id / subscription. B11-F3 (BugBash
+// 2026-05-20): the worker scans for new rows on every reconciler tick
+// and increments BillingChargeUndeliverableTotal so a single NR alert
+// rule can fire on the metric, independent of which service wrote the
+// audit row. The literal mirrors api/internal/models.AuditKindBillingChargeUndeliverable.
+const chargeUndeliverableAuditKind = "billing.charge_undeliverable"
 
 // BillingReconcilerArgs is the River job payload — no fields, sweep job.
 type BillingReconcilerArgs struct{}
@@ -698,6 +708,14 @@ type BillingReconcilerWorker struct {
 	db      *sql.DB
 	fetcher subscriptionFetcher
 	grace   gracePeriodOpener
+
+	// chargeUndeliverableMu guards chargeUndeliverableCursor (B11-F3).
+	// One sweep at a time per pod — the cursor advances monotonically
+	// across ticks. Multiple worker pods are tolerated: each pod has its
+	// own cursor + counter; the metric aggregates pod-wise, and the
+	// audit_log row is the durable source of truth.
+	chargeUndeliverableMu     sync.Mutex
+	chargeUndeliverableCursor time.Time
 }
 
 // NewBillingReconcilerWorker constructs the worker.
@@ -979,6 +997,12 @@ done:
 	// next tick retries the orphan pass.
 	orphanScanned, orphanCorrected := w.runOrphanSweep(ctx)
 
+	// B11-F3 (BugBash 2026-05-20): scan audit_log for new
+	// billing.charge_undeliverable rows since the last tick. Fail-open —
+	// a DB blip just delays the metric update; the audit row itself is
+	// the durable signal.
+	chargeUndeliverableNew := w.scanChargeUndeliverable(ctx)
+
 	slog.Info("jobs.billing_reconciler.completed",
 		"teams_scanned", len(teams),
 		"gap_upgrade", gapUpgrade,
@@ -988,9 +1012,90 @@ done:
 		"razorpay_errors", razorpayErrors,
 		"orphan_scanned", orphanScanned,
 		"orphan_corrected", orphanCorrected,
+		"charge_undeliverable_new", chargeUndeliverableNew,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return nil
+}
+
+// scanChargeUndeliverable counts audit_log rows with
+// kind='billing.charge_undeliverable' since the last successful scan and
+// advances chargeUndeliverableCursor. The api emits these rows when a
+// Razorpay webhook payload trust-pass fails — see B11-F3 + the api
+// handler at internal/handlers/billing.go.
+//
+// First tick after pod boot uses a 1h look-back so we surface any rows
+// that landed in the brief window between an api emit and the worker's
+// first tick. After that the cursor tracks the high-watermark
+// created_at and only newer rows count.
+//
+// Returned: number of new rows seen this tick. On DB error returns 0
+// and does NOT advance the cursor (fail-open — retry next tick).
+func (w *BillingReconcilerWorker) scanChargeUndeliverable(ctx context.Context) int {
+	w.chargeUndeliverableMu.Lock()
+	cursor := w.chargeUndeliverableCursor
+	w.chargeUndeliverableMu.Unlock()
+	if cursor.IsZero() {
+		cursor = time.Now().UTC().Add(-1 * time.Hour)
+	}
+
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT created_at FROM audit_log
+		WHERE kind = $1 AND created_at > $2
+		ORDER BY created_at ASC
+		LIMIT 1000
+	`, chargeUndeliverableAuditKind, cursor)
+	if err != nil {
+		slog.Warn("jobs.billing_reconciler.charge_undeliverable_scan_failed",
+			"error", err, "note", "fail-open — retry next tick")
+		return 0
+	}
+	defer rows.Close()
+
+	var count int
+	var maxCreated time.Time
+	for rows.Next() {
+		var t time.Time
+		if scanErr := rows.Scan(&t); scanErr != nil {
+			slog.Warn("jobs.billing_reconciler.charge_undeliverable_scan_row_failed",
+				"error", scanErr)
+			continue
+		}
+		count++
+		if t.After(maxCreated) {
+			maxCreated = t
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		slog.Warn("jobs.billing_reconciler.charge_undeliverable_rows_error",
+			"error", rowsErr)
+		// Don't advance cursor — next tick re-scans the same window.
+		return 0
+	}
+
+	if count > 0 {
+		metrics.BillingChargeUndeliverableTotal.Add(float64(count))
+		// LOUD log per tick when count > 0 — operator + NR alert + audit row
+		// triangulation. Per CLAUDE.md rule: every code change considers NR
+		// dashboards + alerts (feedback_nr_observability_per_change).
+		slog.Error("jobs.billing_reconciler.charge_undeliverable_observed",
+			"new_rows", count,
+			"cursor_at", cursor,
+			"max_created_at", maxCreated,
+			"note", "api wrote billing.charge_undeliverable audit rows — webhook payload failed trust-pass; needs operator follow-up (B11-F3)",
+		)
+	}
+
+	// Advance the cursor to the latest seen row. If count==0 we still
+	// advance to now() — saves re-scanning the same empty window next
+	// tick, and there's nothing in the window to lose.
+	if maxCreated.IsZero() {
+		maxCreated = time.Now().UTC()
+	}
+	w.chargeUndeliverableMu.Lock()
+	w.chargeUndeliverableCursor = maxCreated
+	w.chargeUndeliverableMu.Unlock()
+	return count
 }
 
 // billingReconcilerOrphanRow is the projection the orphan sweep's SELECT over

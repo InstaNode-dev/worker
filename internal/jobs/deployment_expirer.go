@@ -155,7 +155,13 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 		// Step 2: audit emit. The BrevoForwarder drains audit_log every
 		// 60s and dispatches the "your deploy was removed" email —
 		// migrated 2026-05-14 from inline EmailClient.SendDeployExpired.
-		emitDeployExpiredAudit(w.db, r)
+		//
+		// B19-FIND-2 (BugBash 2026-05-20): pass the parent ctx so trace
+		// metadata (span/trace ID) propagates into the fire-and-forget
+		// audit goroutine. The audit emit itself decouples cancellation
+		// via context.WithoutCancel so the 3s budget survives the parent
+		// job's tick boundary.
+		emitDeployExpiredAudit(ctx, w.db, r)
 		metrics.DeployExpiredTotal.Inc()
 
 		slog.Info("jobs.deployment_expirer.expired",
@@ -181,7 +187,14 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 // MUST stay in sync with that builder.
 //
 // Best-effort, fire-and-forget per existing convention.
-func emitDeployExpiredAudit(db *sql.DB, r deployExpirerRow) {
+//
+// B19-FIND-2 (BugBash 2026-05-20): accepts a parent ctx so the trace
+// metadata (span/trace ID added by the Work tracer span) propagates into
+// the fire-and-forget goroutine. The audit's own 3s deadline is built on
+// context.WithoutCancel(parent) — keeps the trace baggage but decouples
+// cancellation, so the parent tick ending doesn't kill the in-flight
+// INSERT and lose the audit row.
+func emitDeployExpiredAudit(parent context.Context, db *sql.DB, r deployExpirerRow) {
 	meta, _ := json.Marshal(map[string]any{
 		"deploy_id":  r.id,
 		"team_id":    r.teamID,
@@ -192,7 +205,7 @@ func emitDeployExpiredAudit(db *sql.DB, r deployExpirerRow) {
 	// Fire-and-forget audit emit — routed through SafeGo (P1-B) so a panic
 	// in the INSERT path is recovered + counted instead of crashing the pod.
 	SafeGo("deployment_expirer.audit", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 3*time.Second)
 		defer cancel()
 		teamUUID, parseErr := uuid.Parse(r.teamID)
 		if parseErr != nil {
