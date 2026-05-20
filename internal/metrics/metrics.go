@@ -408,6 +408,96 @@ var (
 		Help: "Event-email forwarder hits on an audit_log row whose kind has a builder but no Go renderer. A non-zero rate means a kind is being silently dropped — fix the eventEmailBodyRenderers map.",
 	}, []string{"kind"})
 
+	// ── propagation_runner — unexpected_skip counter (CHAOS-DRILL-2026-05-20 F1) ─
+	//
+	// Every time the propagation_runner's per-resource RegradeResource call
+	// returns (Applied=false, SkipReason=<not in the allowed-skip whitelist>),
+	// this counter increments. Pre-fix the runner WARN-and-applied that case,
+	// silently stamping the propagation row as applied without the entitlement
+	// landing — a paying customer ended up with "Pro on paper, hobby-grade infra"
+	// and no alert (CHAOS-DRILL-2026-05-20 finding #1). Now the case is treated
+	// as a retryable error: the row retries via the backoff schedule and
+	// dead-letters at propagationMaxAttempts. This counter is the leading
+	// indicator; the dead-letter audit row is the alert-able lagging signal.
+	//
+	// Labels:
+	//
+	//   kind           — pending_propagations.kind ("tier_elevation", etc.).
+	//                    Bounded by propagationKnownKinds (~1-3 entries).
+	//
+	//   resource_type  — "postgres" | "redis" | "mongodb" (the offending
+	//                    resource class). Bounded by ResourceType enum.
+	//
+	//   skip_reason    — a SHORT canonical bucket derived from the raw
+	//                    skip_reason string ("postgres_admin_secret_missing",
+	//                    "namespace_not_found", "other"). The runner does
+	//                    the bucketing (jobs.bucketSkipReason) so cardinality
+	//                    stays bounded — never pass the raw SkipReason here.
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_propagation_unexpected_skip_total[15m])) > 0
+	//     for 30+ minutes → P2 page. A single isolated event is the
+	//     mid-deprovisioning-race signal; a sustained rate is a real
+	//     downstream regression and an operator must investigate before
+	//     the row dead-letters ~24h later.
+	PropagationUnexpectedSkipTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_propagation_unexpected_skip_total",
+		Help: "propagation_runner per-resource RegradeResource returned (Applied=false, SkipReason=<not in allowed-skip whitelist>). Leading indicator for the dead-letter alert.",
+	}, []string{"kind", "resource_type", "skip_reason"})
+
+	// ── propagation_runner — dead-letter + unknown-kind counters (CHAOS F2/F3) ─
+	//
+	// PropagationDeadLetteredTotal increments every time the propagation_runner
+	// transitions a row to failed_at + emits a propagation.*dead_lettered audit
+	// row. Two triggers feed this single metric, distinguished by `reason`:
+	//
+	//   reason="max_attempts" — the modal path. Per-resource RegradeResource
+	//                           failures, F1's unexpected_skip-as-failure, and
+	//                           markApplied DB failures all converge here once
+	//                           they reach propagationMaxAttempts.
+	//   reason="unknown_kind" — CHAOS F2: a worker pod that doesn't recognise
+	//                           a `kind` enqueued by a newer api image. Without
+	//                           the F2 fix these escape the maxAttempts ceiling.
+	//
+	// `kind` carries the row's pending_propagations.kind value for the
+	// max_attempts path (bounded by propagationKnownKinds — ~1-3 entries).
+	// The unknown_kind path passes kind="unknown_kind" as a bounded bucket,
+	// so an attacker-controlled api-side enqueue can't blow up worker
+	// label cardinality.
+	//
+	// NR alert (suggested):
+	//   rate(instant_propagation_dead_lettered_total[5m]) > 0 for 5m → P1 page.
+	//   propagation_runner is the last line of defence between Razorpay webhook
+	//   delivery and customer infra; any dead-letter means a paying customer's
+	//   regrade fell through (or, on the unknown_kind path, that a worker pod
+	//   is running an old image vs the api).
+	PropagationDeadLetteredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_propagation_dead_lettered_total",
+		Help: "propagation_runner rows transitioned to failed_at. Labelled by reason (max_attempts|unknown_kind) and kind (pending_propagations.kind, or 'unknown_kind' for F2's bounded bucket).",
+	}, []string{"reason", "kind"})
+
+	// PropagationUnknownKindTotal counts every TICK that picked up at least
+	// one row whose kind had no handler in propagationHandlers. Distinct
+	// from PropagationDeadLetteredTotal{reason="unknown_kind"} — that fires
+	// once at the END of the row's life (after maxAttempts), this fires on
+	// EVERY tick while the row is retrying. Lets the operator see "the
+	// worker is older than the api" within seconds rather than waiting the
+	// ~24h backoff for the dead-letter to land.
+	//
+	// `kind` is the raw pending_propagations.kind value. Bounded by the
+	// api-side enqueue surface (NOT by attacker input — only the api can
+	// INSERT into pending_propagations); the cardinality risk is accepted
+	// because in the rollback-drift scenario the operator wants to know
+	// EXACTLY which new kind their old worker is rejecting.
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_propagation_unknown_kind_total[5m])) by (kind) > 0
+	//     for 5m → P2 page. Action: finish the rollout.
+	PropagationUnknownKindTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_propagation_unknown_kind_total",
+		Help: "propagation_runner ticks that saw at least one row whose kind has no handler (image-skew indicator). Labelled by kind.",
+	}, []string{"kind"})
+
 	// readyzCheckStatusGauge — per-component readiness status surfaced by
 	// /readyz on this service's HTTP sidecar (:8091). See the matching
 	// gauge in the api repo at api/internal/metrics/metrics.go for the
