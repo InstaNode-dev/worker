@@ -1406,3 +1406,134 @@ func TestForwarderSent_AuditID_AlwaysUUID(t *testing.T) {
 		}
 	}
 }
+
+// TestEventForwarder_PersistsUpstreamProviderID is the regression test
+// for the messageId-capture pipeline (Wave 3, 2026-05-21; see Brevo
+// provider response-envelope parsing).
+//
+// Why this matters: forwarder_sent.provider_id is the lookup key the
+// receiver-side webhook (api .../webhooks/brevo/:secret) uses to match
+// async delivery events back to the ledger row — closes the
+// "201 ≠ delivered" gap. If the worker only ever wrote the synthetic
+// "audit-<id>" IdempotencyKey, every inbound Brevo webhook would miss
+// and delivery state would never overwrite the optimistic
+// classification='success' on the row.
+//
+// The provider already parses Brevo's `messageId` field and returns it
+// from SendEvent; the forwarder uses sendMessageID as ProviderID and
+// falls back to evt.IdempotencyKey only on "" (NoopProvider, or a
+// provider envelope that didn't parse).
+//
+// This test drives the fakeProvider.sendFnWithID hook (the messageId-
+// returning override) and asserts the ledger row carries the upstream
+// id verbatim — NOT the "audit-..." fallback.
+//
+// Coverage block (CLAUDE.md rule 17):
+//   Symptom:        forwarder_sent.provider_id == "audit-<id>" never matches
+//                   inbound Brevo events → delivery state silently stale
+//   Enumeration:    rg -n 'sendMessageID|parseBrevoMessageID' internal/jobs/ internal/email/
+//   Sites found:    1 provider parse (brevo_provider.go) + 1 forwarder consume
+//   Sites touched:  0 (already correct; this test pins the wiring)
+//   Coverage test:  TestEventForwarder_PersistsUpstreamProviderID
+//   Live verified:  deferred to deploy.yml verify-live step + Brevo webhook trace
+func TestEventForwarder_PersistsUpstreamProviderID(t *testing.T) {
+	const realAuditUUID = "11111111-2222-3333-4444-555555555555"
+	const upstreamMessageID = "<201906041434.20406ed00f7@smtp-relay.sendinblue.com>"
+
+	createdAt := time.Now().UTC().Add(-time.Hour) // inside the 48h floor
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow(realAuditUUID, "team-1", auditKindOnboardingClaimed, "",
+				"team claimed", []byte(`{"signup_source":"github"}`), createdAt, "owner@example.com"))
+
+	provider := &fakeProvider{
+		// Return the real upstream messageId on success — mirrors what
+		// BrevoProvider does after parseBrevoMessageID(respBody).
+		sendFnWithID: func(_ context.Context, _ email.EventEmail) (string, error) {
+			return upstreamMessageID, nil
+		},
+	}
+	cursor := &memCursor{}
+	ledger := newFakeLedger()
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.ledger = ledger
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	claim, ok := ledger.claims[realAuditUUID]
+	if !ok {
+		t.Fatalf("ledger.claims[%q] not present — markSent never ran", realAuditUUID)
+	}
+	if claim.ProviderID != upstreamMessageID {
+		t.Errorf("ledger.claims[%q].ProviderID = %q; want %q — the upstream messageId MUST flow into forwarder_sent.provider_id so the receiver-side Brevo webhook can match delivery events back to the ledger row (closes 201 ≠ delivered gap)",
+			realAuditUUID, claim.ProviderID, upstreamMessageID)
+	}
+	if strings.HasPrefix(claim.ProviderID, eventEmailIdempotencyPrefix) {
+		t.Errorf("ledger.claims[%q].ProviderID = %q starts with %q — that's the IdempotencyKey fallback. When the provider returns a real messageId, the fallback path must NOT be taken.",
+			realAuditUUID, claim.ProviderID, eventEmailIdempotencyPrefix)
+	}
+	// Classification on the success path must be ledgerClassSuccess —
+	// NOT permanent_drop. A regression that flips this would silently
+	// mark every send as "permanent_drop" in the ledger.
+	if claim.Classification != ledgerClassSuccess {
+		t.Errorf("ledger.claims[%q].Classification = %q; want %q (success-path classification)",
+			realAuditUUID, claim.Classification, ledgerClassSuccess)
+	}
+}
+
+// TestEventForwarder_ProviderIDFallback_OnEmptyMessageID guards the
+// fallback half of the contract: when the provider returns "" for the
+// messageId (NoopProvider, or a future provider whose envelope shape
+// didn't parse), ProviderID falls back to evt.IdempotencyKey
+// ("audit-<row-id>"). The fallback row is benign — it just won't match
+// any inbound webhook, which is already the orphan-event path the
+// receiver handles gracefully. (Wave 3, 2026-05-21.)
+func TestEventForwarder_ProviderIDFallback_OnEmptyMessageID(t *testing.T) {
+	const realAuditUUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow(realAuditUUID, "team-1", auditKindOnboardingClaimed, "",
+				"team claimed", []byte(`{"signup_source":"github"}`), createdAt, "owner@example.com"))
+
+	// Default fakeProvider (no sendFn / sendFnWithID set) → SendEvent
+	// returns ("", nil) — mirrors NoopProvider's behaviour.
+	provider := &fakeProvider{}
+	cursor := &memCursor{}
+	ledger := newFakeLedger()
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.ledger = ledger
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	claim, ok := ledger.claims[realAuditUUID]
+	if !ok {
+		t.Fatalf("ledger.claims[%q] not present", realAuditUUID)
+	}
+	// On empty upstream messageId, ProviderID MUST fall back to
+	// "audit-<row-id>" — NOT "" (which would render the ledger row
+	// unsupportable for grep) and NOT "missing_renderer" (which is
+	// reserved for the F4 path).
+	wantFallback := eventEmailIdempotencyPrefix + realAuditUUID
+	if claim.ProviderID != wantFallback {
+		t.Errorf("ledger.claims[%q].ProviderID = %q; want %q (when upstream returns no messageId, fallback to evt.IdempotencyKey is the documented behaviour)",
+			realAuditUUID, claim.ProviderID, wantFallback)
+	}
+}
