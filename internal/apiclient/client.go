@@ -89,8 +89,14 @@ func New(httpClient *http.Client) *Client {
 //   - HTTP 5xx response: counts as a failure (the api is signalling it
 //     can't serve us). The *http.Response is still returned so the
 //     caller can read the body for logging.
-//   - HTTP 4xx response: NOT a failure (it's our request that's wrong,
-//     not the api that's down). Caller decides how to handle.
+//   - HTTP 429 response: counts as a failure. Audit P3-5 / brief item 3:
+//     a 429 from the api is a rate-limit feedback signal — the worker
+//     should shed (slow down) rather than ignore it. Distinct from a
+//     server outage (5xx) but in the same "back off" bucket for breaker
+//     purposes. The *http.Response is still returned unchanged so the
+//     caller can read Retry-After / body for logging.
+//   - Other HTTP 4xx response: NOT a failure (it's our request that's
+//     wrong, not the api that's down). Caller decides how to handle.
 //   - HTTP 2xx/3xx: success — resets the consecutive-failure counter.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if !c.breaker.Allow() {
@@ -101,9 +107,17 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		c.breaker.Record(err)
 		return resp, err
 	}
-	// Treat 5xx as a failure for breaker purposes. 4xx is not a server
-	// outage signal — those should not trip the breaker.
+	// Treat 5xx as a failure for breaker purposes. 4xx (other than 429)
+	// is not a server outage signal — those should not trip the breaker.
 	if resp.StatusCode >= 500 {
+		c.breaker.Record(httpServerError{Code: resp.StatusCode})
+		return resp, nil
+	}
+	// 429 Too Many Requests — count as a Transient failure so the breaker
+	// paces the worker against the api's rate-limit feedback. Without this,
+	// a misconfigured worker would hammer the api forever; the breaker is
+	// the load-shedder of last resort.
+	if resp.StatusCode == http.StatusTooManyRequests {
 		c.breaker.Record(httpServerError{Code: resp.StatusCode})
 		return resp, nil
 	}

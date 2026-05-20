@@ -315,4 +315,39 @@ var (
 		Name: "instant_worker_goroutine_panics_recovered_total",
 		Help: "Panics recovered by the worker's fire-and-forget goroutine recovery helper, labelled by site.",
 	}, []string{"site"})
+
+	// ── fail-open visibility (CIRCUIT-RETRY-AUDIT-2026-05-20, P2 worker) ──────
+	//
+	// Every fail-open site in the worker — Redis errors, DB brownouts, Brevo
+	// suppression-lookup failures, GeoIP misses, k8s lookups — increments this
+	// counter so an SRE can alert on "fail-open rate above a baseline" without
+	// changing the fail-mode semantics of any particular site.
+	//
+	// Labels:
+	//
+	//   site   — stable, low-cardinality string identifying the call site
+	//            (e.g. "event_email_forwarder.bounce_suppression",
+	//            "billing_reconciler.upgrade_audit_insert", ...). NEVER
+	//            include team_id / resource_id / email — keep cardinality
+	//            bounded.
+	//
+	//   reason — short classification of WHAT the underlying failure was
+	//            ("redis_error", "db_error", "brevo_classify_failed",
+	//            "geoip_unknown"). Distinct from `site` so the operator can
+	//            slice by infrastructure (all redis_error sites) OR by job
+	//            (all billing_reconciler sites). Bounded by code path.
+	//
+	// NR alert (suggested): rate(instant_worker_fail_open_total[15m]) by site,
+	//   alert when a single site exceeds N events per minute sustained for
+	//   5+ minutes — that points straight at the brownout backend.
+	//
+	// IMPORTANT: incrementing this counter MUST be paired with a structured
+	// slog line that includes the key/value pair `fail_open=true` (or a
+	// `fail_open` slog.Bool attr) — see the helper in fail_open.go. The
+	// log line carries the high-cardinality context (team_id, error) that
+	// the metric must not.
+	FailOpenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_worker_fail_open_total",
+		Help: "Worker fail-open events (request proceeded despite a check failing). Labelled by call site and failure reason. Pair with the slog 'fail_open=true' field for context.",
+	}, []string{"site", "reason"})
 )

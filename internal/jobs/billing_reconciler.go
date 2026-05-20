@@ -392,8 +392,14 @@ func (d *dbGracePeriodOpener) OpenGracePeriod(ctx context.Context, teamID uuid.U
 		expiresAt.Format(time.RFC3339),
 	)
 	if auditErr != nil {
-		slog.Warn("billing.reconciler.grace_audit_insert_failed",
-			"team_id", teamID, "error", auditErr,
+		// Fail-open: grace period is already committed; a missing audit row
+		// only costs the dunning email. Surface via the fail-open metric so
+		// an SRE can alert on a sudden spike (DB brownout, schema drift).
+		RecordFailOpen(
+			"billing_reconciler.grace_audit_insert",
+			"db_error",
+			auditErr,
+			"team_id", teamID,
 		)
 	}
 	return nil
@@ -470,12 +476,32 @@ func (a *razorpayClientAdapter) FetchSubscription(subID string, queryParams map[
 	return a.c.Subscription.Fetch(subID, queryParams, extraHeaders)
 }
 
+// workerRazorpayHTTPTimeoutSeconds is the HTTP timeout (in seconds) applied to
+// the Razorpay SDK client used by the worker — billing reconciler fetcher and
+// orphan-sweep canceler both share this value.
+//
+// The Razorpay Go SDK's *default* http.Client.Timeout is 10s (see
+// requests.TIMEOUT in razorpay-go). The audit (CIRCUIT-RETRY-AUDIT-2026-05-20,
+// P1-6) flagged that the worker's reconciler ticks could be pinned for the
+// full job budget while waiting on a slow-but-up Razorpay. We deliberately
+// raise the deadline to 30s and explicitly pin it via SetTimeout — both so a
+// future SDK default change does not silently shift our deadline AND so the
+// "no explicit HTTP timeout" audit finding has a load-bearing constant to
+// reference. 30s matches what the api side does (P0-2 fix). Together with the
+// circuit breaker (5 consecutive failures → 60s cooldown) this caps the worst-
+// case tick blockage at ~150s instead of the entire River job timeout.
+const workerRazorpayHTTPTimeoutSeconds int16 = 30
+
 // NewRazorpaySubFetcher constructs a razorpaySubFetcher that reads credentials
 // from the environment. Returns (nil, nil) when RAZORPAY_KEY_ID is unset so
 // callers can fall back to noopSubFetcher without an error.
 //
 // The returned fetcher is NOT wrapped with the circuit breaker — the caller
 // (StartWorkers / WrapFetcherWithBreaker) adds that layer.
+//
+// The underlying razorpay.Client has its HTTP timeout pinned to
+// workerRazorpayHTTPTimeoutSeconds via SetTimeout — see that constant for the
+// audit rationale.
 func NewRazorpaySubFetcher() (*razorpaySubFetcher, error) {
 	keyID := os.Getenv("RAZORPAY_KEY_ID")
 	keySecret := os.Getenv("RAZORPAY_KEY_SECRET")
@@ -483,6 +509,9 @@ func NewRazorpaySubFetcher() (*razorpaySubFetcher, error) {
 		return nil, nil // unconfigured — use noop
 	}
 	c := razorpay.NewClient(keyID, keySecret)
+	// Pin the SDK's HTTP client timeout explicitly — see
+	// workerRazorpayHTTPTimeoutSeconds for the rationale (audit P1-6).
+	c.SetTimeout(workerRazorpayHTTPTimeoutSeconds)
 	return &razorpaySubFetcher{client: &razorpayClientAdapter{c: c}}, nil
 }
 
@@ -578,8 +607,56 @@ func (f *circuitSubFetcher) FetchSubscriptionForReconciler(ctx context.Context, 
 		return nil, errReconcilerCircuitOpen
 	}
 	out, err := f.inner.FetchSubscriptionForReconciler(ctx, subscriptionID)
-	f.breaker.Record(err)
+	// Filter caller-cancellations and bad-input errors out of the breaker's
+	// failure signal — mirrors the api-side P1-1 fix in
+	// api/internal/provisioner/client.go.
+	//
+	// Why: the breaker is a SERVER-trouble detector. A context that the
+	// caller cancelled (e.g. River job timeout, parent ctx Done) is not a
+	// signal that Razorpay is unhealthy; it's a signal the caller went
+	// away. Counting it would let a noisy local cancellation trip the
+	// breaker and shut Razorpay calls down for 60s for every other team.
+	// `errReconcilerCircuitOpen` and `errSubFetcherNotConfigured` are
+	// breaker-bookkeeping / config sentinels, not Razorpay failures, and
+	// must also not feed back into the breaker.
+	f.breaker.Record(reconcilerBreakerFilter(ctx, err))
 	return out, err
+}
+
+// reconcilerBreakerFilter returns the error that should be Record()'d
+// against the reconciler's Razorpay breaker. It returns nil for caller-
+// driven and config-driven errors that do NOT signal a Razorpay problem;
+// it passes through any genuine Razorpay / transport error so the breaker
+// still trips on a real upstream outage.
+//
+// The audit explicitly called this out (worker mirror of api P1-1): a
+// caller flooding the reconciler with cancelled contexts must not be able
+// to self-inflict a 60s outage on the breaker.
+func reconcilerBreakerFilter(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	// 1. Caller-driven cancellations / deadlines. ctx.Err() can be either
+	//    context.Canceled or context.DeadlineExceeded; both mean "we left
+	//    early", not "Razorpay is sick".
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		// The fetcher saw a non-context error but the caller's ctx is
+		// already done — almost certainly the call was abandoned. Don't
+		// count it.
+		return nil
+	}
+	// 2. Breaker bookkeeping / config sentinels — these aren't Razorpay
+	//    errors and must never feed back into the breaker.
+	if errors.Is(err, errReconcilerCircuitOpen) ||
+		errors.Is(err, errSubFetcherNotConfigured) {
+		return nil
+	}
+	// 3. Everything else (Razorpay 5xx, transport errors, parse errors)
+	//    is a genuine signal — pass through.
+	return err
 }
 
 // NewBillingReconcilerCircuitBreaker builds the reconciler's Razorpay circuit
@@ -1183,8 +1260,16 @@ func (w *BillingReconcilerWorker) emitUpgradeAudit(ctx context.Context, teamID u
 		        ))
 	`, teamID, fromTier, toTier, subID)
 	if err != nil {
-		slog.Warn("billing.reconciler.upgrade_audit_failed",
-			"team_id", teamID, "error", err,
+		// Fail-open: tier upgrade already committed; missing audit row
+		// only suppresses the upgrade email. Surface via fail-open counter
+		// so a DB brownout that swallows audit rows is alertable.
+		RecordFailOpen(
+			"billing_reconciler.upgrade_audit_insert",
+			"db_error",
+			err,
+			"team_id", teamID,
+			"from_tier", fromTier,
+			"to_tier", toTier,
 		)
 	}
 }
@@ -1203,8 +1288,15 @@ func (w *BillingReconcilerWorker) emitCancelAudit(ctx context.Context, teamID uu
 		        ))
 	`, teamID, fromTier, toTier, subID)
 	if err != nil {
-		slog.Warn("billing.reconciler.cancel_audit_failed",
-			"team_id", teamID, "error", err,
+		// Fail-open: downgrade already committed; missing audit row only
+		// suppresses the cancellation-confirmation email.
+		RecordFailOpen(
+			"billing_reconciler.cancel_audit_insert",
+			"db_error",
+			err,
+			"team_id", teamID,
+			"from_tier", fromTier,
+			"to_tier", toTier,
 		)
 	}
 }

@@ -5,6 +5,7 @@ package apiclient
 // real api anywhere — these are pure-Go unit tests.
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
@@ -182,5 +183,115 @@ func TestClient_NamedCorrectly(t *testing.T) {
 	c := New(nil)
 	if got := c.Breaker().Name(); got != "worker_api_client" {
 		t.Errorf("breaker name = %q; want 'worker_api_client'", got)
+	}
+}
+
+// TestClient_429TripsBreaker is the regression for CIRCUIT-RETRY-AUDIT-2026-05-20
+// (worker brief item 3 / audit P3-5): a 429 Too Many Requests response from the
+// api signals "back off, I'm rate-limiting you" — the worker must count it as
+// a Transient failure so the breaker can shed load. Before this fix, 429 was
+// silently ignored as a non-5xx response and the worker would hammer through
+// the rate-limit indefinitely.
+func TestClient_429TripsBreaker(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate_limited"}`)
+	}))
+	defer srv.Close()
+
+	c := New(&http.Client{Timeout: 1 * time.Second})
+
+	// apiClientCircuitThreshold consecutive 429s → breaker opens.
+	for i := 0; i < apiClientCircuitThreshold; i++ {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatalf("attempt %d: unexpected error: %v", i+1, err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d: want 429, got %d", i+1, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+	}
+	if c.Breaker().State() != circuit.StateOpen {
+		t.Fatalf("breaker should be OPEN after %d consecutive 429s, got %s",
+			apiClientCircuitThreshold, c.Breaker().State())
+	}
+
+	// Subsequent calls short-circuit — no server hit.
+	hitsBefore := hits.Load()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+	_, err := c.Do(req)
+	if !errors.Is(err, circuit.ErrOpen) {
+		t.Fatalf("want circuit.ErrOpen after 429-floods, got %v", err)
+	}
+	if hits.Load() != hitsBefore {
+		t.Fatal("server should not be hit while breaker is open")
+	}
+}
+
+// TestClient_Other4xxStillDoesNotTrip locks in that the 429 carve-out does NOT
+// silently bring 400/401/403/404 into the breaker. Those are client-side bugs
+// and the breaker is a server-trouble detector — keep them separate.
+func TestClient_Other4xxStillDoesNotTrip(t *testing.T) {
+	for _, code := range []int{400, 401, 403, 404, 422} {
+		code := code
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			c := New(&http.Client{Timeout: 1 * time.Second})
+			for i := 0; i < apiClientCircuitThreshold*5; i++ {
+				req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+				resp, err := c.Do(req)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				_ = resp.Body.Close()
+			}
+			if c.Breaker().State() != circuit.StateClosed {
+				t.Errorf("breaker should remain CLOSED on consistent %d responses, got %s",
+					code, c.Breaker().State())
+			}
+		})
+	}
+}
+
+// TestClient_429ResponseBodyStillReadable — the 429 carve-out returns the
+// *http.Response unchanged so the caller can read Retry-After / body for
+// logging. We rely on that property in github_deploy_dispatcher and
+// team_deletion_executor.
+func TestClient_429ResponseBodyStillReadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"slow_down"}`)
+	}))
+	defer srv.Close()
+
+	c := New(&http.Client{Timeout: 1 * time.Second})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status: got %d, want 429", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "42" {
+		t.Errorf("Retry-After header lost: got %q, want %q", got, "42")
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Contains(b, []byte("slow_down")) {
+		t.Errorf("body lost: got %q", b)
 	}
 }
