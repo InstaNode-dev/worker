@@ -16,24 +16,42 @@ package email
 //     "params":     { "<key>": "<value>", ... }
 //   }
 //
-// Result classification — these line up exactly with SendClass so the
-// forwarder doesn't need to know the wire format:
+// Result classification — the canonical table. Every Brevo POST takes one
+// of these branches; tests pin them per-code in brevo_provider_test.go.
 //
 //   2xx                              → nil                                            (success — forwarder advances cursor)
-//   401 / 403 (auth) / 429 (rate)    → *SendError{Class: SendClassTransient}          (forwarder HOLDS cursor — recoverable)
-//   4xx (400 / 422 payload reject)   → *SendError{Class: SendClassPermanent}          (forwarder advances + logs ERROR)
+//   401 / 403 (auth)                 → *SendError{Class: SendClassTransient}          (forwarder HOLDS cursor — token rotation recoverable)
+//   408 / 425 / 429                  → *SendError{Class: SendClassTransient}          (forwarder HOLDS cursor — back off + retry)
 //   5xx / network / timeout          → *SendError{Class: SendClassTransient}          (forwarder holds cursor)
+//   400 / 404 / 422 / other 4xx      → *SendError{Class: SendClassPermanent}          (forwarder advances + logs ERROR)
 //   no template configured for kind  → *SendError{Class: SendClassSkippedNoTemplate}  (forwarder advances silently)
 //
 // The "payload-4xx-advances" behaviour is deliberate: a single audit row
 // with malformed content (400/422) shouldn't block every event behind it
 // forever. We log loudly so the poisoned row is visible in the log stream.
 //
-// P0-1 (2026-05-19): 401/403/429 are NOT advanced. A bad/expired/revoked
-// API key (401/403) or a rate-limit (429) is an ACCOUNT-level condition,
-// recoverable without operator data loss — classifying it Permanent made
-// the forwarder silently drop every audit row in every batch. These now
-// map to Transient (cursor held) and log the alert-able auth_wall ERROR.
+// P0-1 (2026-05-19, re-confirmed BugBash 2026-05-20): 401/403/429 are NOT
+// advanced. A bad/expired/revoked API key (401/403) or a rate-limit (429) is
+// an ACCOUNT-level condition, recoverable without operator data loss —
+// classifying it Permanent made the forwarder silently drop every audit row
+// in every batch. These now map to Transient (cursor held) and log the
+// alert-able auth_wall / rate_limited entries. BugBash 2026-05-20 added
+// 408 (Request Timeout) and 425 (Too Early) to the explicit transient set
+// — both are recoverable upstream conditions, not per-row payload defects.
+//
+// Observability (BugBash 2026-05-20):
+//
+//   - Every send result (success + every error path) emits a single
+//     structured slog line carrying classification=<...>, status_code=<...>,
+//     provider="brevo", kind=<audit_log.kind>, idempotency_key=<X-Mailin-Custom>.
+//     The IdempotencyKey is "audit-<row-id>" so the log line acts as the
+//     audit-log-id cross-reference the brief requires.
+//
+//   - Every non-2xx outcome increments metrics.BrevoSendErrorsTotal
+//     {classification,status_code}. Network/transport errors record
+//     status_code="0" so the operator can distinguish "Brevo said no" from
+//     "we never reached Brevo" at the metric layer without grepping logs.
+//     Exposed on the worker /metrics endpoint registered in main.go.
 
 import (
 	"bytes"
@@ -43,7 +61,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
+
+	"instant.dev/worker/internal/metrics"
 )
 
 // ── Named constants — no inline strings for headers / endpoints / content-types.
@@ -360,48 +381,73 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 
 	resp, err := p.httpc.Do(req)
 	if err != nil {
-		// Network error, timeout, dns failure. Transient by definition.
+		// Network error, timeout, dns failure, TLS handshake failure, EOF
+		// before headers, context.DeadlineExceeded. By construction we have
+		// NO response — there is no status code to record, so the metric is
+		// labelled status_code="0" so an operator can distinguish "we never
+		// reached Brevo" from "Brevo returned something" at the metric layer
+		// without grepping logs. Transient because none of these are
+		// per-row payload defects.
+		const (
+			classification = "transient"
+			statusLabel    = "0" // no response observed
+		)
+		metrics.BrevoSendErrorsTotal.WithLabelValues(classification, statusLabel).Inc()
 		slog.Warn("email.brevo.http_failed",
+			"provider", providerNameBrevo,
+			"classification", classification,
+			"status_code", 0,
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
 			"path", string(path),
+			"audit_log_id", evt.IdempotencyKey,
 			"error", err,
 		)
 		return &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: http"}
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, brevoBodyReadCap))
+	statusLabel := strconv.Itoa(resp.StatusCode)
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		// Success path. We deliberately log `classification=success` (rather
+		// than omitting it) so an NR query for `classification:*` over the
+		// Brevo provider stream returns one row per send, not one row per
+		// failure. Useful for "send/error ratio" dashboards.
 		slog.Info("email.brevo.event_sent",
+			"provider", providerNameBrevo,
+			"classification", "success",
+			"status_code", resp.StatusCode,
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
-			"status", resp.StatusCode,
 			"path", string(path),
 			"template_id", tmplID,
+			"audit_log_id", evt.IdempotencyKey,
 		)
 		return nil
 
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		// P0-1 FIX (2026-05-19): 401/403 is an ACCOUNT-LEVEL auth failure
-		// (bad / expired / revoked BREVO_API_KEY) — NOT a per-row payload
-		// problem. It is transient from the queue's point of view: it
-		// resolves the instant an operator rotates the secret. Classifying
-		// it Permanent made the forwarder advance the cursor past every
-		// row in every batch, silently and unrecoverably dropping all
-		// email. Transient holds the cursor so nothing is lost and the
-		// backlog drains once the key is fixed.
+		// 401/403 is an ACCOUNT-LEVEL auth failure (bad / expired / revoked
+		// BREVO_API_KEY) — NOT a per-row payload problem. Transient from the
+		// queue's point of view: it resolves the instant an operator rotates
+		// the secret. Classifying Permanent (the pre-2026-05-19 behaviour)
+		// made the forwarder advance the cursor past every row in every
+		// batch, silently and unrecoverably dropping all email.
 		//
-		// This is logged at ERROR with a distinct, alert-able key
-		// (auth_wall) so an operator is paged before a batch is burned —
-		// the generic email.brevo.permanent_4xx key is for per-row
-		// payload rejects, not account auth failure.
+		// Logged at ERROR with a distinct, alert-able key (auth_wall) so
+		// an operator is paged before a batch is burned — the generic
+		// email.brevo.permanent_4xx key is for per-row payload rejects.
+		const classification = "transient"
+		metrics.BrevoSendErrorsTotal.WithLabelValues(classification, statusLabel).Inc()
 		slog.Error("email.brevo.auth_wall",
+			"provider", providerNameBrevo,
+			"classification", classification,
+			"status_code", resp.StatusCode,
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
-			"status", resp.StatusCode,
 			"path", string(path),
+			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 			"note", "account-level Brevo auth failure (bad/expired/revoked BREVO_API_KEY) — classified Transient, cursor held, email NOT lost; rotate the secret",
 		)
@@ -410,31 +456,49 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			Message: fmt.Sprintf("brevo: auth failure %d %s", resp.StatusCode, string(respBody)),
 		}
 
-	case resp.StatusCode == http.StatusTooManyRequests:
-		// P0-1 FIX (2026-05-19): 429 rate-limited is also recoverable —
-		// the row is fine, Brevo just wants us to back off. Transient so
-		// the cursor holds and the row retries next tick.
+	case resp.StatusCode == http.StatusRequestTimeout ||
+		resp.StatusCode == http.StatusTooEarly ||
+		resp.StatusCode == http.StatusTooManyRequests:
+		// 408 Request Timeout — Brevo edge dropped our request before
+		// finishing reads; retry will work.
+		// 425 Too Early — Brevo rejected a replay-suspect early-data
+		// request; a fresh handshake on retry succeeds.
+		// 429 Too Many Requests — rate limited; the row is fine, Brevo
+		// just wants us to back off. All three are recoverable upstream
+		// conditions, not per-row payload defects.
+		const classification = "transient"
+		metrics.BrevoSendErrorsTotal.WithLabelValues(classification, statusLabel).Inc()
 		slog.Warn("email.brevo.rate_limited",
+			"provider", providerNameBrevo,
+			"classification", classification,
+			"status_code", resp.StatusCode,
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
-			"status", resp.StatusCode,
 			"path", string(path),
+			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 		)
 		return &SendError{
 			Class:   SendClassTransient,
-			Message: fmt.Sprintf("brevo: rate limited %d %s", resp.StatusCode, string(respBody)),
+			Message: fmt.Sprintf("brevo: throttled %d %s", resp.StatusCode, string(respBody)),
 		}
 
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		// 400/422 and other 4xx = genuine per-row payload rejection. The
-		// row will never produce a valid send, so advancing the cursor is
-		// correct: holding it pins the whole queue on one bad row.
+		// 400/404/422 and other 4xx = genuine per-row payload rejection.
+		// The row will never produce a valid send, so advancing the cursor
+		// is correct: holding it pins the whole queue on one bad row.
+		// (408/425/429 are siphoned off in the case above; auth 401/403
+		// in the case before that.)
+		const classification = "permanent"
+		metrics.BrevoSendErrorsTotal.WithLabelValues(classification, statusLabel).Inc()
 		slog.Error("email.brevo.permanent_4xx",
+			"provider", providerNameBrevo,
+			"classification", classification,
+			"status_code", resp.StatusCode,
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
-			"status", resp.StatusCode,
 			"path", string(path),
+			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 		)
 		return &SendError{
@@ -444,11 +508,19 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 
 	default:
 		// 5xx — Brevo upstream issue. Hold cursor; retry next tick.
+		// Also catches anything ≥600 (RFC violation by upstream) and the
+		// theoretical 1xx/3xx leakage from net/http (which would not be a
+		// per-row defect either). All routed Transient as a fail-safe.
+		const classification = "transient"
+		metrics.BrevoSendErrorsTotal.WithLabelValues(classification, statusLabel).Inc()
 		slog.Warn("email.brevo.transient_5xx",
+			"provider", providerNameBrevo,
+			"classification", classification,
+			"status_code", resp.StatusCode,
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
-			"status", resp.StatusCode,
 			"path", string(path),
+			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 		)
 		return &SendError{

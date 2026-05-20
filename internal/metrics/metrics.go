@@ -350,4 +350,61 @@ var (
 		Name: "instant_worker_fail_open_total",
 		Help: "Worker fail-open events (request proceeded despite a check failing). Labelled by call site and failure reason. Pair with the slog 'fail_open=true' field for context.",
 	}, []string{"site", "reason"})
+
+	// ── Brevo send-classification (BugBash 2026-05-20 P0-1) ──────────────────
+	//
+	// Every Brevo POST that does NOT return a 2xx increments this counter,
+	// labelled by:
+	//
+	//   classification — one of "transient" / "permanent" / "skipped_no_template"
+	//                    (same vocabulary as email.SendClass.String()). Drives the
+	//                    NR alert that distinguishes "we're losing email" from
+	//                    "operator hasn't wired a template yet".
+	//
+	//   status_code    — the Brevo HTTP status as a string ("401", "429", "503",
+	//                    or "0" for a transport-level network/timeout error
+	//                    where there was no response). Bounded by HTTP — no
+	//                    cardinality explosion.
+	//
+	// NR alert (suggested):
+	//   rate(brevo_send_errors_total{classification="transient"}[5m]) > 0
+	//     for >10 min → operator-page (Brevo / network outage; cursor held
+	//     so email is recoverable but the backlog grows).
+	//   rate(brevo_send_errors_total{classification="permanent"}[15m]) > 0
+	//     → poisoned audit row(s); inspect the audit_log + log stream.
+	//
+	// IMPORTANT: this counter is provider-specific. SES has its own error
+	// model (smithy fault classifications) and will need its own
+	// ses_send_errors_total counter when the SES path is fully load-bearing —
+	// keeping them split avoids muddying "Brevo dropped 100 emails" alerts
+	// with SES throttles or vice versa.
+	BrevoSendErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "brevo_send_errors_total",
+		Help: "Brevo send classifications for non-2xx outcomes. Labelled by classification (transient|permanent|skipped_no_template) and status_code ('0' for network errors).",
+	}, []string{"classification", "status_code"})
+
+	// ── F4 missing-renderer counter (BugBash 2026-05-20) ──────────────────────
+	//
+	// Increments every time the event_email_forwarder sees an audit_log row
+	// whose kind has a builder but NO entry in eventEmailBodyRenderers. This
+	// is the exact failure mode of the 2026-05-15 expiry-email regression
+	// (resource.expiry_imminent shipped without a renderer; rows were
+	// silently consumed). The runtime counter is the backstop — the
+	// TestEventEmail_EverySupportedKindFullyWired registry test catches the
+	// half-registration at CI time, and this metric catches it in prod
+	// if anything ever slips past CI.
+	//
+	// Labelled by `kind` so the NR alert can name the offending registry
+	// entry. Kind cardinality is bounded by supportedAuditKinds (~30
+	// entries) — safe for Prometheus.
+	//
+	// NR alert (suggested):
+	//   sum(rate(email_missing_renderer_total[5m])) by (kind) > 0
+	//     for any 5m window → P1 page. A non-zero value means at least
+	//     one customer email kind is silently being dropped because a
+	//     deploy half-registered a new audit kind.
+	EmailMissingRendererTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "email_missing_renderer_total",
+		Help: "Event-email forwarder hits on an audit_log row whose kind has a builder but no Go renderer. A non-zero rate means a kind is being silently dropped — fix the eventEmailBodyRenderers map.",
+	}, []string{"kind"})
 )
