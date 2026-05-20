@@ -26,12 +26,17 @@ type NoopProvider struct{}
 // right signal here: the operator chose to disable email by leaving the
 // provider unset, not that the row is poisoned (Permanent) or that the
 // provider is having a bad day (Transient).
-func (n *NoopProvider) SendEvent(_ context.Context, evt EventEmail) error {
+//
+// Returns "" for the messageId — the noop provider never reaches a real
+// upstream, so there's no per-send id to surface. The forwarder's
+// markSent call falls back to EventEmail.IdempotencyKey in that case
+// (the historical behaviour pre the brief's worker change).
+func (n *NoopProvider) SendEvent(_ context.Context, evt EventEmail) (string, error) {
 	slog.Debug("email.noop.skip",
 		"kind", evt.Kind,
 		"recipient", evt.Recipient,
 	)
-	return &SendError{
+	return "", &SendError{
 		Class:   SendClassSkippedNoTemplate,
 		Message: "noop provider — EMAIL_PROVIDER unset",
 	}

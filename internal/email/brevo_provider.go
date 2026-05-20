@@ -239,14 +239,14 @@ type brevoRawSendRequest struct {
 //
 // Both paths classify the HTTP response identically per the table at the
 // top of this file.
-func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
+func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) (string, error) {
 	if evt.Recipient == "" {
 		// Defensive — the forwarder filters orphan rows before reaching
 		// here, but a future caller path might not. Permanent because
 		// the row will never sprout an email retroactively. Checked
 		// before the template lookup so a raw-render event with empty
 		// recipient short-circuits the same way.
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassPermanent,
 			Message: "brevo: empty recipient",
 		}
@@ -264,7 +264,7 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 		// Operator hasn't mapped this kind to a Brevo template yet —
 		// the forwarder advances the cursor silently. Brevo dedupe
 		// would do nothing useful here anyway since we never POSTed.
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassSkippedNoTemplate,
 			Message: fmt.Sprintf("brevo: no template configured for kind %q", evt.Kind),
 		}
@@ -284,24 +284,7 @@ func (p *BrevoProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
-		return &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: marshal payload"}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(body))
-	if err != nil {
-		// Request construction failure is almost certainly a malformed URL —
-		// a programming bug. Transient so the operator sees it on every tick
-		// until they fix it, instead of advancing past silently.
-		slog.Error("email.brevo.request_build_failed",
-			"kind", evt.Kind,
-			"error", err,
-		)
-		return &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: build request"}
-	}
-	req.Header.Set(headerAPIKey, p.apiKey)
-	req.Header.Set(headerContentType, contentTypeJSON)
-	if evt.IdempotencyKey != "" {
-		req.Header.Set(headerIdempotency, evt.IdempotencyKey)
+		return "", &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: marshal payload"}
 	}
 
 	return p.doRequest(ctx, evt, body, brevoSendPathTemplate, tmplID)
@@ -323,7 +306,7 @@ const (
 // dashboard-template path is bypassed entirely — Brevo just relays the
 // bytes. This is how anon.expiry_warning escapes the broken dashboard
 // template that hardcoded "6 hours" and rendered empty fields.
-func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
+func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) (string, error) {
 	if evt.Subject == "" {
 		// Subject is mandatory in the raw path — a Brevo POST with an
 		// empty subject string still delivers, but the recipient sees
@@ -333,7 +316,7 @@ func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
 			"kind", evt.Kind,
 			"recipient", maskEmail(evt.Recipient),
 		)
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassPermanent,
 			Message: "brevo: raw send missing subject",
 		}
@@ -351,7 +334,7 @@ func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
 			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
-		return &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: raw marshal"}
+		return "", &SendError{Class: SendClassPermanent, Cause: err, Message: "brevo: raw marshal"}
 	}
 	return p.doRequest(ctx, evt, body, brevoSendPathRaw, 0)
 }
@@ -360,7 +343,7 @@ func (p *BrevoProvider) sendRaw(ctx context.Context, evt EventEmail) error {
 // both template and raw branches. Identical wire-level behavior — the
 // only difference is the log label and the absence of a template id in
 // the raw path.
-func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []byte, path brevoSendPath, tmplID int) error {
+func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []byte, path brevoSendPath, tmplID int) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(body))
 	if err != nil {
 		// Request construction failure is almost certainly a malformed URL —
@@ -371,7 +354,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"path", string(path),
 			"error", err,
 		)
-		return &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: build request"}
+		return "", &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: build request"}
 	}
 	req.Header.Set(headerAPIKey, p.apiKey)
 	req.Header.Set(headerContentType, contentTypeJSON)
@@ -403,7 +386,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"audit_log_id", evt.IdempotencyKey,
 			"error", err,
 		)
-		return &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: http"}
+		return "", &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: http"}
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, brevoBodyReadCap))
@@ -415,6 +398,20 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		// than omitting it) so an NR query for `classification:*` over the
 		// Brevo provider stream returns one row per send, not one row per
 		// failure. Useful for "send/error ratio" dashboards.
+		//
+		// Parse Brevo's response envelope { "messageId":"<id>" } so the
+		// caller can persist the real upstream messageId into
+		// forwarder_sent.provider_id. That id is the lookup key the
+		// receiver-side webhook (api/.../webhooks/brevo/:secret) uses to
+		// match delivery events back to the ledger row — closes the
+		// "201 ≠ delivered" gap.
+		//
+		// Brevo's wire format for the 201 body is documented at
+		// https://developers.brevo.com/reference/sendtransacemail#response-201.
+		// On the off chance Brevo changes the body shape, we treat a parse
+		// failure as non-fatal: the send still succeeded, the forwarder
+		// just falls back to the IdempotencyKey for the ledger row.
+		msgID := parseBrevoMessageID(respBody)
 		slog.Info("email.brevo.event_sent",
 			"provider", providerNameBrevo,
 			"classification", "success",
@@ -424,8 +421,10 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"path", string(path),
 			"template_id", tmplID,
 			"audit_log_id", evt.IdempotencyKey,
+			"message_id", msgID,
+			"note", "201 == ACCEPTED by Brevo API, NOT delivered — actual delivery is async; the receiver-side webhook overwrites classification when relay outcome arrives",
 		)
-		return nil
+		return msgID, nil
 
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		// 401/403 is an ACCOUNT-LEVEL auth failure (bad / expired / revoked
@@ -451,7 +450,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"body", string(respBody),
 			"note", "account-level Brevo auth failure (bad/expired/revoked BREVO_API_KEY) — classified Transient, cursor held, email NOT lost; rotate the secret",
 		)
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassTransient,
 			Message: fmt.Sprintf("brevo: auth failure %d %s", resp.StatusCode, string(respBody)),
 		}
@@ -478,7 +477,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 		)
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassTransient,
 			Message: fmt.Sprintf("brevo: throttled %d %s", resp.StatusCode, string(respBody)),
 		}
@@ -501,7 +500,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 		)
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassPermanent,
 			Message: fmt.Sprintf("brevo: %d %s", resp.StatusCode, string(respBody)),
 		}
@@ -523,9 +522,33 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 			"audit_log_id", evt.IdempotencyKey,
 			"body", string(respBody),
 		)
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassTransient,
 			Message: fmt.Sprintf("brevo: %d %s", resp.StatusCode, string(respBody)),
 		}
 	}
+}
+
+// brevoSuccessEnvelope is the 201 response shape from POST /v3/smtp/email.
+// Brevo returns { "messageId":"<id>" } on the template path and the same
+// shape on the raw path. We only consume the messageId field; additional
+// fields (none today, but Brevo may add them) are ignored by json.Unmarshal.
+type brevoSuccessEnvelope struct {
+	MessageID string `json:"messageId"`
+}
+
+// parseBrevoMessageID extracts the messageId from a 2xx Brevo response
+// body. Returns "" on any parse failure or absent field — the caller
+// treats "" as a non-fatal fallback (forwarder uses the IdempotencyKey
+// for the ledger row instead). NEVER panics, NEVER returns an error —
+// the success path must not be broken by an envelope shape change.
+func parseBrevoMessageID(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var env brevoSuccessEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return ""
+	}
+	return env.MessageID
 }

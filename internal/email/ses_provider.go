@@ -127,13 +127,13 @@ func (p *SESProvider) Name() string { return providerNameSES }
 // an SES template name via p.templates, marshals evt.Params to JSON
 // (SES's TemplateData wire format), calls SendEmail, and classifies the
 // error per the table at the top of this file.
-func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
+func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) (string, error) {
 	tmplName, ok := p.templates[evt.Kind]
 	if !ok {
 		// Operator hasn't mapped this kind to an SES template yet —
 		// forwarder advances silently. No API call avoids burning
 		// SES quota on rows that wouldn't have rendered anything.
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassSkippedNoTemplate,
 			Message: fmt.Sprintf("ses: no template configured for kind %q", evt.Kind),
 		}
@@ -141,7 +141,7 @@ func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 	if evt.Recipient == "" {
 		// Defensive — forwarder filters orphan rows but a future caller path
 		// might not. Permanent: this row will never sprout an email later.
-		return &SendError{
+		return "", &SendError{
 			Class:   SendClassPermanent,
 			Message: "ses: empty recipient",
 		}
@@ -160,7 +160,7 @@ func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 			"recipient", maskEmail(evt.Recipient),
 			"error", err,
 		)
-		return &SendError{Class: SendClassPermanent, Cause: err, Message: "ses: marshal params"}
+		return "", &SendError{Class: SendClassPermanent, Cause: err, Message: "ses: marshal params"}
 	}
 
 	input := &sesv2.SendEmailInput{
@@ -176,17 +176,28 @@ func (p *SESProvider) SendEvent(ctx context.Context, evt EventEmail) error {
 		},
 	}
 
-	_, err = p.client.SendEmail(ctx, input)
+	out, err := p.client.SendEmail(ctx, input)
 	if err != nil {
-		return classifySESError(err, evt, tmplName)
+		return "", classifySESError(err, evt, tmplName)
+	}
+
+	// SES's SendEmailOutput.MessageId is the per-send opaque id — this is
+	// the value the forthcoming SES delivery webhook receiver will use to
+	// match callbacks back to the ledger row. Today only the api/Brevo
+	// receiver consumes provider_id; the SES surface is symmetrical for
+	// when SES delivery notifications land.
+	var msgID string
+	if out != nil && out.MessageId != nil {
+		msgID = *out.MessageId
 	}
 
 	slog.Info("email.ses.event_sent",
 		"kind", evt.Kind,
 		"recipient", maskEmail(evt.Recipient),
 		"template", tmplName,
+		"message_id", msgID,
 	)
-	return nil
+	return msgID, nil
 }
 
 // classifySESError maps an SES SDK error into a *SendError with the

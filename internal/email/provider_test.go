@@ -74,7 +74,7 @@ func TestFactory_UnknownProvider_Errors(t *testing.T) {
 // flagging permanent or transient errors.
 func TestNoopProvider_SendEventReturnsSkipped(t *testing.T) {
 	n := &NoopProvider{}
-	err := n.SendEvent(context.Background(), EventEmail{
+	_, err := n.SendEvent(context.Background(), EventEmail{
 		Kind:      "anything",
 		Recipient: "u@example.com",
 	})

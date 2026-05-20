@@ -144,7 +144,7 @@ func TestSESProvider_HappyPath(t *testing.T) {
 	fake := &fakeSESClient{}
 	p := newTestSESProvider(t, fake, map[string]string{"subscription.upgraded": "tier-upgraded-v1"})
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:           "subscription.upgraded",
 		Recipient:      "user@example.com",
 		RecipientName:  "User",
@@ -195,7 +195,7 @@ func TestSESProvider_MissingTemplate_SkipsNoTemplate(t *testing.T) {
 	fake := &fakeSESClient{}
 	p := newTestSESProvider(t, fake, map[string]string{"subscription.upgraded": "tier-upgraded-v1"})
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "experiment.conversion", // not in template map
 		Recipient: "x@example.com",
 	})
@@ -220,7 +220,7 @@ func TestSESProvider_EmptyTemplates_AllSkip(t *testing.T) {
 	p := newTestSESProvider(t, fake, map[string]string{})
 
 	for _, kind := range []string{"subscription.upgraded", "near_quota_wall", "admin.tier_changed"} {
-		err := p.SendEvent(context.Background(), EventEmail{
+		_, err := p.SendEvent(context.Background(), EventEmail{
 			Kind:      kind,
 			Recipient: "x@example.com",
 		})
@@ -240,7 +240,7 @@ func TestSESProvider_EmptyRecipient_ReturnsPermanent(t *testing.T) {
 	fake := &fakeSESClient{}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "subscription.upgraded",
 		Recipient: "",
 	})
@@ -260,7 +260,7 @@ func TestSESProvider_MessageRejected_IsPermanent(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.MessageRejected{Message: aws.String("recipient not verified")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "subscription.upgraded",
 		Recipient: "x@example.com",
 	})
@@ -280,7 +280,7 @@ func TestSESProvider_NotFoundException_IsPermanent(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.NotFoundException{Message: aws.String("template not found")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassPermanent {
 		t.Errorf("NotFoundException → %v; want SendClassPermanent", err)
@@ -292,7 +292,7 @@ func TestSESProvider_BadRequest_IsPermanent(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.BadRequestException{Message: aws.String("invalid template data")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassPermanent {
 		t.Errorf("BadRequestException → %v; want SendClassPermanent", err)
@@ -307,7 +307,7 @@ func TestSESProvider_AccountSuspended_IsPermanent(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.AccountSuspendedException{Message: aws.String("account suspended")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassPermanent {
 		t.Errorf("AccountSuspendedException → %v; want SendClassPermanent", err)
@@ -322,7 +322,7 @@ func TestSESProvider_Throttling_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.TooManyRequestsException{Message: aws.String("rate exceeded")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) {
 		t.Fatalf("got %T; want *SendError", err)
@@ -340,7 +340,7 @@ func TestSESProvider_SendingPaused_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.SendingPausedException{Message: aws.String("sending paused")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassTransient {
 		t.Errorf("SendingPausedException → %v; want SendClassTransient", err)
@@ -353,7 +353,7 @@ func TestSESProvider_InternalServiceError_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: &sestypes.InternalServiceErrorException{Message: aws.String("internal error")}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassTransient {
 		t.Errorf("InternalServiceErrorException → %v; want SendClassTransient", err)
@@ -366,7 +366,7 @@ func TestSESProvider_UnknownServerFault_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: &smithy.GenericAPIError{Code: "SomeFutureUpstreamFailure", Message: "x", Fault: smithy.FaultServer}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassTransient {
 		t.Errorf("unknown server-fault → %v; want SendClassTransient (fail-safe for unknown 5xx-likes)", err)
@@ -380,7 +380,7 @@ func TestSESProvider_UnknownClientFault_IsPermanent(t *testing.T) {
 	fake := &fakeSESClient{err: &smithy.GenericAPIError{Code: "SomeFutureClientError", Message: "x", Fault: smithy.FaultClient}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassPermanent {
 		t.Errorf("unknown client-fault → %v; want SendClassPermanent (advance past unrecognised 4xx)", err)
@@ -394,7 +394,7 @@ func TestSESProvider_AuthError_IsPermanent(t *testing.T) {
 	fake := &fakeSESClient{err: &smithy.GenericAPIError{Code: "UnrecognizedClientException", Message: "bad creds", Fault: smithy.FaultClient}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassPermanent {
 		t.Errorf("UnrecognizedClientException → %v; want SendClassPermanent", err)
@@ -418,7 +418,7 @@ func TestSESProvider_NetworkError_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: &fakeNetErr{msg: "connection refused"}}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassTransient {
 		t.Errorf("net.Error → %v; want SendClassTransient", err)
@@ -438,7 +438,7 @@ func TestSESProvider_ContextCanceled_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: ctx.Err()}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassTransient {
 		t.Errorf("context.DeadlineExceeded → %v; want SendClassTransient", err)
@@ -451,7 +451,7 @@ func TestSESProvider_UnknownError_IsTransient(t *testing.T) {
 	fake := &fakeSESClient{err: errors.New("something we don't model")}
 	p := newTestSESProvider(t, fake, nil)
 
-	err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
+	_, err := p.SendEvent(context.Background(), EventEmail{Kind: "subscription.upgraded", Recipient: "x@example.com"})
 	var se *SendError
 	if !errors.As(err, &se) || se.Class != SendClassTransient {
 		t.Errorf("unknown error → %v; want SendClassTransient (fail-safe hold)", err)
@@ -467,7 +467,7 @@ func TestSESProvider_TemplateDataIsFlatStringMap(t *testing.T) {
 	fake := &fakeSESClient{}
 	p := newTestSESProvider(t, fake, map[string]string{"subscription.upgraded": "tier-upgraded-v1"})
 
-	err := p.SendEvent(context.Background(), EventEmail{
+	_, err := p.SendEvent(context.Background(), EventEmail{
 		Kind:      "subscription.upgraded",
 		Recipient: "u@example.com",
 		Params:    map[string]string{"from_tier": "hobby", "to_tier": "pro", "mrr": "49"},

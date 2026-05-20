@@ -67,20 +67,32 @@ func fakeJobLocal[T river.JobArgs]() *river.Job[T] {
 type fakeProvider struct {
 	name    string
 	sendFn  func(ctx context.Context, evt email.EventEmail) error
-	calls   int32
-	lastEvt email.EventEmail
-	mu      sync.Mutex
+	// sendFnWithID, when set, overrides sendFn and lets a test return a
+	// per-send messageId alongside the error. Most tests just exercise
+	// the error-classification path so they use sendFn (which yields
+	// "" for the messageId); the messageId-capture tests use this.
+	sendFnWithID func(ctx context.Context, evt email.EventEmail) (string, error)
+	// messageID is the static value returned on SendEvent success when
+	// neither sendFnWithID nor sendFn is set. "" by default — the
+	// historical (pre-2026-05-20) behaviour.
+	messageID string
+	calls     int32
+	lastEvt   email.EventEmail
+	mu        sync.Mutex
 }
 
-func (f *fakeProvider) SendEvent(ctx context.Context, evt email.EventEmail) error {
+func (f *fakeProvider) SendEvent(ctx context.Context, evt email.EventEmail) (string, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.mu.Lock()
 	f.lastEvt = evt
 	f.mu.Unlock()
-	if f.sendFn != nil {
-		return f.sendFn(ctx, evt)
+	if f.sendFnWithID != nil {
+		return f.sendFnWithID(ctx, evt)
 	}
-	return nil
+	if f.sendFn != nil {
+		return "", f.sendFn(ctx, evt)
+	}
+	return f.messageID, nil
 }
 
 func (f *fakeProvider) Name() string {
