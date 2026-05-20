@@ -1288,3 +1288,31 @@ func TestEventForwarder_BuilderSkippedRow_NotWarn(t *testing.T) {
 		t.Errorf("cursor.ID = %q; want orphan-team-row — P2-1 keeps the cursor-advance behavior", cursor.c.ID)
 	}
 }
+
+// TestEventForwarder_CursorConstants_Pinned pins the absolute values of the
+// two cursor-defense constants so a future tightening/loosening is caught
+// at review time, not in production. P1-2 follow-up (Wave 3, 2026-05-21).
+//
+// Rationale: TestEventForwarder_FetchBatch_HasAgeFloor and
+// TestEventForwarder_MissingCursor_SeedsToNow already prove the BEHAVIOR is
+// wired end-to-end. This test pins the SHAPE of the defense — a future PR
+// that quietly drops eventEmailMaxAge to (say) 5 minutes (silently denies a
+// real backlog drain) or balloons eventEmailCursorSeedGrace to 24h (mass-
+// spams a wider window after a Redis wipe) trips this pinning test and
+// forces an explicit conversation.
+func TestEventForwarder_CursorConstants_Pinned(t *testing.T) {
+	if eventEmailMaxAge != 48*time.Hour {
+		t.Errorf("eventEmailMaxAge = %v; want 48h — see jobs.event_email_forwarder docstring before changing (P1-2)", eventEmailMaxAge)
+	}
+	if eventEmailCursorSeedGrace != 5*time.Minute {
+		t.Errorf("eventEmailCursorSeedGrace = %v; want 5m — cursor-loss replay window (P1-2)", eventEmailCursorSeedGrace)
+	}
+	// Defense-in-depth invariant: the seed grace MUST be strictly smaller
+	// than the absolute age floor. If grace ever exceeds the floor, a seeded
+	// cursor could outscan the floor and the 48h cap stops protecting against
+	// a Redis wipe.
+	if eventEmailCursorSeedGrace >= eventEmailMaxAge {
+		t.Fatalf("invariant violated: eventEmailCursorSeedGrace (%v) >= eventEmailMaxAge (%v); seed grace must replay strictly LESS than the absolute floor",
+			eventEmailCursorSeedGrace, eventEmailMaxAge)
+	}
+}
