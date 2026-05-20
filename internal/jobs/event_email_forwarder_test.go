@@ -743,18 +743,24 @@ func (m recentTimeArg) Match(v driver.Value) bool {
 // markSent returns; markCalls / releaseCalls / isSentCalls count
 // invocations so a test can assert idempotency behavior. seen records
 // claimed audit_ids so a re-run against the SAME fakeLedger behaves
-// like the real ON CONFLICT.
+// like the real ON CONFLICT. lastClaim captures the most recent
+// ledgerClaim passed to markSent so a test can assert the 059 audit
+// columns flow through correctly.
 type fakeLedger struct {
 	mu           sync.Mutex
 	seen         map[string]bool
+	claims       map[string]ledgerClaim
 	isSentCalls  int
 	markCalls    int
 	releaseCalls int
 	markErr      error
 	isSentErr    error
+	lastClaim    ledgerClaim
 }
 
-func newFakeLedger() *fakeLedger { return &fakeLedger{seen: map[string]bool{}} }
+func newFakeLedger() *fakeLedger {
+	return &fakeLedger{seen: map[string]bool{}, claims: map[string]ledgerClaim{}}
+}
 
 func (l *fakeLedger) isSent(_ context.Context, auditID string) (bool, error) {
 	l.mu.Lock()
@@ -766,17 +772,19 @@ func (l *fakeLedger) isSent(_ context.Context, auditID string) (bool, error) {
 	return l.seen[auditID], nil
 }
 
-func (l *fakeLedger) markSent(_ context.Context, auditID string) (bool, error) {
+func (l *fakeLedger) markSent(_ context.Context, c ledgerClaim) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.markCalls++
+	l.lastClaim = c
 	if l.markErr != nil {
 		return false, l.markErr
 	}
-	if l.seen[auditID] {
+	if l.seen[c.AuditID] {
 		return false, nil // already claimed — duplicate
 	}
-	l.seen[auditID] = true
+	l.seen[c.AuditID] = true
+	l.claims[c.AuditID] = c
 	return true, nil
 }
 
@@ -785,6 +793,7 @@ func (l *fakeLedger) release(_ context.Context, auditID string) error {
 	defer l.mu.Unlock()
 	l.releaseCalls++
 	delete(l.seen, auditID)
+	delete(l.claims, auditID)
 	return nil
 }
 
@@ -1080,17 +1089,33 @@ func TestEventForwarder_SuppressionUsesSentRecipient(t *testing.T) {
 	}
 }
 
-// TestEventForwarder_MissingRenderer_LoudErrorNoAdvance is the F4
-// regression test.
+// TestEventForwarder_MissingRenderer_LoudErrorDropAndAdvance is the F4
+// regression test (BugBash 2026-05-20 reshape).
 //
-// BUG: a kind registered in eventEmailBuilders but missing from
-// eventEmailBodyRenderers fell through to the dead Brevo dashboard-
-// template path → SkippedNoTemplate → cursor advanced silently → zero
-// email, zero error, audit row consumed forever. With the fix a missing
-// renderer is a loud ERROR and the cursor is HELD (not advanced). This
-// test temporarily registers a builder-only kind and asserts the cursor
-// does NOT advance and the provider is never called.
-func TestEventForwarder_MissingRenderer_LoudErrorNoAdvance(t *testing.T) {
+// BUG (pre-2026-05-19): a kind registered in eventEmailBuilders but
+// missing from eventEmailBodyRenderers fell through to the dead Brevo
+// dashboard-template path → SkippedNoTemplate → cursor advanced silently
+// → zero email, zero error, audit row consumed forever.
+//
+// EARLIER FIX (2026-05-19): made a missing renderer a loud ERROR but
+// HELD the cursor (would pin the queue behind a programming bug until
+// the registry was repaired).
+//
+// CURRENT FIX (2026-05-20, F4 reshape): a missing renderer is now
+// (a) a loud ERROR with the literal message "missing_email_renderer",
+// (b) increments metrics.EmailMissingRendererTotal{kind},
+// (c) inserts a forwarder_sent row with classification='permanent_drop'
+//     / provider='none' / provider_id='missing_renderer' so support can
+//     grep the ledger, and
+// (d) ADVANCES the cursor — the row will never produce an email so
+//     pinning the queue is worse than dropping it. The CI registry test
+//     TestEventEmail_EverySupportedKindFullyWired catches the half-
+//     registration at gate time; this is the runtime backstop.
+//
+// This test feeds the worker an orphan kind (builder, no renderer) and
+// asserts: provider is NOT called, cursor IS advanced, and the
+// fakeLedger sees one permanent_drop claim for the orphan row.
+func TestEventForwarder_MissingRenderer_LoudErrorDropAndAdvance(t *testing.T) {
 	const orphanKind = "test.builder_without_renderer"
 	// Register a builder but deliberately NO renderer; clean up after.
 	eventEmailBuilders[orphanKind] = func(row auditRow) (map[string]string, bool) {
@@ -1116,20 +1141,37 @@ func TestEventForwarder_MissingRenderer_LoudErrorNoAdvance(t *testing.T) {
 
 	provider := &fakeProvider{
 		sendFn: func(_ context.Context, _ email.EventEmail) error {
-			t.Errorf("SendEvent called for a kind with no renderer — should have errored before send")
+			t.Errorf("SendEvent called for a kind with no renderer — should have dropped before send")
 			return nil
 		},
 	}
 	cursor := &memCursor{}
+	ledger := newFakeLedger()
 	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	w.ledger = ledger
 	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
-	if !cursor.c.zero() {
-		t.Errorf("cursor advanced past a kind with no renderer (%+v); want HELD — a missing renderer must not silently consume the audit row (F4)", cursor.c)
+	if cursor.c.ID != "orphan-id" {
+		t.Errorf("cursor.ID = %q after missing-renderer drop; want orphan-id (cursor MUST advance — the row can never produce an email so pinning the queue is wrong) (F4)", cursor.c.ID)
 	}
 	if got := provider.callCount(); got != 0 {
 		t.Errorf("SendEvent called %d times for a renderer-less kind; want 0", got)
+	}
+	if ledger.markCalls != 1 {
+		t.Errorf("ledger.markSent called %d times; want 1 (the F4 path must write a permanent_drop row)", ledger.markCalls)
+	}
+	if ledger.lastClaim.Classification != ledgerClassPermanentDrop {
+		t.Errorf("ledger.lastClaim.Classification = %q; want %q (F4 must classify as permanent_drop so support can grep)", ledger.lastClaim.Classification, ledgerClassPermanentDrop)
+	}
+	if ledger.lastClaim.Provider != providerNoneMissingRenderer {
+		t.Errorf("ledger.lastClaim.Provider = %q; want %q (F4 path didn't call a provider)", ledger.lastClaim.Provider, providerNoneMissingRenderer)
+	}
+	if ledger.lastClaim.ProviderID != providerIDMissingRenderer {
+		t.Errorf("ledger.lastClaim.ProviderID = %q; want %q (F4 sentinel)", ledger.lastClaim.ProviderID, providerIDMissingRenderer)
+	}
+	if ledger.lastClaim.TemplateKind != orphanKind {
+		t.Errorf("ledger.lastClaim.TemplateKind = %q; want %q (the kind that hit the F4 path)", ledger.lastClaim.TemplateKind, orphanKind)
 	}
 }
 

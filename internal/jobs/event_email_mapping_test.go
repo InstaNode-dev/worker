@@ -36,6 +36,29 @@ func TestEventEmail_EverySupportedKindFullyWired(t *testing.T) {
 	}
 }
 
+// TestEventEmail_EveryBuilderHasARenderer is the F4 (BugBash 2026-05-20)
+// inverse coverage test. The TestEventEmail_EverySupportedKindFullyWired
+// pass already walks supportedAuditKinds; this one walks the
+// eventEmailBuilders map directly so a kind that has a builder (the F4
+// failure shape) is caught at CI even if the author forgot to add it to
+// supportedAuditKinds. The 2026-05-15 expiry-email regression had
+// EXACTLY this shape: resource.expiry_imminent had a builder + a sketchy
+// rendering path through the dashboard template, but no Go renderer.
+// This test would have failed it at gate time.
+//
+// Per CLAUDE rule 18 the test iterates the LIVE registry, not a
+// hand-typed slice.
+func TestEventEmail_EveryBuilderHasARenderer(t *testing.T) {
+	for kind := range eventEmailBuilders {
+		if _, ok := eventEmailBodyRenderers[kind]; !ok {
+			t.Errorf("F4 registry guard: eventEmailBuilders has entry for %q but eventEmailBodyRenderers does NOT — "+
+				"a runtime row of this kind would hit the F4 missing_renderer path, log ERROR \"missing_email_renderer\", "+
+				"emit email_missing_renderer_total{kind=%q}, write a permanent_drop forwarder_sent row, and silently drop the email. "+
+				"Fix: add a renderer to eventEmailBodyRenderers for this kind.", kind, kind)
+		}
+	}
+}
+
 // TestEventEmail_W2KindsRegistered pins the W2 fix: the nine audit kinds
 // whose rows were being written by a producer but had NO email path. A
 // paying customer whose card fails (payment.grace_*) previously got ZERO
