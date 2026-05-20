@@ -91,8 +91,21 @@ const (
 // would defeat the worker-wide PII discipline (see logsafe.go in
 // internal/email/ + the api models.MaskEmail mirror).
 type ledgerClaim struct {
+	// AuditID MUST be the canonical UUID of the audit_log row (i.e.
+	// `audit_log.id::text` as read by fetchBatch). It must NOT be the
+	// "audit-<id>" idempotency-key prefix — that prefix is for the
+	// outbound provider header, never for the database column. The api
+	// migration 063 (forwarder_sent.audit_id soft FK) relies on this
+	// invariant: any non-UUID write would orphan the row from the
+	// audit_log parent. See TestForwarderSent_AuditID_AlwaysUUID for
+	// the registry-iterating coverage that pins every call site.
 	AuditID        string
 	Provider       string
+	// ProviderID is the upstream messageId (e.g. Brevo's `messageId`),
+	// falling back to evt.IdempotencyKey ("audit-<row-id>") only when
+	// the provider didn't surface one. NOT a UUID — explicit string-
+	// shaped, deliberately, because providers vary. Distinct from
+	// AuditID above.
 	ProviderID     string
 	Recipient      string // MUST be pre-masked by the caller
 	TemplateKind   string
