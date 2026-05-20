@@ -48,6 +48,47 @@ const queueBilling = "billing"
 // workers can shorten this via `Timeout()` on the worker; none currently do.
 const globalJobTimeout = 20 * time.Minute
 
+// rescueStuckJobsAfter overrides River's default JobRescuer threshold.
+//
+// CHAOS F4 (CHAOS-DRILL-2026-05-20):
+// River's default `RescueStuckJobsAfter` is `JobTimeout + JobRescuerRescueAfterDefault`
+// (= 20m + 1h = 1h20m). That sets an 80-minute RTO ceiling on any
+// catastrophic worker death (OOMKill / pod eviction / hard segfault) where
+// River's client never gets to mark the job back to `available` itself —
+// the only path back to the queue is the JobRescuer's sweep, which by
+// default won't touch a `running` row until it's been "running" (per
+// the row's `attempted_at` timestamp) for the full 80 minutes.
+//
+// 25 minutes is the explicit RTO floor we chose:
+//
+//   - globalJobTimeout = 20 minutes already bounds any LEGITIMATELY long
+//     job (the ~17-minute billing reconciler is the longest). A worker
+//     that survived would have already returned from Work() by then; the
+//     rescuer only needs to handle the case where the worker died WITHOUT
+//     returning.
+//
+//   - 5 minutes of headroom past JobTimeout absorbs queue jitter, kube
+//     liveness-probe restarts, etc., without falsely rescuing a job that
+//     would have returned within milliseconds of timing out.
+//
+//   - 25m matches the propagation_runner's worst-case backoff step at
+//     attempts ~3 (15 min) plus its dispatch budget, so a rescued
+//     propagation row joins the natural retry rhythm rather than
+//     thrashing.
+//
+// Trade-off: a job that legitimately runs slightly longer than
+// JobTimeout (impossible today — all workers respect ctx) would be
+// duplicate-rescued. Acceptable: every job in this worker is idempotent
+// (provisioner.RegradeResource, customer-backup s3 put with checksum,
+// brevo send keyed by audit_log row id, etc.) so a re-execution is a
+// no-op rather than a double-effect.
+//
+// Pinning this in code means a future River bump (whose default might
+// shift) can't quietly regress our worst-case RTO. The companion test
+// `TestWorker_RiverConfig_RescueStuckJobsAfterIs25Min` asserts the
+// constructed config carries exactly this value.
+const rescueStuckJobsAfter = 25 * time.Minute
+
 // periodicUniqueOpts is the UniqueOpts EVERY periodic job must carry
 // (P1-W3-07 / P1-W4-06 / P2-W5-05). The worker runs at replicas:2 — without
 // a uniqueness guard, both pods' River clients independently enqueue the
@@ -774,6 +815,14 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		// on a runaway. Individual jobs that need a longer or shorter ceiling
 		// can override via `Timeout()` on the worker (none currently do).
 		JobTimeout: globalJobTimeout,
+		// CHAOS F4 (CHAOS-DRILL-2026-05-20): cap the worst-case RTO of a
+		// catastrophic worker death (OOMKill / pod eviction / segfault).
+		// Without this, River defaults to JobTimeout + JobRescuerRescueAfterDefault
+		// (= 20m + 1h = 1h20m), giving an 80-minute RTO on dropped jobs.
+		// 25m = JobTimeout + 5m of jitter headroom. See the comment on
+		// rescueStuckJobsAfter for the full rationale. Pinned by
+		// TestWorker_RiverConfig_RescueStuckJobsAfterIs25Min.
+		RescueStuckJobsAfter: rescueStuckJobsAfter,
 	})
 	if err != nil {
 		slog.Error("jobs.workers.client_init_failed", "error", err)
@@ -790,9 +839,17 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		return &Workers{started: false}
 	}
 
+	// CHAOS F4 (CHAOS-DRILL-2026-05-20): stamp the rescue-stuck-jobs threshold
+	// in the startup line so an operator's live `kubectl logs` grep for
+	// `rescue_stuck_jobs_after` after a roll confirms the pinned RTO is in
+	// effect (rather than reverting to the River default of 1h20m). Pair
+	// with TestWorker_RiverConfig_RescueStuckJobsAfterIs25Min — the test
+	// is the build-time gate; this log line is the runtime confirmation.
 	slog.Info("jobs.workers.started",
 		"queues", fmt.Sprintf("%v", []string{river.QueueDefault, queueReconcile, queueBilling}),
 		"max_workers", 5,
+		"job_timeout", globalJobTimeout.String(),
+		"rescue_stuck_jobs_after", rescueStuckJobsAfter.String(),
 	)
 
 	return &Workers{
