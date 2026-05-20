@@ -1,4 +1,4 @@
-.PHONY: build test gate docker-build run smoke-buildinfo
+.PHONY: build test gate docker-build run smoke-buildinfo chaostest chaostest-propagation chaostest-lease-recovery
 
 # Build-time metadata injected into instant.dev/common/buildinfo via -ldflags.
 # Override on the make line if needed. GIT_SHA falls back to "dev" when not
@@ -47,3 +47,21 @@ smoke-buildinfo:
 	  echo "$$out" | grep -q "Version=smoke-ver" || (echo "FAIL: $$out" && exit 1) && \
 	  echo "smoke-buildinfo: OK ($$out)" && \
 	  rm -rf $$tmpdir
+
+# ── chaostest targets (CHAOS-DRILL-2026-05-20) ──
+# These targets are convenience shims — the actual chaos tests live in
+# api/e2e/{propagation,lease_recovery}_chaos_test.go (the api repo owns
+# the e2e harness; the worker repo owns the stub job + workers wiring).
+#
+# `make chaostest` from this repo runs BOTH drills via the api Makefile.
+# Requires the api repo to be a sibling on disk at ../api (the standard
+# `~/Documents/InstaNode/{api,worker}` layout).
+chaostest: chaostest-propagation chaostest-lease-recovery
+
+chaostest-propagation:
+	@: $${E2E_PLATFORM_DB_URL:?set E2E_PLATFORM_DB_URL — see CHAOS-DRILL-2026-05-20.md}
+	$(MAKE) -C ../api chaostest-propagation
+
+chaostest-lease-recovery:
+	@: $${E2E_PLATFORM_DB_URL:?set E2E_PLATFORM_DB_URL — see CHAOS-DRILL-2026-05-20.md}
+	$(MAKE) -C ../api chaostest-lease-recovery

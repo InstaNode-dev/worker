@@ -677,6 +677,12 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// WARN-noop each tick, matching the entitlement_reconciler's
 	// fail-open posture.
 	river.AddWorker(workers, WithObservability(NewPropagationRunnerWorker(db, planRegistry, entitlementRegrader), nrApp))
+	// chaos_lease_recovery (CHAOS-DRILL-2026-05-20). Stub job used ONLY by
+	// the lease-takeover chaos drill. Never enqueued in normal operation —
+	// the drill test inserts the row directly into river_job and asserts
+	// that River's rescuer re-leases it to a sibling worker after a forced
+	// pod kill. See chaos_lease_recovery.go header for the full procedure.
+	river.AddWorker(workers, WithObservability(NewChaosLeaseRecoveryWorker(db), nrApp))
 	// Billing reconciler (P1 Wave-3 Cluster-B Slice 4). Every 15 minutes,
 	// compares Razorpay's live subscription state against teams.plan_tier and
 	// corrects divergence in both directions (upgrade catch-up AND grace/downgrade
