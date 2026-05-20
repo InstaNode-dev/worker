@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/lib/pq"
@@ -47,7 +48,79 @@ import (
 	"go.opentelemetry.io/otel"
 
 	"instant.dev/worker/internal/email"
+	"instant.dev/worker/internal/metrics"
 )
+
+// ── forwarder_sent classification constants (migration 059) ───────────────
+//
+// Named constants per CLAUDE.md feedback_no_hardcoded_strings. The
+// `classification` column on forwarder_sent records the terminal outcome
+// of one forwarding attempt. Today only two values land: ledgerClassSuccess
+// (a confirmed 2xx) and ledgerClassPermanentDrop (a terminal-but-no-2xx
+// outcome — F4 missing_renderer + provider Permanent / SkippedNoTemplate).
+// The transient_retry value is reserved for a future per-attempt audit;
+// the current ordering keeps no ledger row for a Transient send (so the
+// next tick retries cleanly).
+const (
+	ledgerClassSuccess       = "success"
+	ledgerClassPermanentDrop = "permanent_drop"
+	ledgerClassTransient     = "transient_retry"
+
+	// providerNoneMissingRenderer is the synthetic provider name written
+	// to forwarder_sent.provider when the F4 missing-renderer path drops a
+	// row. No provider was actually called — store 'none' so a support
+	// query can grep classification='permanent_drop' AND provider='none'
+	// to isolate exactly the missing-renderer drops (vs Brevo Permanent
+	// failures which carry provider='brevo').
+	providerNoneMissingRenderer = "none"
+
+	// providerIDMissingRenderer is the synthetic provider_id used for F4
+	// rows. Real provider message ids never start with this literal so a
+	// support query like
+	//   SELECT * FROM forwarder_sent WHERE provider_id='missing_renderer'
+	// returns exactly the F4 drops.
+	providerIDMissingRenderer = "missing_renderer"
+)
+
+// ledgerClaim is the bundle of audit columns persisted on a forwarder_sent
+// row. Migration 059 added the columns; this struct is the in-memory
+// projection passed into markSent.
+//
+// Recipient is ALREADY masked at the call site (via maskRecipientForLedger)
+// — the ledger row stores PII-safe text only. Storing raw addresses
+// would defeat the worker-wide PII discipline (see logsafe.go in
+// internal/email/ + the api models.MaskEmail mirror).
+type ledgerClaim struct {
+	AuditID        string
+	Provider       string
+	ProviderID     string
+	Recipient      string // MUST be pre-masked by the caller
+	TemplateKind   string
+	Classification string
+}
+
+// maskRecipientForLedger returns a privacy-preserving rendering of an
+// email address for persistence in forwarder_sent.recipient. Mirrors the
+// algorithm in internal/email/logsafe.go and api/internal/email/email.go
+// :maskEmail byte-for-byte (the email-package helper is unexported;
+// duplicating the 7-line function is the cheapest way to avoid widening
+// the email-package API surface for this one caller).
+//
+//	"alice@example.com"            → "a***@example.com"
+//	"a@example.com"                → "a@example.com"   (1-char local kept)
+//	"" / "no-at-sign" / "@only"    → returned unchanged (defensive)
+func maskRecipientForLedger(addr string) string {
+	at := strings.LastIndex(addr, "@")
+	if at <= 0 {
+		return addr
+	}
+	local := addr[:at]
+	domain := addr[at:]
+	if len(local) == 1 {
+		return local + domain
+	}
+	return local[:1] + "***" + domain
+}
 
 // EventEmailForwarderArgs is the River job payload — no fields, runs as a sweep.
 type EventEmailForwarderArgs struct{}
@@ -131,7 +204,7 @@ const eventEmailCursorSeedGrace = 5 * time.Minute
 // pre-existing claim are tolerated.
 type sentLedger interface {
 	isSent(ctx context.Context, auditID string) (sent bool, err error)
-	markSent(ctx context.Context, auditID string) (claimed bool, err error)
+	markSent(ctx context.Context, claim ledgerClaim) (claimed bool, err error)
 	release(ctx context.Context, auditID string) error
 }
 
@@ -154,15 +227,21 @@ func (l *sqlSentLedger) isSent(ctx context.Context, auditID string) (bool, error
 	return exists, nil
 }
 
-// markSent inserts (audit_id) ON CONFLICT DO NOTHING. RowsAffected==1
-// means this call claimed the send; ==0 means the audit_id was already
-// in the ledger and the send must be skipped.
-func (l *sqlSentLedger) markSent(ctx context.Context, auditID string) (bool, error) {
+// markSent inserts the ledgerClaim row ON CONFLICT DO NOTHING.
+// RowsAffected==1 means this call claimed the send; ==0 means the audit_id
+// was already in the ledger and the send must be skipped.
+//
+// Migration 059 enriched the table with provider / provider_id / recipient
+// (masked) / template_kind / classification columns so support staff can
+// answer "what happened to email X" without log-spelunking. The caller
+// MUST pre-mask the recipient (see ledgerClaim doc).
+func (l *sqlSentLedger) markSent(ctx context.Context, c ledgerClaim) (bool, error) {
 	res, err := l.db.ExecContext(ctx, `
-		INSERT INTO forwarder_sent (audit_id)
-		VALUES ($1)
+		INSERT INTO forwarder_sent
+			(audit_id, provider, provider_id, recipient, template_kind, classification)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (audit_id) DO NOTHING
-	`, auditID)
+	`, c.AuditID, c.Provider, c.ProviderID, c.Recipient, c.TemplateKind, c.Classification)
 	if err != nil {
 		return false, fmt.Errorf("forwarder_sent insert: %w", err)
 	}
@@ -188,9 +267,9 @@ func (l *sqlSentLedger) release(ctx context.Context, auditID string) error {
 // about the ledger path. Production NEVER uses this.
 type noopSentLedger struct{}
 
-func (noopSentLedger) isSent(context.Context, string) (bool, error)   { return false, nil }
-func (noopSentLedger) markSent(context.Context, string) (bool, error) { return true, nil }
-func (noopSentLedger) release(context.Context, string) error          { return nil }
+func (noopSentLedger) isSent(context.Context, string) (bool, error)        { return false, nil }
+func (noopSentLedger) markSent(context.Context, ledgerClaim) (bool, error) { return true, nil }
+func (noopSentLedger) release(context.Context, string) error               { return nil }
 
 // Suppression-related constants — mirrored from the api package's
 // internal/models.email_events.go so the worker doesn't import the api
@@ -524,11 +603,16 @@ batchLoop:
 			// EXPECTED, benign state (deleted / orphan / test teams), so
 			// this logs at INFO, not WARN — a steady trickle of orphan
 			// rows must not erode WARN's signal value.
+			// #147 (BugBash 2026-05-20): standardize on `skip_reason` as the
+			// dedupe-friendly facet name (matches the rest of the worker's
+			// `skipped_ephemeral` / `skip_ingress_steps` shape). Renamed from
+			// `reason` so NR Logs can pivot on a single field across builders.
 			slog.Info("jobs.event_email_forwarder.builder_skipped_row",
 				"kind", row.Kind,
 				"audit_id", row.ID,
 				"team_id", row.TeamID,
-				"reason", "builder returned ok=false (no resolvable owner email — expected for deleted/orphan/test teams)",
+				"skip_reason", "no_owner_email",
+				"note", "builder returned ok=false (expected for deleted/orphan/test teams)",
 			)
 			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
 				return fmt.Errorf("event_email_forwarder: advance cursor after builder skip: %w", advErr)
@@ -604,25 +688,67 @@ batchLoop:
 			continue
 		}
 
-		// F4 (BugBash 2026-05-19): a kind that has a builder but NO
-		// registered renderer used to fall through to the dead Brevo
-		// dashboard-template path → SkippedNoTemplate → cursor advanced
-		// silently → zero email, zero error, audit row consumed forever.
-		// AS OF 2026-05-15 every kind IS Go-rendered, so a missing
-		// renderer is now unambiguously a programming bug (a 19th kind
-		// added to eventEmailBuilders without a renderer). Treat it as a
-		// loud ERROR and HOLD the cursor — never advance silently. The
-		// TestEveryEmailKindHasAGoRenderer registry test catches this at
-		// CI time; this is the runtime backstop if it ever ships anyway.
+		// F4 (BugBash 2026-05-19, reshaped BugBash 2026-05-20): a kind
+		// that has a builder but NO registered renderer used to fall
+		// through to the dead Brevo dashboard-template path →
+		// SkippedNoTemplate → cursor advanced silently → zero email, zero
+		// error, audit row consumed forever. The
+		// TestEventEmail_EverySupportedKindFullyWired registry test catches
+		// this at CI time; this is the runtime backstop if it ever ships
+		// anyway.
+		//
+		// Behavior on a missing renderer:
+		//   1. Log loud ERROR with the literal message
+		//      "missing_email_renderer" and `audit_id` / `team_id` / `kind`.
+		//      The literal lets the NR alert key on
+		//      message:"missing_email_renderer" independent of kind
+		//      cardinality.
+		//   2. Increment metrics.EmailMissingRendererTotal{kind} so an
+		//      operator alert can fire on rate without parsing logs.
+		//   3. INSERT into forwarder_sent with classification='permanent_drop'
+		//      / provider='none' / provider_id='missing_renderer' so
+		//      support can grep the ledger for exactly these rows.
+		//   4. ADVANCE the cursor — the row will never produce an email
+		//      regardless of how many retries we do, and holding the
+		//      cursor pins the queue behind a programming bug for as long
+		//      as the registry stays broken. The CI registry test makes
+		//      this condition vanishingly rare in practice; the runtime
+		//      path prioritizes "don't pin the queue" over "don't drop
+		//      the row" because in this state the row was already going
+		//      to be dropped.
 		renderer, hasRenderer := eventEmailBodyRenderers[row.Kind]
 		if !hasRenderer {
-			slog.Error("jobs.event_email_forwarder.missing_renderer",
+			slog.Error("missing_email_renderer",
 				"kind", row.Kind,
 				"audit_id", row.ID,
-				"note", "kind has a builder but no Go renderer — holding cursor (NOT advancing). This is a registry bug; add a renderer to eventEmailBodyRenderers. Email NOT sent.",
+				"team_id", row.TeamID,
+				"note", "kind has a builder but no Go renderer — F4 permanent_drop. Add a renderer to eventEmailBodyRenderers. Email NOT sent; forwarder_sent ledger gets a permanent_drop row.",
 			)
-			transient++
-			break batchLoop
+			metrics.EmailMissingRendererTotal.WithLabelValues(row.Kind).Inc()
+			if _, ledgerErr := w.ledger.markSent(ctx, ledgerClaim{
+				AuditID:        row.ID,
+				Provider:       providerNoneMissingRenderer,
+				ProviderID:     providerIDMissingRenderer,
+				Recipient:      maskRecipientForLedger(recipient),
+				TemplateKind:   row.Kind,
+				Classification: ledgerClassPermanentDrop,
+			}); ledgerErr != nil {
+				// Best-effort — log and advance even if the ledger insert
+				// fails. The alternative (holding the cursor) would still
+				// pin the queue behind a programming bug we already know
+				// the row can never resolve.
+				slog.Warn("jobs.event_email_forwarder.missing_renderer_ledger_failed",
+					"audit_id", row.ID,
+					"kind", row.Kind,
+					"error", ledgerErr,
+					"note", "F4 permanent_drop ledger insert failed — advancing cursor anyway (row can never produce an email); support will grep the ERROR log instead",
+				)
+			}
+			if advErr := w.cursor.write(ctx, eventCursor{CreatedAt: row.CreatedAt, ID: row.ID}); advErr != nil {
+				return fmt.Errorf("event_email_forwarder: advance cursor after missing_renderer: %w", advErr)
+			}
+			skipped++
+			continue
 		}
 
 		// recipient was resolved once at the top of the loop (F5) — the
@@ -692,8 +818,17 @@ batchLoop:
 			// then advance the cursor. If the markSent insert fails the
 			// send was real and the cursor must not advance — retry next
 			// tick (Brevo dedup header absorbs the at-most-once duplicate
-			// where honored).
-			claimed, ledgerErr := w.ledger.markSent(ctx, row.ID)
+			// where honored). The ledger row carries the audit columns
+			// added by migration 059 so support can reconstruct what got
+			// sent without grepping logs.
+			claimed, ledgerErr := w.ledger.markSent(ctx, ledgerClaim{
+				AuditID:        row.ID,
+				Provider:       w.provider.Name(),
+				ProviderID:     evt.IdempotencyKey, // best available — providers don't surface a message id today
+				Recipient:      maskRecipientForLedger(recipient),
+				TemplateKind:   row.Kind,
+				Classification: ledgerClassSuccess,
+			})
 			if ledgerErr != nil {
 				slog.Warn("jobs.event_email_forwarder.ledger_claim_failed_post_send",
 					"audit_id", row.ID,
@@ -729,8 +864,17 @@ batchLoop:
 			// Permanent failure (e.g. an invalid recipient). A best-effort
 			// claim — a failure here is non-fatal because the cursor still
 			// advances; worst case a duplicate Permanent error is logged
-			// on a cursor reset, which is harmless.
-			if claimed, ledgerErr := w.ledger.markSent(ctx, row.ID); ledgerErr != nil {
+			// on a cursor reset, which is harmless. classification is
+			// permanent_drop so a support grep against the 059 columns
+			// finds these alongside the F4 missing_renderer drops.
+			if claimed, ledgerErr := w.ledger.markSent(ctx, ledgerClaim{
+				AuditID:        row.ID,
+				Provider:       w.provider.Name(),
+				ProviderID:     evt.IdempotencyKey,
+				Recipient:      maskRecipientForLedger(recipient),
+				TemplateKind:   row.Kind,
+				Classification: ledgerClassPermanentDrop,
+			}); ledgerErr != nil {
 				slog.Warn("jobs.event_email_forwarder.ledger_claim_failed_terminal",
 					"audit_id", row.ID,
 					"kind", row.Kind,
@@ -772,7 +916,19 @@ batchLoop:
 		}
 	}
 
-	slog.Info("jobs.event_email_forwarder.completed",
+	// #146 (BugBash 2026-05-20 idle-tick noise pass): the forwarder runs
+	// every 60s. The early-return path on no_new_rows is already DEBUG
+	// (line 482), so this branch only fires when there WERE rows. But the
+	// dominant low-traffic shape is: cursor advanced past a row that all
+	// skipped (suppression / duplicate / unsupported-kind) — sent==0,
+	// transient==0. That is also idle-tick steady state from the
+	// observability standpoint. Emit DEBUG when nothing went out the wire
+	// AND no transient errors occurred; INFO when bits genuinely moved.
+	forwarderLevel := slog.LevelInfo
+	if sent == 0 && transient == 0 {
+		forwarderLevel = slog.LevelDebug
+	}
+	slog.Log(ctx, forwarderLevel, "jobs.event_email_forwarder.completed",
 		"provider", w.provider.Name(),
 		"sent", sent,
 		"skipped", skipped,
