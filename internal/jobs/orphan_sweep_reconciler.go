@@ -92,6 +92,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/riverqueue/river"
 	"go.opentelemetry.io/otel"
+
+	"instant.dev/worker/internal/metrics"
 )
 
 // orphanSweepInterval is how often the reconciler runs. 15 minutes is a
@@ -128,6 +130,60 @@ const (
 	orphanKindK8sNamespace     = "k8s_namespace"
 	orphanKindK8sCustomerNS    = "k8s_customer_namespace"
 	orphanKindK8sStackNS       = "k8s_stack_namespace"
+	// orphanKindStuckBuild — PASS 6 flips a deployments row that has been
+	// 'building' / 'deploying' for >30min with a stuck pod
+	// (ImagePullBackOff / ErrImagePull / CrashLoopBackOff) to 'failed'.
+	// The autopsy row is captured in deployment_events by the existing
+	// deploy_status_reconcile loop on its next tick; PASS 3 reaps the
+	// namespace 6h later via orphanReapReasonFailedOldDeployment.
+	orphanKindStuckBuild = "stuck_build_deployment"
+)
+
+// Prometheus `reason` label values for instant_orphan_sweep_reaped_total.
+// Bounded set — every reap action picks exactly one. The literal strings
+// are part of the metric contract; do not change without also updating the
+// infra/k8s/prometheus-rules.yaml alert that watches `no_db_row`.
+const (
+	orphanReapReasonTeamTombstoned       = "team_tombstoned"
+	orphanReapReasonNoDBRow              = "no_db_row"
+	orphanReapReasonFailedOldDeployment  = "failed_old_deployment"
+	orphanReapReasonFailedBuild          = "failed_build"
+	orphanReapReasonCustomerNoRow        = "customer_no_row"
+	orphanReapReasonStackNoRow           = "stack_no_row"
+)
+
+// Grace-period thresholds. Conservative on purpose — easier to extend than
+// to undo a wrongful reap. All three are pulled into named constants so
+// tests can override via the seam in NewOrphanSweepReconciler if needed.
+const (
+	// orphanNoDBRowGrace is how old an instant-deploy-* / instant-stack-*
+	// namespace must be before PASS 3 will reap it on the "no DB row at all"
+	// path. Sized to cover a worst-case in-flight provision that has created
+	// the namespace but not yet committed the deployments INSERT.
+	orphanNoDBRowGrace = 1 * time.Hour
+
+	// orphanFailedDeploymentGrace is how old a deployments row whose status
+	// is 'failed' must be before PASS 3 will reap its namespace. The autopsy
+	// row in deployment_events persists forever — only the namespace +
+	// running pods are reclaimed, not the operator's forensic trail.
+	orphanFailedDeploymentGrace = 6 * time.Hour
+
+	// orphanStuckBuildGrace is how long a deployments row in
+	// 'building' / 'deploying' status must have been there before PASS 6
+	// will inspect the pod state and, on a sustained ImagePullBackOff /
+	// CrashLoopBackOff, flip the row to 'failed'.
+	orphanStuckBuildGrace = 30 * time.Minute
+
+	// orphanPodStateCheckTimeout caps each per-deployment pod-list call.
+	// Keeps a slow k8s API from stalling the whole sweep when many rows
+	// qualify for PASS 6 inspection.
+	orphanPodStateCheckTimeout = 5 * time.Second
+
+	// orphanStuckBuildBatchLimit caps how many stuck-build candidates
+	// PASS 6 inspects per tick. A healthy steady state has zero; a backlog
+	// (a ghcr.io outage that wedged many builds at once) is drained over
+	// several ticks rather than spamming the k8s API in one burst.
+	orphanStuckBuildBatchLimit = 25
 )
 
 // customerNamespacePrefix is the prefix of every per-resource customer
@@ -161,6 +217,31 @@ type K8sNamespaceLister interface {
 	ListDeployNamespaces(ctx context.Context) ([]string, error)
 	ListCustomerNamespaces(ctx context.Context) ([]string, error)
 	ListStackNamespaces(ctx context.Context) ([]string, error)
+	// GetNamespaceAge returns the elapsed time since the namespace was
+	// created. The PASS 3 "no DB row" reap path requires this to enforce
+	// the 1h grace window — a freshly-created namespace whose deployments
+	// INSERT is still in flight must NOT be reaped. NotFound is treated as
+	// (0, nil) — the caller skips the reap (already gone).
+	GetNamespaceAge(ctx context.Context, namespace string) (time.Duration, error)
+}
+
+// PodStateProvider is the narrow slice of the k8s pod API the
+// orphan-sweep reconciler's PASS 6 needs: enumerate the pods of a single
+// instant-deploy-<appID> namespace and report each pod's waiting-state
+// reason. The seam is named separately from K8sNamespaceLister so a
+// reconciler test can supply a pod-state fake without also wiring up the
+// cluster-wide List interface.
+//
+// The concrete production impl wraps the same kubernetes.Clientset used by
+// k8sNamespaceClient + k8sAutopsyClient (see k8s_namespace_client.go's
+// pass6PodStateClient adapter).
+type PodStateProvider interface {
+	// ListPodWaitingReasons returns, for every pod in `namespace`, the
+	// waiting-state reason of its primary container (or "" when the
+	// container is not in Waiting state). The slice is empty when no pods
+	// match. NotFound on the namespace is (nil, nil) — the namespace was
+	// reaped by another path; PASS 6 then no-ops.
+	ListPodWaitingReasons(ctx context.Context, namespace string) ([]string, error)
 }
 
 // teamTeardownExecutor is the slice of the team-deletion executor the
@@ -184,12 +265,17 @@ type OrphanSweepReconciler struct {
 	db       *sql.DB
 	executor teamTeardownExecutor       // nil = PASS 1 skipped
 	canceler OrphanSubscriptionCanceler // nil = PASS 2 skipped
-	k8s      K8sNamespaceLister         // nil = PASS 3 skipped
+	k8s      K8sNamespaceLister         // nil = PASS 3/4/5 skipped
+	pods     PodStateProvider           // nil = PASS 6 skipped
 }
 
 // NewOrphanSweepReconciler constructs the reconciler. executor, canceler,
 // and k8s may each be nil — the corresponding pass is then skipped with a
 // WARN log. In production all three are wired in StartWorkers.
+//
+// PASS 6 (stuck-build detection) is opted in via WithPodStateProvider —
+// nil pods leaves PASS 6 disabled with a single WARN log per tick, matching
+// the fail-open posture of every other pass.
 func NewOrphanSweepReconciler(
 	db *sql.DB,
 	executor teamTeardownExecutor,
@@ -202,6 +288,15 @@ func NewOrphanSweepReconciler(
 		canceler: canceler,
 		k8s:      k8s,
 	}
+}
+
+// WithPodStateProvider wires the PASS 6 stuck-build seam. Call this in
+// StartWorkers after constructing the reconciler when the cluster is
+// reachable. Not called in CI / docker-compose where k8s is absent — PASS
+// 6 then logs a single WARN per tick and returns zero orphans.
+func (w *OrphanSweepReconciler) WithPodStateProvider(p PodStateProvider) *OrphanSweepReconciler {
+	w.pods = p
+	return w
 }
 
 // Work runs one full sweep — PASS 1, 2, 3 in order. Money first (the stuck-
@@ -223,15 +318,16 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		return fmt.Errorf("OrphanSweepReconciler: subscription pass failed: %w", err)
 	}
 
-	// PASS 3 + PASS 4 are fail-open: a forbidden/transient k8s error degrades
-	// to a single WARN and a zero-orphan result. They must NEVER fail the job
-	// — PASS 1 (money) and PASS 2 (money) have already run, and an ERROR here
-	// would have River retry the whole dispatch every ~60s, spamming ERROR
-	// logs over a missing RBAC permission. Neither sweep returns a non-nil
-	// error.
+	// PASS 3 + PASS 4 + PASS 5 + PASS 6 are fail-open: a forbidden/transient
+	// k8s error degrades to a single WARN and a zero-orphan result. They must
+	// NEVER fail the job — PASS 1 (money) and PASS 2 (money) have already
+	// run, and an ERROR here would have River retry the whole dispatch every
+	// ~60s, spamming ERROR logs over a missing RBAC permission. None of the
+	// k8s passes return a non-nil error.
 	nsDeleted, nsFailed := w.sweepOrphanedNamespaces(ctx)
 	custNSDeleted, custNSFailed := w.sweepOrphanedCustomerNamespaces(ctx)
 	stackNSDeleted, stackNSFailed := w.sweepOrphanedStackNamespaces(ctx)
+	stuckBuildFlipped, stuckBuildFailed := w.sweepStuckBuildDeployments(ctx)
 
 	// #146 (BugBash 2026-05-20 idle-tick noise pass): 15min tick = 96
 	// lines/day. An all-zero sweep means the cluster is clean — DEBUG.
@@ -242,7 +338,8 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		subsCancelled == 0 && subsFailed == 0 &&
 		nsDeleted == 0 && nsFailed == 0 &&
 		custNSDeleted == 0 && custNSFailed == 0 &&
-		stackNSDeleted == 0 && stackNSFailed == 0 {
+		stackNSDeleted == 0 && stackNSFailed == 0 &&
+		stuckBuildFlipped == 0 && stuckBuildFailed == 0 {
 		level = slog.LevelDebug
 	}
 	slog.Log(ctx, level, "jobs.orphan_sweep.completed",
@@ -256,6 +353,8 @@ func (w *OrphanSweepReconciler) Work(ctx context.Context, job *river.Job[OrphanS
 		"orphan_customer_namespaces_failed", custNSFailed,
 		"orphan_stack_namespaces_deleted", stackNSDeleted,
 		"orphan_stack_namespaces_failed", stackNSFailed,
+		"stuck_build_flipped_to_failed", stuckBuildFlipped,
+		"stuck_build_failed", stuckBuildFailed,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"job_id", job.ID,
 	)
@@ -389,9 +488,40 @@ func (w *OrphanSweepReconciler) sweepOrphanedSubscriptions(ctx context.Context) 
 
 // ── PASS 3 — orphaned k8s deploy namespaces ──────────────────────────────
 
+// deployRowSnapshot is the per-app_id projection PASS 3 reads from the
+// deployments table — enough state for the sweep to decide between
+// "live", "team_tombstoned", "failed_old_deployment", and "no_db_row"
+// without re-querying per namespace.
+type deployRowSnapshot struct {
+	status       string    // deployments.status
+	teamStatus   string    // teams.status
+	rowCreatedAt time.Time // deployments.created_at — gates the failed_old_deployment reap
+}
+
 // sweepOrphanedNamespaces lists every instant-deploy-* namespace and deletes
 // the ones whose backing deployment row is owned by a tombstoned /
-// deletion_pending team, or has no backing row at all.
+// deletion_pending team, or has no backing row at all, OR is in
+// status='failed' beyond the 6h grace window.
+//
+// REAP REASONS (every reap increments instant_orphan_sweep_reaped_total
+// with one of these labels; ops alerts watch the per-reason rate):
+//
+//   - team_tombstoned       — the namespace's row exists but its team is
+//                             tombstoned / deletion_pending, OR the row's
+//                             status is 'deleted'. Reaped immediately —
+//                             the team-deletion executor was supposed to
+//                             have caught it.
+//   - failed_old_deployment — the row exists with status='failed' AND
+//                             created_at > 6h ago. The autopsy in
+//                             deployment_events persists forever; the
+//                             namespace doesn't need to linger.
+//   - no_db_row             — the namespace has NO matching deployments
+//                             row at all AND the namespace itself is
+//                             >1h old (the grace window protects in-flight
+//                             provisions where the namespace is created
+//                             before the DB INSERT lands). This is the
+//                             P0-3 atomic-provision leading indicator —
+//                             non-zero rate pages an operator.
 //
 // FAIL-OPEN. This pass never returns an error. The namespace List is a
 // cluster-scoped k8s call that can be denied (RBAC Forbidden) or fail
@@ -419,69 +549,171 @@ func (w *OrphanSweepReconciler) sweepOrphanedNamespaces(ctx context.Context) (de
 		return 0, 0
 	}
 
-	// Build the set of app_ids whose namespace is legitimately live: the
-	// deployment row exists AND its team is still active or inside the
-	// restorable deletion_requested grace window. Everything else is an
-	// orphan.
-	liveAppIDs, err := w.fetchLiveDeployAppIDs(ctx)
+	// Read every app_id's row state in one query. The sweep iterates
+	// namespaces and looks up the row by app_id — three buckets fall out:
+	// live (left alone), reapable-now (team_tombstoned + failed_old),
+	// no-row (grace-checked via namespace CreationTimestamp).
+	rowsByAppID, err := w.fetchDeployRowsByAppID(ctx)
 	if err != nil {
-		// Same fail-open posture: a DB blip on the live-app-ids query
-		// must not fail the job. Skip the delete decisions this sweep.
+		// Same fail-open posture: a DB blip must not fail the job.
 		slog.Warn("jobs.orphan_sweep.pass3_live_app_ids_failed",
 			"error", err.Error(),
 			"detail", "namespace-orphan cleanup skipped this sweep; PASS 1/2 still ran")
 		return 0, 0
 	}
 
+	now := time.Now()
 	for _, ns := range namespaces {
 		appID := ns[len(deployNamespacePrefixTDE):]
 		if appID == "" {
 			continue
 		}
-		if liveAppIDs[appID] {
-			continue // legitimately owned — leave it
+		reason, ok := classifyDeployOrphan(appID, rowsByAppID, now)
+		if !ok {
+			// Either the row is legitimately live, OR the row's status is
+			// 'failed' but newer than the 6h grace window. Leave it.
+			continue
 		}
-		// Orphan: no live owner. Delete the namespace.
+		// Reason "no_db_row" needs the namespace-age grace check before
+		// we delete. Every other reason is reaped immediately.
+		if reason == orphanReapReasonNoDBRow {
+			age, ageErr := w.k8s.GetNamespaceAge(ctx, ns)
+			if ageErr != nil {
+				// Treat any age-lookup failure as "skip this tick" rather
+				// than reap-without-grace. The namespace is re-evaluated
+				// on the next sweep.
+				slog.Warn("jobs.orphan_sweep.namespace_age_lookup_failed",
+					"namespace", ns, "error", ageErr.Error(),
+					"detail", "skipping reap this sweep; will retry next interval")
+				continue
+			}
+			if age < orphanNoDBRowGrace {
+				slog.Debug("jobs.orphan_sweep.no_db_row_within_grace",
+					"namespace", ns, "age", age.String(),
+					"grace", orphanNoDBRowGrace.String())
+				continue
+			}
+		}
+
+		// Log the proposed action with full evidence BEFORE the delete
+		// (constraint #3 from the brief: operator must be able to see what
+		// is about to happen in audit_log).
+		evidence := buildPass3Evidence(appID, rowsByAppID, reason)
+		slog.Info("jobs.orphan_sweep.proposed_reap",
+			"namespace", ns,
+			"reason", reason,
+			"evidence", evidence,
+			"action", "deleting namespace + emitting team.orphan_reclaimed",
+		)
+
 		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
 			failed++
+			metrics.OrphanSweepReapFailedTotal.WithLabelValues(reason).Inc()
 			slog.Error("jobs.orphan_sweep.namespace_delete_failed",
-				"namespace", ns, "error", delErr)
+				"namespace", ns, "reason", reason, "error", delErr)
 			w.emitOrphanSweepFailed(ctx, uuid.Nil, orphanKindK8sNamespace, ns, delErr)
 			continue
 		}
 		deleted++
+		metrics.OrphanSweepReapedTotal.WithLabelValues(reason).Inc()
 		w.emitOrphanReclaimed(ctx, uuid.Nil, orphanKindK8sNamespace, ns,
-			"deleted orphaned k8s deploy namespace")
+			"deleted orphaned k8s deploy namespace (reason="+reason+")")
 	}
 	return deleted, failed
 }
 
-// fetchLiveDeployAppIDs returns the set of deployment app_ids that are
-// legitimately live — the deployment row exists, is not 'deleted', and its
-// team is 'active' or in the still-restorable 'deletion_requested' state.
-// A deployment owned by a 'tombstoned' / 'deletion_pending' team is NOT
-// live (its namespace is an orphan to be reclaimed).
-func (w *OrphanSweepReconciler) fetchLiveDeployAppIDs(ctx context.Context) (map[string]bool, error) {
+// classifyDeployOrphan decides whether (and why) an instant-deploy-<appID>
+// namespace is an orphan. Returns (reason, true) if the namespace is
+// reapable, (_, false) if it is legitimately live or still inside the
+// failed-grace window.
+//
+// The three reapable reasons map 1:1 to the Prometheus metric labels —
+// op alerts in infra/k8s/prometheus-rules.yaml watch each independently.
+// Kept as a pure function so the test suite can drive it directly with
+// table inputs without standing up the full sweep.
+func classifyDeployOrphan(appID string, rowsByAppID map[string]deployRowSnapshot, now time.Time) (string, bool) {
+	row, present := rowsByAppID[appID]
+	if !present {
+		// No deployments row at all. Reap reason is no_db_row — caller
+		// applies the namespace-age grace before deleting.
+		return orphanReapReasonNoDBRow, true
+	}
+	// Row exists. Two reapable sub-cases:
+	//   1. team_tombstoned: team in a terminal/pending-delete state, OR
+	//      the row itself is already status='deleted'.
+	//   2. failed_old_deployment: row is status='failed' AND old enough.
+	teamGone := row.teamStatus != "active" && row.teamStatus != "deletion_requested"
+	rowDeleted := row.status == "deleted"
+	if teamGone || rowDeleted {
+		return orphanReapReasonTeamTombstoned, true
+	}
+	if row.status == "failed" && !row.rowCreatedAt.IsZero() &&
+		now.Sub(row.rowCreatedAt) >= orphanFailedDeploymentGrace {
+		return orphanReapReasonFailedOldDeployment, true
+	}
+	// Live OR failed-but-within-grace. Leave the namespace alone.
+	return "", false
+}
+
+// buildPass3Evidence assembles the structured-log evidence block for a
+// proposed reap. Includes the deployments row state when present, "absent"
+// when no row was found. Operators trace this back via NR Logs to the
+// orphan_reclaimed audit row.
+func buildPass3Evidence(appID string, rowsByAppID map[string]deployRowSnapshot, reason string) map[string]any {
+	row, present := rowsByAppID[appID]
+	if !present {
+		return map[string]any{
+			"app_id":         appID,
+			"reason":         reason,
+			"db_row_present": false,
+		}
+	}
+	return map[string]any{
+		"app_id":             appID,
+		"reason":             reason,
+		"db_row_present":     true,
+		"db_status":          row.status,
+		"team_status":        row.teamStatus,
+		"db_row_created_at":  row.rowCreatedAt.Format(time.RFC3339),
+		"db_row_age_seconds": int64(time.Since(row.rowCreatedAt).Seconds()),
+	}
+}
+
+// fetchDeployRowsByAppID returns every deployments row's app_id mapped to
+// (status, team_status, created_at) — the projection PASS 3 needs.
+//
+// Crucially this does NOT pre-filter to "active rows" the way the old
+// fetchLiveDeployAppIDs did: PASS 3 must see deleted rows to detect that
+// the namespace should have been torn down (team_tombstoned reap path).
+// The classification happens in classifyDeployOrphan.
+func (w *OrphanSweepReconciler) fetchDeployRowsByAppID(ctx context.Context) (map[string]deployRowSnapshot, error) {
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT d.app_id
+		SELECT d.app_id, d.status, t.status, d.created_at
 		  FROM deployments d
 		  JOIN teams t ON t.id = d.team_id
 		 WHERE d.app_id IS NOT NULL
 		   AND d.app_id != ''
-		   AND d.status != 'deleted'
-		   AND t.status IN ('active', 'deletion_requested')
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make(map[string]bool)
+	out := make(map[string]deployRowSnapshot)
 	for rows.Next() {
-		var appID string
-		if scanErr := rows.Scan(&appID); scanErr != nil {
+		var (
+			appID      string
+			dStatus    string
+			teamStatus string
+			createdAt  time.Time
+		)
+		if scanErr := rows.Scan(&appID, &dStatus, &teamStatus, &createdAt); scanErr != nil {
 			return nil, scanErr
 		}
-		out[appID] = true
+		out[appID] = deployRowSnapshot{
+			status:       dStatus,
+			teamStatus:   teamStatus,
+			rowCreatedAt: createdAt,
+		}
 	}
 	return out, rows.Err()
 }
@@ -549,12 +781,14 @@ func (w *OrphanSweepReconciler) sweepOrphanedCustomerNamespaces(ctx context.Cont
 		// Orphan: no active/paused/suspended resources row for this token.
 		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
 			failed++
+			metrics.OrphanSweepReapFailedTotal.WithLabelValues(orphanReapReasonCustomerNoRow).Inc()
 			slog.Error("jobs.orphan_sweep.customer_namespace_delete_failed",
 				"namespace", ns, "error", delErr)
 			w.emitOrphanSweepFailed(ctx, uuid.Nil, orphanKindK8sCustomerNS, ns, delErr)
 			continue
 		}
 		deleted++
+		metrics.OrphanSweepReapedTotal.WithLabelValues(orphanReapReasonCustomerNoRow).Inc()
 		slog.Info("jobs.orphan_sweep.customer_namespace_reclaimed",
 			"namespace", ns,
 			"detail", "instant-customer-* namespace with no active resources row deleted (MR-P0-1b)")
@@ -662,12 +896,14 @@ func (w *OrphanSweepReconciler) sweepOrphanedStackNamespaces(ctx context.Context
 		// Orphan: no stacks row for this id.
 		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
 			failed++
+			metrics.OrphanSweepReapFailedTotal.WithLabelValues(orphanReapReasonStackNoRow).Inc()
 			slog.Error("jobs.orphan_sweep.stack_namespace_delete_failed",
 				"namespace", ns, "error", delErr)
 			w.emitOrphanSweepFailed(ctx, uuid.Nil, orphanKindK8sStackNS, ns, delErr)
 			continue
 		}
 		deleted++
+		metrics.OrphanSweepReapedTotal.WithLabelValues(orphanReapReasonStackNoRow).Inc()
 		slog.Info("jobs.orphan_sweep.stack_namespace_reclaimed",
 			"namespace", ns,
 			"detail", "instant-stack-* namespace with no backing stacks row deleted (T6 P0-1)")
@@ -699,6 +935,248 @@ func (w *OrphanSweepReconciler) fetchLiveStackIDs(ctx context.Context) (map[stri
 		}
 	}
 	return out, rows.Err()
+}
+
+// ── PASS 6 — stuck-build detection (2026-05-20) ──────────────────────────
+//
+// PASS 6 catches deployments that are stuck in 'building' or 'deploying'
+// because the pod cannot pull its image (ImagePullBackOff / ErrImagePull)
+// or its container keeps crashing (CrashLoopBackOff). The existing
+// deploy_status_reconcile only flips a row to 'failed' when the k8s
+// Deployment has DeploymentReplicaFailure=True; a stuck pod never trips
+// that condition — UnavailableReplicas stays positive and the row sits at
+// 'deploying' forever.
+//
+// THE SHAPE PASS 6 CATCHES (verbatim case 04dc0b31 from 2026-05-20):
+//
+//   deployments.status   = 'deploying'
+//   deployments.updated_at = >30min ago
+//   pod's only container is in Waiting with reason=ImagePullBackOff
+//
+// THE ACTION
+//
+//   1. Flip deployments.status to 'failed' (so PASS 3 reaps the namespace
+//      6h later via orphanReapReasonFailedOldDeployment).
+//   2. Set deployments.error_message describing the stuck reason.
+//   3. Emit a structured log with full evidence (audit_log lookup is via
+//      the deployment_id in the next reconcile tick).
+//   4. Increment instant_orphan_sweep_reaped_total{reason="failed_build"}.
+//
+// THE FAILURE-AUTOPSY ROW IS NOT WRITTEN HERE. The capture path is shared
+// with deploy_status_reconcile.go's captureDeploymentAutopsy; running it
+// here would require also wiring the deployAutopsyK8sProvider into the
+// orphan-sweep reconciler. Instead PASS 6 flips the status; the next
+// deploy_status_reconcile tick (~30s later) sees the row at 'failed' and
+// writes the autopsy via its existing per-tick capture loop. One source
+// of truth for the autopsy row, two reconcilers cooperating.
+//
+// FAIL-OPEN. Identical posture to PASS 3/4/5: a pods-list failure on one
+// namespace skips that candidate, never fails the job. A DB blip on the
+// candidate query degrades to one WARN and a zero-flipped result.
+//
+// SAFETY. The query joins on `teams` to refuse any row whose team is NOT
+// 'active' or 'deletion_requested' — a tombstoned team's deployments are
+// PASS 3's territory.
+func (w *OrphanSweepReconciler) sweepStuckBuildDeployments(ctx context.Context) (flipped, failed int) {
+	if w.pods == nil {
+		// Not wired — silent in steady state. The structured WARN comes
+		// from StartWorkers once at boot when the seam stays nil.
+		return 0, 0
+	}
+
+	candidates, err := w.fetchStuckBuildCandidates(ctx)
+	if err != nil {
+		slog.Warn("jobs.orphan_sweep.pass6_candidates_query_failed",
+			"error", err.Error(),
+			"detail", "stuck-build sweep skipped this tick; PASS 1/2/3/4/5 still ran")
+		return 0, 0
+	}
+	if len(candidates) == 0 {
+		return 0, 0
+	}
+
+	for _, c := range candidates {
+		ns := deployNamespacePrefixTDE + c.appID
+		reasons, lerr := w.listPodWaitingReasonsWithTimeout(ctx, ns)
+		if lerr != nil {
+			// Per-namespace failure is isolated — one WARN, no error.
+			slog.Warn("jobs.orphan_sweep.pass6_pod_list_failed",
+				"namespace", ns,
+				"deployment_id", c.deploymentID.String(),
+				"error", lerr.Error())
+			continue
+		}
+		// Decide: every running pod must be in a stuck-waiting reason for
+		// us to flip. A single pod that is "" (Running / ContainerCreating
+		// without a Waiting state) means the build is still progressing
+		// or has just turned over — leave the row alone.
+		if !isStuckBuildState(reasons) {
+			continue
+		}
+		stuckReason := dominantStuckReason(reasons)
+
+		// Log the proposed action with full evidence BEFORE the write.
+		slog.Info("jobs.orphan_sweep.pass6_proposed_flip",
+			"namespace", ns,
+			"deployment_id", c.deploymentID.String(),
+			"app_id", c.appID,
+			"current_status", c.status,
+			"stuck_reason", stuckReason,
+			"pod_waiting_reasons", reasons,
+			"row_updated_at", c.updatedAt.Format(time.RFC3339),
+			"action", "flipping deployments.status to 'failed' + setting error_message",
+		)
+
+		errMsg := fmt.Sprintf("orphan_sweep PASS 6: pod stuck in %s for >%s; flipped to failed for namespace reap",
+			stuckReason, orphanStuckBuildGrace.String())
+		if uerr := w.flipDeploymentToFailed(ctx, c.deploymentID, errMsg); uerr != nil {
+			failed++
+			metrics.OrphanSweepReapFailedTotal.WithLabelValues(orphanReapReasonFailedBuild).Inc()
+			slog.Error("jobs.orphan_sweep.pass6_flip_failed",
+				"deployment_id", c.deploymentID.String(),
+				"namespace", ns,
+				"error", uerr)
+			// No audit row — teamID lookup is on c.teamID below.
+			w.emitOrphanSweepFailed(ctx, c.teamID, orphanKindStuckBuild,
+				c.deploymentID.String(), uerr)
+			continue
+		}
+		flipped++
+		metrics.OrphanSweepReapedTotal.WithLabelValues(orphanReapReasonFailedBuild).Inc()
+		w.emitOrphanReclaimed(ctx, c.teamID, orphanKindStuckBuild,
+			c.deploymentID.String(),
+			"flipped stuck-build deployment to failed (reason="+stuckReason+")")
+	}
+	return flipped, failed
+}
+
+// stuckBuildCandidate is the projection PASS 6 reads — minimal columns
+// from the deployments + teams join.
+type stuckBuildCandidate struct {
+	deploymentID uuid.UUID
+	teamID       uuid.UUID
+	appID        string
+	status       string
+	updatedAt    time.Time
+}
+
+// fetchStuckBuildCandidates returns every deployments row in
+// status='building'/'deploying' whose updated_at is older than
+// orphanStuckBuildGrace AND whose team is still 'active' or in the
+// restorable 'deletion_requested' grace window. Capped by
+// orphanStuckBuildBatchLimit so a backlog (e.g. a multi-hour ghcr.io
+// outage that wedged hundreds of builds) is drained across ticks rather
+// than all at once.
+func (w *OrphanSweepReconciler) fetchStuckBuildCandidates(ctx context.Context) ([]stuckBuildCandidate, error) {
+	cutoff := time.Now().Add(-orphanStuckBuildGrace)
+	rows, err := w.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT d.id, d.team_id, d.app_id, d.status, d.updated_at
+		  FROM deployments d
+		  JOIN teams t ON t.id = d.team_id
+		 WHERE d.status IN ('building', 'deploying')
+		   AND d.updated_at < $1
+		   AND d.app_id IS NOT NULL AND d.app_id != ''
+		   AND t.status IN ('active', 'deletion_requested')
+		 ORDER BY d.updated_at ASC
+		 LIMIT %d
+	`, orphanStuckBuildBatchLimit), cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []stuckBuildCandidate
+	for rows.Next() {
+		var c stuckBuildCandidate
+		if scanErr := rows.Scan(&c.deploymentID, &c.teamID, &c.appID, &c.status, &c.updatedAt); scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// flipDeploymentToFailed updates a deployments row to status='failed' +
+// sets error_message, but ONLY when the row is still in a non-terminal
+// build state. The guard prevents a race with deploy_status_reconcile
+// that may have already moved the row to 'healthy' or 'stopped' between
+// our SELECT and UPDATE.
+func (w *OrphanSweepReconciler) flipDeploymentToFailed(ctx context.Context, deploymentID uuid.UUID, errMsg string) error {
+	_, err := w.db.ExecContext(ctx, `
+		UPDATE deployments
+		   SET status = 'failed',
+		       error_message = $1,
+		       updated_at = now()
+		 WHERE id = $2
+		   AND status IN ('building', 'deploying')
+	`, errMsg, deploymentID)
+	if err != nil {
+		return fmt.Errorf("flipDeploymentToFailed: %w", err)
+	}
+	return nil
+}
+
+// listPodWaitingReasonsWithTimeout calls the seam under a per-namespace
+// timeout so one slow k8s API call cannot stall the whole sweep.
+func (w *OrphanSweepReconciler) listPodWaitingReasonsWithTimeout(ctx context.Context, namespace string) ([]string, error) {
+	cctx, cancel := context.WithTimeout(ctx, orphanPodStateCheckTimeout)
+	defer cancel()
+	return w.pods.ListPodWaitingReasons(cctx, namespace)
+}
+
+// stuckBuildWaitingReasons is the bounded set of waiting-state reasons PASS 6
+// treats as evidence of a stuck build. Anything outside this set leaves the
+// row alone — including transient states like ContainerCreating /
+// PodInitializing that resolve themselves.
+//
+// `ErrImagePull` is the precursor to `ImagePullBackOff`; both appear in
+// real cluster traces depending on which kubelet sample lands first. We
+// accept either as the same failure mode.
+var stuckBuildWaitingReasons = map[string]bool{
+	"ImagePullBackOff":  true,
+	"ErrImagePull":      true,
+	"CrashLoopBackOff":  true,
+}
+
+// isStuckBuildState reports whether ALL container waiting reasons are in
+// the stuckBuildWaitingReasons set. An empty input (no pods at all) is
+// treated as not-stuck — the rollout may have just started and pods
+// haven't appeared yet, OR the namespace was reaped by another path
+// between PASS 3 and PASS 6. A "" reason in any slot is treated as
+// progressing (the pod is Running or in ContainerCreating without a
+// Waiting state).
+func isStuckBuildState(reasons []string) bool {
+	if len(reasons) == 0 {
+		return false
+	}
+	for _, r := range reasons {
+		if !stuckBuildWaitingReasons[r] {
+			return false
+		}
+	}
+	return true
+}
+
+// dominantStuckReason picks the most-frequent reason for the structured
+// log + error_message. Stable order on ties (first observed wins) so log
+// messages are deterministic across re-runs against the same pod set.
+func dominantStuckReason(reasons []string) string {
+	counts := make(map[string]int)
+	order := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		if _, seen := counts[r]; !seen {
+			order = append(order, r)
+		}
+		counts[r]++
+	}
+	best := ""
+	bestCount := 0
+	for _, r := range order {
+		if counts[r] > bestCount {
+			best = r
+			bestCount = counts[r]
+		}
+	}
+	return best
 }
 
 // ── audit emitters ───────────────────────────────────────────────────────

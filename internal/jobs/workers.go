@@ -653,10 +653,23 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	if l, ok := nsClient.(K8sNamespaceLister); ok {
 		nsLister = l
 	}
-	river.AddWorker(workers, WithObservability(
-		NewOrphanSweepReconciler(db, teamDeletionExecutor, orphanCanceler, nsLister),
-		nrApp,
-	))
+	// PASS 6 (stuck-build detection) pod-state seam — independent of
+	// nsClient so PASS 6 can be disabled in isolation if the kubelet/pod-list
+	// scope is ever revoked. In production both share the same
+	// kubernetes.Clientset.
+	var podStateClient PodStateProvider
+	if ps, psErr := NewK8sPodStateClient(); psErr != nil {
+		slog.Warn("jobs.orphan_sweep.pass6_pod_state_unavailable",
+			"error", psErr,
+			"effect", "stuck-build deployments will not auto-flip to failed; PASS 1-5 still run")
+	} else {
+		podStateClient = ps
+	}
+	orphanReconciler := NewOrphanSweepReconciler(db, teamDeletionExecutor, orphanCanceler, nsLister)
+	if podStateClient != nil {
+		orphanReconciler = orphanReconciler.WithPodStateProvider(podStateClient)
+	}
+	river.AddWorker(workers, WithObservability(orphanReconciler, nrApp))
 	// Provisioner-reconciler (W5-A). Every 2min, recovers or abandons
 	// stuck pending resources.
 	//
