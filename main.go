@@ -18,6 +18,7 @@ import (
 	commonplans "instant.dev/common/plans"
 	"instant.dev/worker/internal/config"
 	"instant.dev/worker/internal/db"
+	"instant.dev/worker/internal/handlers"
 	"instant.dev/worker/internal/jobs"
 	"instant.dev/worker/internal/obs"
 	"instant.dev/worker/internal/provisioner"
@@ -130,6 +131,12 @@ func main() {
 		fmt.Fprintf(w, `{"ok":true,"service":"instant-worker","commit_id":%q,"build_time":%q,"version":%q}`,
 			buildinfo.GitSHA, buildinfo.BuildTime, buildinfo.Version)
 	})
+	// /readyz — deep readiness probe (platform_db / redis / brevo /
+	// river). Wired to the k8s readinessProbe in the worker deployment
+	// manifest. /healthz stays the shallow liveness probe — see
+	// handlers/readyz.go for the rationale and the criticality matrix.
+	readyzH := handlers.NewReadyzHandler(cfg, database, rdb, workers)
+	mux.Handle("/readyz", http.HandlerFunc(readyzH.Get))
 	mux.Handle("/metrics", promhttp.Handler())
 	srv := &http.Server{Addr: ":8091", Handler: mux}
 	// Routed through jobs.SafeGo so a panic in the liveness server (or its
