@@ -205,6 +205,21 @@ var billingPaidTiers = map[string]bool{
 	"team":       true,
 }
 
+// terminalDowngradeTier is the canonical post-state tier for ANY terminal
+// Razorpay subscription event (cancel / expire / 7-day-grace-elapsed). Both
+// downgrade paths land here:
+//
+//  1. webhook → api/internal/handlers/billing.go (subscription.cancelled etc.)
+//  2. reconciler → billing_reconciler.go (this file, terminal status branch)
+//  3. grace expiry → payment_grace_terminator → api/internal/handlers/internal_terminate.go
+//
+// All three MUST write the same tier or two teams with the same canonical
+// outcome end up on different post-states (D28 F1, BugBash 2026-05-21).
+// "hobby" is the floor (lowest PAID tier); "free" is the 24h-TTL ephemeral
+// tier and is NOT a valid terminal target — see the long-form rationale in
+// the rzpStatusClassTerminal branch below.
+const terminalDowngradeTier = "hobby"
+
 // ── worker-local planIDToTier ─────────────────────────────────────────────────
 
 // Razorpay plan-id env-var names. These MUST match the names the api reads in
@@ -960,7 +975,13 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 				// PaidCount. (PaidCount==0 only means no *successful* charge
 				// was recorded — e.g. a failed first charge then cancellation;
 				// it is not a signal that resources should become ephemeral.)
-				const terminalDowngradeTier = "hobby"
+				//
+				// BugBash #9 / D28 F1 (2026-05-21): the api side
+				// /internal/teams/:id/terminate must also land on
+				// terminalDowngradeTier (was historically "free"). The
+				// constant is package-level so a coverage test can assert
+				// it (TestBillingReconciler_TerminalDowngradeTierIsHobby)
+				// and so future readers see the cross-repo contract.
 				targetTier := terminalDowngradeTier
 				slog.Warn("billing.reconciler.tier_corrected",
 					"team_id", team.id,

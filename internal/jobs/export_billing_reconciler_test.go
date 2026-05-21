@@ -50,6 +50,11 @@ func BillingTierRank(tier string) int {
 	return billingTierRank(tier)
 }
 
+// TerminalDowngradeTier exports the canonical terminal-subscription tier
+// the reconciler downgrades to. Used by TestBillingReconciler_TerminalDowngradeTierIsHobby
+// to lock the value (D28 F1, BugBash 2026-05-21).
+const TerminalDowngradeTier = terminalDowngradeTier
+
 // ErrReconcilerCircuitOpen exports errReconcilerCircuitOpen for circuit-open tests.
 var ErrReconcilerCircuitOpen = errReconcilerCircuitOpen
 
