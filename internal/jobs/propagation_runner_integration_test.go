@@ -237,6 +237,10 @@ func TestPropagation_UnknownKindIntegration_BoundedRetries(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, kind, team_id, target_tier, payload, attempts\s+FROM pending_propagations`).
 		WillReturnRows(sqlmock.NewRows(propagationSweepCols).
 			AddRow(propID, "garbage_kind_nobody_handles", teamID, "pro", []byte(`{}`), 0))
+	// D22-P3 lease bump (2026-05-21).
+	mock.ExpectExec(`UPDATE pending_propagations\s+SET next_attempt_at\s*=\s*\$1\s+WHERE id = ANY\(\$2::uuid\[\]\)`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	// Expected: markRetry fires (attempts++ + audit row). On master

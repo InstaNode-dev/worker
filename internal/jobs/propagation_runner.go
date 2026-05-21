@@ -474,6 +474,29 @@ func (w *PropagationRunnerWorker) Work(ctx context.Context, job *river.Job[Propa
 	return nil
 }
 
+// propagationLeaseDuration is how far forward we push next_attempt_at on
+// pick, BEFORE dispatching. The value MUST be >= propagationDispatchTimeout
+// — otherwise a long-running handler could see its row become eligible
+// again under a sibling pod's picker while the original handler is still
+// mid-flight, leading to redundant double-dispatch (idempotent, but
+// wastes provisioner cycles).
+//
+// D22-P3 (2026-05-21): a crash between pickEligible's COMMIT and the
+// handler's markRetry call previously left next_attempt_at unchanged.
+// On the next tick (30s later), the picker re-selected the same row
+// with attempts unchanged — a crashing pod could spin the same row
+// through the dispatch loop every 30s without ever incurring backoff,
+// effectively burning the maxAttempts budget against transient pod
+// failures rather than genuine downstream outages. The lease bump
+// inside the pick transaction pre-emptively schedules the row out by
+// propagationLeaseDuration; the normal dispatch path's markApplied /
+// markRetry overwrites this value on completion, so a healthy run is
+// unaffected. A crashed dispatch falls back to the lease — the row
+// re-enters the picker after propagationLeaseDuration with attempts
+// unchanged (the actual retry counter is bumped only by markRetry, so
+// a crashed dispatch correctly does NOT consume an attempt).
+const propagationLeaseDuration = 5 * time.Minute
+
 // pickEligible runs the SELECT … FOR UPDATE SKIP LOCKED that the runner
 // uses to claim a batch. Each picked row is implicitly locked for the
 // duration of the surrounding transaction; we COMMIT inside the picker
@@ -486,6 +509,15 @@ func (w *PropagationRunnerWorker) Work(ctx context.Context, job *river.Job[Propa
 // We use the FOR UPDATE SKIP LOCKED clause to keep two concurrent picks
 // from claiming the SAME rows (otherwise both pods would dispatch the
 // same handler twice in the same tick window).
+//
+// D22-P3 (2026-05-21): before COMMIT, we UPDATE the just-picked rows to
+// push next_attempt_at forward by propagationLeaseDuration. This is the
+// crash-safe lease: if the pod dies between COMMIT and the handler's
+// terminal markApplied/markRetry, the row is no longer eligible for
+// re-pick for propagationLeaseDuration. On the happy path the lease is
+// overwritten by markApplied/markRetry as before; on the crash path the
+// row gets a free backoff penalty (the same lease window) without
+// burning a retry attempt.
 func (w *PropagationRunnerWorker) pickEligible(ctx context.Context) ([]propagationRow, error) {
 	tx, err := w.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
@@ -527,11 +559,78 @@ func (w *PropagationRunnerWorker) pickEligible(ctx context.Context) ([]propagati
 	}
 	rows.Close()
 
+	// D22-P3 lease bump (2026-05-21). Push next_attempt_at on the
+	// just-picked, still-locked rows so a pod crash between COMMIT below
+	// and the per-row dispatch can't immediately re-stage the same rows
+	// on the next 30s tick. Done inside the SAME tx as the SELECT FOR
+	// UPDATE so the bump is atomic with the pick — no window where a
+	// sibling pod could SELECT before the bump.
+	//
+	// We do NOT bump attempts here — attempts is the failed-dispatch
+	// counter and a crashed pod's row shouldn't burn an attempt against
+	// the maxAttempts budget. last_error stays unchanged for the same
+	// reason; a crash is not a dispatch failure.
+	if len(out) > 0 {
+		ids := make([]uuid.UUID, 0, len(out))
+		for _, r := range out {
+			ids = append(ids, r.id)
+		}
+		// pq array binding via pq.Array would require importing lib/pq
+		// here; the picker already runs against pgx-compatible drivers
+		// where = ANY($1) accepts a []uuid.UUID. We pass the slice
+		// directly — both pgx and lib/pq honour this when the column
+		// type is uuid[].
+		nextAttempt := w.now().Add(propagationLeaseDuration)
+		if _, leaseErr := tx.ExecContext(ctx, `
+			UPDATE pending_propagations
+			   SET next_attempt_at = $1
+			 WHERE id = ANY($2::uuid[])
+			   AND applied_at IS NULL
+			   AND failed_at IS NULL
+		`, nextAttempt, pgUUIDArray(ids)); leaseErr != nil {
+			// Lease bump failed — log + proceed. The downside is the
+			// pre-D22-P3 behavior (crash → immediate re-pick) which is
+			// the SAME as before this fix shipped; the dispatch loop
+			// remains correct. We deliberately do NOT abort the tick.
+			slog.Warn("jobs.propagation_runner.lease_bump_failed",
+				"error", leaseErr,
+				"picked_count", len(out),
+				"note", "rows will dispatch but crash-resume window may re-pick on next tick",
+			)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit pick tx: %w", err)
 	}
 	committed = true
 	return out, nil
+}
+
+// pgUUIDArray formats a []uuid.UUID as a Postgres array literal suitable
+// for `$N::uuid[]` parameter binding via the standard database/sql driver.
+// Returns the literal as a string (e.g. `{a-b-c-...,d-e-f-...}`) — the
+// driver round-trips this through the array text protocol. Empty slice
+// returns `{}` (a valid empty PG array).
+//
+// We hand-roll this rather than depend on lib/pq's Array() helper so the
+// worker stays driver-agnostic — the propagation_runner_integration_test
+// runs against TEST_DATABASE_URL with whichever driver the operator
+// configures (pgx or lib/pq).
+func pgUUIDArray(ids []uuid.UUID) string {
+	if len(ids) == 0 {
+		return "{}"
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(id.String())
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 // propagationBackoffFor returns the delay to apply BEFORE the next attempt
