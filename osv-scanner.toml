@@ -1,0 +1,30 @@
+# OSV-Scanner config
+#
+# prometheus/prometheus CVEs below are TRANSITIVE-ONLY findings — the
+# worker doesn't directly import or call any code from the prometheus
+# server binary module. govulncheck (which is call-graph aware) confirms
+# zero called vulnerabilities on master HEAD.
+#
+# OSV-Scanner reports any module-graph CVE without reachability, so it
+# flags these 4 even though our binary never reaches the vulnerable
+# code paths. Suppressing with explicit rationale per CLAUDE.md rule 25.
+#
+# These suppressions will lift when an upstream transitive consumer
+# (likely OTel Collector or Grafana SDK) upgrades to a prometheus
+# server module > v0.303.0.
+
+[[IgnoredVulns]]
+id = "GHSA-8rm2-7qqf-34qm"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Server-binary module, no reachable code path."
+
+[[IgnoredVulns]]
+id = "GHSA-fw8g-cg8f-9j28"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Server-binary module, no reachable code path."
+
+[[IgnoredVulns]]
+id = "GHSA-vffh-x6r8-xx99"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Server-binary module, no reachable code path."
+
+[[IgnoredVulns]]
+id = "GHSA-wg65-39gg-5wfj"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Server-binary module, no reachable code path."
