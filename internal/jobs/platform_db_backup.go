@@ -455,6 +455,27 @@ func (w *PlatformDBBackupWorker) Work(ctx context.Context, job *river.Job[Platfo
 		"s3_key", key,
 		"swept_objects", deleted,
 	)
+	// D26-F7 (2026-05-21): emit the literal "backup OK" success line that
+	// the infra/newrelic/alerts/backup-stale-36h.json NR alert keys on.
+	// The CronJob-based backups (postgres-customers-backup, mongodb-backup,
+	// redis-provision-backup) emit `[<ts>] backup OK` per the alert's
+	// `message LIKE '%backup OK%'` predicate; this River job previously
+	// emitted only the structured `jobs.platform_db_backup.succeeded`
+	// line and was invisible to the staleness alert. Operator-visible
+	// symptom pre-fix: a silent platform_db_backup failure would persist
+	// until someone manually inspected audit_log for
+	// platform_backup.failed.
+	//
+	// Keep both lines: the structured one is the dashboard/query surface,
+	// the literal one is the alert trigger. Rule 25 ("every metric
+	// ships with its alert") — same principle applies to log-based
+	// alerts.
+	slog.Info("backup OK",
+		"kind", "platform_db",
+		"size_bytes", size,
+		"duration_seconds", duration.Seconds(),
+		"s3_key", key,
+	)
 	return nil
 }
 
