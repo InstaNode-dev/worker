@@ -12,27 +12,145 @@ permissions:
 jobs:
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # Service containers mirror ci.yml's build-and-test job. Without these
+    # `go test ./...` ran with no DB and coverage measured only the handful
+    # of pure-unit packages — every integration-style test (the
+    # propagation_runner live-DB walk, anything that pings TEST_DATABASE_URL)
+    # skipped or returned 0% coverage for the touched lines. See CLAUDE.md
+    # rule 23 (the local gate must equal CI) — coverage.yml must run the
+    # same hermetic suite ci.yml does.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instant_dev_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mongo:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Worker tests read TEST_DATABASE_URL (propagation_runner integration
+      # walk) and skip when unset. CUSTOMER_DATABASE_URL / MONGO_ADMIN_URI /
+      # CUSTOMER_REDIS_URL are read by internal/config at boot — wire them
+      # too so config-walk tests don't no-op.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/15
+      # Customer DB admin target — provisioner-style integration tests
+      # CREATE a customer database on this connection; matches ci.yml.
+      TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@localhost:5432/instant_customers?sslmode=disable
+      # Mongo admin URI — nosql provider tests skip cleanly when unset;
+      # wire it so the nosql packages contribute to coverage too.
+      TEST_MONGO_URI: mongodb://localhost:27017
+      # Cross-repo registry-iterating gate (CLAUDE.md rule 18). Tells
+      # coverage_registry_test.go's findApiRepoRoot() exactly where the api
+      # sibling is — without it the cross-repo tests skip in CI and we lose
+      # the drift-detection coverage. Mirrors ci.yml.
+      INSTANT_API_REPO: ${{ github.workspace }}/../api
     steps:
       - uses: actions/checkout@v4
         with:
           path: worker
-      - uses: actions/checkout@v4
+
+      - name: Checkout proto sibling (for go.mod replace ../proto)
+        uses: actions/checkout@v4
         with:
-          repository: InstaNode-dev/common
-          path: common
-        continue-on-error: true
-      - uses: actions/checkout@v4
-        with:
-          repository: InstaNode-dev/proto
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: proto
-        continue-on-error: true
+
+      - name: Checkout common sibling (for go.mod replace ../common)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: common
+
+      # Cross-repo registry-iterating tests (CLAUDE.md rule 18) text-walk
+      # api/internal/models/audit_kinds.go to assert worker auditKind* wire
+      # values match the api source. Without this checkout the tests SKIP
+      # in CI, leaving cross-repo drift detection to developer machines
+      # only. INSTANT_API_REPO env (set above) locates this checkout.
+      - name: Checkout api sibling (for cross-repo registry-iterating tests)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: _api_ci
+          fetch-depth: 1
+      - run: mv _api_ci ../api
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: worker/go.mod
+
+      - name: Apply DB migrations to the test database
+        # Worker has its own SQL files in worker/sql/ (forwarder_sent +
+        # resource_heartbeat + backups). The bulk of the schema the worker
+        # reads (teams / resources / pending_propagations / audit_log) is
+        # owned by api/internal/db/migrations/ — apply those first, then
+        # the worker-local files. Mirrors what `make test-db-up` does for
+        # an integrated worker+api test run. Creates instant_customers too
+        # since some integration tests touch the customer DB.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          # api-owned schema (canonical platform_db source of truth)
+          if [ -d ../api/internal/db/migrations ]; then
+            for f in $(ls ../api/internal/db/migrations/*.sql | sort); do
+              echo "→ applying api migration $(basename "$f")"
+              psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null
+            done
+            echo "all api migrations applied to instant_dev_test"
+          else
+            echo "::warning::no api migrations directory found at ../api/internal/db/migrations — registry-iterating tests will skip"
+          fi
+          # worker-owned schema (forwarder_sent enrich + delivered_at columns,
+          # resource_heartbeat, backups). Applied on top — IF NOT EXISTS guards
+          # keep these idempotent against api-side counterparts.
+          if [ -d worker/sql ]; then
+            for f in $(ls worker/sql/*.sql | sort); do
+              echo "→ applying worker migration $(basename "$f")"
+              psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null || echo "::warning::worker migration $(basename "$f") failed — likely overlap with api schema; continuing"
+            done
+          fi
+          psql -h localhost -U postgres -d postgres -c "CREATE DATABASE instant_customers" >/dev/null
+          echo "created instant_customers (customer DB admin target)"
+
       - name: Generate coverage
         working-directory: worker
-        run: go test ./... -short -coverprofile=coverage.out -covermode=atomic || true
+        # `-p 1` matches ci.yml's build-and-test invocation — every package
+        # shares the single instant_dev_test DB + redis/15; default
+        # parallelism corrupts shared state mid-test. `-short` matches the
+        # hermetic suite (e2e/chaos tests are tagged and excluded from
+        # ./... anyway). continue-on-error so a single flaky test doesn't
+        # drop the entire coverage artifact — codecov still ingests cov.out.
+        continue-on-error: true
+        run: go test ./... -short -count=1 -p 1 -coverprofile=coverage.out -covermode=atomic
+
       - uses: codecov/codecov-action@v4
         with:
           files: worker/coverage.out
