@@ -23,7 +23,7 @@ func TestMaskEmail_BasicShapes(t *testing.T) {
 		{"alice@example.com", "a***@example.com"},
 		{"a@example.com", "a@example.com"}, // 1-char local preserved
 		{"bb20-t7-1779218881@instanode-test.dev", "b***@instanode-test.dev"},
-		{"REDACTED@gmail.com", "m***@gmail.com"},
+		{"testuser805@gmail.com", "t***@gmail.com"},
 		{"@onlydomain.com", "@onlydomain.com"}, // empty local — return unchanged (defensive)
 		{"no-at-sign", "no-at-sign"},
 		{"", ""},
