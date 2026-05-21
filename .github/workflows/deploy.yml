@@ -70,6 +70,20 @@ jobs:
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: proto
 
+      # Cross-repo registry-iterating tests (CLAUDE.md rule 18) text-walk
+      # api/internal/models/audit_kinds.go and api/e2e/reliability_contract_test.go
+      # to assert worker auditKind* wire values match the api source. Without
+      # this checkout the tests SKIP in deploy CI, leaving cross-repo drift
+      # detection to developer machines only. INSTANT_API_REPO is set on the
+      # test step below so findApiRepoRoot() locates the sibling deterministically.
+      - name: Checkout api sibling into ./api (for cross-repo registry-iterating tests)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: api
+          fetch-depth: 1
+
       - name: Compute build metadata
         id: meta
         run: |
@@ -91,7 +105,14 @@ jobs:
         # `replace instant.dev/proto => ../proto`. When `go test` runs
         # inside ./worker, the relative paths resolve to ./common and
         # ./proto in the workspace root — already correct, no mv needed.
+        # INSTANT_API_REPO points findApiRepoRoot() (used by
+        # TestWorkerAuditKinds_ValuesMatchApiConstants +
+        # TestSupportedAuditKinds_CoveredByApiSpecOrDocumentedWorkerOnly)
+        # at the api sibling checked out above; without this they SKIP
+        # and the cross-repo wire-value drift gate doesn't run in CI.
         working-directory: worker
+        env:
+          INSTANT_API_REPO: ${{ github.workspace }}/api
         run: go test ./... -short -count=1
 
       - name: Set up Docker Buildx
