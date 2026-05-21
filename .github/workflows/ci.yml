@@ -3,8 +3,29 @@ name: CI
 on:
   push:
     branches: [master]
+    # CI-minute savings (2026-05-21): skip CI on docs-only commits.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'CLAUDE.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'BUGBASH-*/**'
   pull_request:
     branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'CLAUDE.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'BUGBASH-*/**'
+
+concurrency:
+  # CI-minute savings (2026-05-21): cancel prior in-flight CI for the same
+  # branch/PR when a new commit lands.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Stale-green guard. A PR can show a green CI run that was executed BEFORE a
