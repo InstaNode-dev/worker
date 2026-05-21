@@ -52,10 +52,28 @@ jobs:
           path: _common_ci
       - run: mv _common_ci ../common
 
+      # Cross-repo registry-iterating tests (CLAUDE.md rule 18) text-walk
+      # api/internal/models/audit_kinds.go and api/e2e/reliability_contract_test.go
+      # to assert worker auditKind* wire values match the api source. Without
+      # this checkout the tests SKIP in CI, leaving cross-repo drift detection
+      # to developer machines only. INSTANT_API_REPO is set on the test step
+      # below so findApiRepoRoot() locates the sibling deterministically.
+      - name: Checkout api sibling (for cross-repo registry-iterating tests)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: _api_ci
+          fetch-depth: 1
+      - run: mv _api_ci ../api
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
 
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./... -v -race -count=1
+      - name: Run tests (with INSTANT_API_REPO for cross-repo gate)
+        env:
+          INSTANT_API_REPO: ${{ github.workspace }}/../api
+        run: go test ./... -v -race -count=1
