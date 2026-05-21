@@ -57,6 +57,16 @@ func main() {
 	database := db.ConnectPostgres(cfg.DatabaseURL)
 	defer database.Close()
 
+	// Pool-saturation observability (Wave-3 chaos verify, 2026-05-21).
+	// Ticks every 5s and pushes *sql.DB.Stats onto instant_pg_pool_*
+	// Prometheus gauges. Lets operators see worker's pool saturation
+	// independently from api's so the next time DO Managed Postgres is
+	// exhausted, the cause is localized in real time instead of after
+	// the fact via event_email_forwarder failures.
+	poolStatsCtx, poolStatsCancel := context.WithCancel(context.Background())
+	defer poolStatsCancel()
+	go db.StartPoolStatsExporter(poolStatsCtx, database, "platform_db")
+
 	rdb := db.ConnectRedis(cfg.RedisURL)
 	defer rdb.Close()
 
