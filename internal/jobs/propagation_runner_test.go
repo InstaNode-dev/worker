@@ -125,6 +125,13 @@ func TestPropagationRunner_AppliesEligibleRow(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, kind, team_id, target_tier, payload, attempts\s+FROM pending_propagations`).
 		WillReturnRows(sqlmock.NewRows(propagationSweepCols).
 			AddRow(propID, propagationKindTierElevation, teamID, "pro", []byte(`{}`), 0))
+	// D22-P3 lease bump (2026-05-21): inside the pick tx, push
+	// next_attempt_at on the just-picked rows by propagationLeaseDuration
+	// so a crash before markApplied/markRetry can't immediately re-stage
+	// the row on the next 30s tick.
+	mock.ExpectExec(`UPDATE pending_propagations\s+SET next_attempt_at\s*=\s*\$1\s+WHERE id = ANY\(\$2::uuid\[\]\)`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	// Handler queries the team's resources.
@@ -172,6 +179,10 @@ func TestPropagationRunner_RetryOnFailure_PersistsBackoff(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, kind, team_id, target_tier, payload, attempts\s+FROM pending_propagations`).
 		WillReturnRows(sqlmock.NewRows(propagationSweepCols).
 			AddRow(propID, propagationKindTierElevation, teamID, "pro", []byte(`{}`), 0))
+	// D22-P3 lease bump (2026-05-21).
+	mock.ExpectExec(`UPDATE pending_propagations\s+SET next_attempt_at\s*=\s*\$1\s+WHERE id = ANY\(\$2::uuid\[\]\)`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	mock.ExpectQuery(`SELECT r\.id, r\.token, r\.provider_resource_id, r\.tier, r\.resource_type`).
@@ -225,6 +236,10 @@ func TestPropagationRunner_DeadLettersAfterMaxAttempts(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, kind, team_id, target_tier, payload, attempts\s+FROM pending_propagations`).
 		WillReturnRows(sqlmock.NewRows(propagationSweepCols).
 			AddRow(propID, propagationKindTierElevation, teamID, "pro", []byte(`{}`), propagationMaxAttempts-1))
+	// D22-P3 lease bump (2026-05-21).
+	mock.ExpectExec(`UPDATE pending_propagations\s+SET next_attempt_at\s*=\s*\$1\s+WHERE id = ANY\(\$2::uuid\[\]\)`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	mock.ExpectQuery(`SELECT r\.id, r\.token, r\.provider_resource_id, r\.tier, r\.resource_type`).

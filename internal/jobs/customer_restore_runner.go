@@ -25,7 +25,6 @@
 package jobs
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -36,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -129,6 +129,24 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 		return nil
 	}
 
+	// D26-F5 (2026-05-21): stuck-row recovery — mirrors the equivalent
+	// pass in customer_backup_runner.go (P2-W4). A restore row is
+	// atomically claimed by flipping status 'pending' → 'running'. If the
+	// worker pod is killed mid-pg_restore (rolling deploy, OOM, node
+	// drain) AFTER the claim but BEFORE finalize/markRestoreFailed, the
+	// row is orphaned at 'running' forever — the pending-row sweep below
+	// only selects status='pending', so no runner ever picks it up again.
+	// Customer support's "why is my restore stuck for 6h" ticket is the
+	// user-visible symptom. Recovery: any 'running' row whose started_at
+	// is older than restorePerRunTimeout could not still be a live
+	// in-flight restore (the per-run context would have fired), so it is
+	// marked 'failed' with an explicit error_summary. We deliberately do
+	// NOT re-queue these (unlike the backup runner) — restore is a
+	// destructive operation gated on user intent, and a silent retry of
+	// a half-completed pg_restore could compound database corruption.
+	// The user can re-issue the POST /resources/:id/restore manually.
+	w.recoverStuckRestores(ctx)
+
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT rr.id::text, rr.resource_id::text, rr.backup_id::text,
 		       rb.s3_key, rb.sha256,
@@ -212,6 +230,40 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 	return nil
 }
 
+// recoverStuckRestores marks restore rows orphaned at status='running' as
+// 'failed' with a worker_killed_during_restore reason. A row qualifies only
+// when started_at is older than restorePerRunTimeout — a genuinely
+// in-flight restore is bounded by that per-run context, so anything older
+// is a casualty of a pod kill, not a live job. Best-effort: a failure here
+// is logged and the sweep proceeds.
+//
+// Unlike customer_backup_runner.recoverStuckRows (which re-queues to
+// 'pending'), this path TERMINATES the row at 'failed'. pg_restore is
+// destructive — a half-completed restore that re-queues for retry could
+// compound the partial-state damage. The customer can manually re-issue
+// POST /resources/:id/restore after inspecting the resource state.
+func (w *CustomerRestoreRunnerWorker) recoverStuckRestores(ctx context.Context) {
+	res, err := w.db.ExecContext(ctx, `
+		UPDATE resource_restores
+		   SET status        = 'failed',
+		       finished_at   = now(),
+		       error_summary = 'worker_killed_during_restore: runner pod lost before finalize — pg_restore may have partially applied; re-issue restore after inspecting resource state'
+		 WHERE status = 'running'
+		   AND started_at IS NOT NULL
+		   AND started_at < now() - ($1::int * INTERVAL '1 second')
+	`, int(w.timeout.Seconds()))
+	if err != nil {
+		slog.Warn("jobs.customer_restore_runner.stuck_row_recovery_failed", "error", err)
+		return
+	}
+	if n, raErr := res.RowsAffected(); raErr == nil && n > 0 {
+		slog.Warn("jobs.customer_restore_runner.recovered_stuck_rows",
+			"count", n,
+			"note", "rows orphaned at status='running' past the per-run timeout — marked failed (NOT re-queued; pg_restore is destructive)",
+		)
+	}
+}
+
 // processRestore runs a single restore row. Returns true on success.
 func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, p struct {
 	restoreID    string
@@ -277,31 +329,55 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 		return false
 	}
 
-	// Download from S3. We buffer the WHOLE object into memory rather than
-	// streaming it straight into gunzip→pg_restore, because the SHA-256
-	// integrity check below must hash the exact bytes BEFORE pg_restore's
-	// `--clean --if-exists` DROPs every table. A streaming verify-as-you-go
-	// would only detect a mismatch after the destructive restore already ran.
-	// Memory cost is bounded by the per-tier backup size (the same gzipped
-	// object the backup runner already round-trips through io.Pipe).
+	// Download from S3 → temp file via streaming TeeReader. We MUST verify
+	// the SHA-256 BEFORE invoking pg_restore (its `--clean --if-exists`
+	// would otherwise DROP every table from an unverified — potentially
+	// truncated / bit-rotted — archive before the mismatch was detected).
+	//
+	// D26-F4 (2026-05-21): the previous implementation `io.ReadAll`-ed the
+	// whole object into RAM to satisfy the "hash before restore" ordering.
+	// A multi-GB pro/team backup OOM-killed the worker pod. Fix: tee the
+	// S3 read stream into BOTH a sha256.New() hasher AND a bounded temp
+	// file. Memory footprint stays at the io.Copy buffer (~32 KiB) while
+	// the digest is computed inline. The temp file is rewound to offset 0
+	// for the gunzip + pg_restore step once the SHA gate has passed.
+	//
+	// Temp file lives under os.TempDir() (the pod's emptyDir / tmpfs);
+	// caller MUST `defer os.Remove` to avoid leaks across worker restarts.
 	obj, dlErr := w.store.Download(ctx, w.bucket, p.s3Key.String)
 	if dlErr != nil {
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("S3 download failed: %v", dlErr), start, p)
 		return false
 	}
-	objBytes, readErr := io.ReadAll(obj)
-	obj.Close()
-	if readErr != nil {
-		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("S3 read failed: %v", readErr), start, p)
+
+	tmpFile, tmpErr := os.CreateTemp("", "instant-restore-*.dump.gz")
+	if tmpErr != nil {
+		obj.Close()
+		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("create temp file: %v", tmpErr), start, p)
 		return false
 	}
+	// Always clean up — the temp file is destructively rewritten on every
+	// restore, and a pod restart would otherwise leak the file on /tmp.
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+	}()
 
-	// Integrity gate. The backup runner (customer_backup_runner.go, FIX-H
-	// #59) hashes the COMPRESSED (gzipped) object — its SHA-256 hasher sits
-	// in an io.MultiWriter fed by the gzip writer's output, i.e. the exact
-	// bytes uploaded to S3. So we hash objBytes here (still gzipped, BEFORE
-	// gunzip) to compare against the stored digest. A mismatch means the
-	// object bit-rotted or was truncated in transit → refuse to restore.
+	hasher := sha256.New()
+	tee := io.TeeReader(obj, hasher)
+	if _, copyErr := io.Copy(tmpFile, tee); copyErr != nil {
+		obj.Close()
+		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("S3 read failed: %v", copyErr), start, p)
+		return false
+	}
+	obj.Close()
+
+	// Integrity gate (same semantics as before — only the hashing path
+	// changed). The backup runner (customer_backup_runner.go, FIX-H #59)
+	// hashes the COMPRESSED (gzipped) object — its SHA-256 hasher sits in
+	// an io.MultiWriter fed by the gzip writer's output, i.e. the exact
+	// bytes uploaded to S3. We hash the same gzipped stream here (BEFORE
+	// gunzip) to compare against the stored digest.
 	//
 	// Fail-open on a NULL/empty stored digest: rows predating migration
 	// 043_backup_sha256.sql have no sha256, and the documented contract is
@@ -314,8 +390,7 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 			"backup_id", p.backupID,
 		)
 	} else {
-		sum := sha256.Sum256(objBytes)
-		actualDigest := hex.EncodeToString(sum[:])
+		actualDigest := hex.EncodeToString(hasher.Sum(nil))
 		if !strings.EqualFold(actualDigest, storedDigest) {
 			w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf(
 				"%s: sha256 mismatch (stored %s, downloaded %s) — backup object is corrupt or truncated; pg_restore NOT run",
@@ -324,8 +399,15 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 		}
 	}
 
-	// Verified (or fail-open legacy) → gunzip the buffered bytes and restore.
-	gzReader, gzErr := gzip.NewReader(bytes.NewReader(objBytes))
+	// Verified (or fail-open legacy) → rewind temp file, gunzip, and
+	// stream into pg_restore. The gunzip reader holds at most one block
+	// of decompressed data at a time, so the pg_restore stdin pipe never
+	// buffers the whole archive in memory.
+	if _, seekErr := tmpFile.Seek(0, io.SeekStart); seekErr != nil {
+		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("rewind temp file: %v", seekErr), start, p)
+		return false
+	}
+	gzReader, gzErr := gzip.NewReader(tmpFile)
 	if gzErr != nil {
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("gunzip header: %v", gzErr), start, p)
 		return false
