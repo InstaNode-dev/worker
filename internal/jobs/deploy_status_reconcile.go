@@ -171,7 +171,7 @@ type deployStatusK8sProvider interface {
 // Wraps a kubernetes.Clientset so the reconciler doesn't import the full client
 // surface at every callsite.
 type k8sDeployStatusClient struct {
-	cs *kubernetes.Clientset
+	cs kubernetes.Interface
 }
 
 // GetDeployment implements deployStatusK8sProvider.
@@ -203,7 +203,15 @@ func NewK8sDeployStatusClientWithAutopsy() (deployStatusK8sProvider, deployAutop
 	if err != nil {
 		return nil, nil, err
 	}
-	return &k8sDeployStatusClient{cs: cs}, NewK8sAutopsyClient(cs), nil
+	status, autopsy := buildDeployStatusAndAutopsy(cs)
+	return status, autopsy, nil
+}
+
+// buildDeployStatusAndAutopsy wires the status + autopsy providers around a
+// single kubernetes.Interface. Split out from NewK8sDeployStatusClientWithAutopsy
+// so the wiring is exercisable with a fake.Clientset without a live cluster.
+func buildDeployStatusAndAutopsy(cs kubernetes.Interface) (deployStatusK8sProvider, deployAutopsyK8sProvider) {
+	return &k8sDeployStatusClient{cs: cs}, NewK8sAutopsyClient(cs)
 }
 
 // newDeployK8sClientset builds a kubernetes.Clientset from in-cluster config,

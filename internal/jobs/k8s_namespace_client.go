@@ -43,7 +43,7 @@ import (
 // k8sNamespaceClient is the concrete K8sNamespaceDeleter. Wraps a
 // kubernetes.Clientset.
 type k8sNamespaceClient struct {
-	cs *kubernetes.Clientset
+	cs kubernetes.Interface
 }
 
 // NewK8sNamespaceClient builds a K8sNamespaceDeleter from in-cluster config,
@@ -167,7 +167,7 @@ func (c *k8sNamespaceClient) GetNamespaceAge(ctx context.Context, namespace stri
 // are constructed in StartWorkers from a single newDeployK8sClientset()
 // call so they share a TCP connection pool to the k8s API.
 type k8sPodStateClient struct {
-	cs *kubernetes.Clientset
+	cs kubernetes.Interface
 }
 
 // NewK8sPodStateClient builds the PASS 6 pod-state seam. Returns (nil, err)
