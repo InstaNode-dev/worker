@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	madmin "github.com/minio/madmin-go/v3"
@@ -570,7 +571,11 @@ func deleteStorageObjects(ctx context.Context, deleter S3BackupDeleter, bucket, 
 	// with thousands of objects doesn't pull the whole listing into memory —
 	// the same pipe pattern as team_deletion_executor.deleteS3BackupsForToken.
 	objectsCh := make(chan minio.ObjectInfo, 32)
-	var objectCount int
+	// objectCount is incremented in the producer goroutine below and read
+	// after the RemoveObjects drain loop on the consumer side — use an
+	// atomic so the cross-goroutine read in the final slog is race-free
+	// (the -race build flagged the plain-int read otherwise).
+	var objectCount atomic.Int64
 	go func() {
 		defer close(objectsCh)
 		defer func() {
@@ -591,7 +596,7 @@ func deleteStorageObjects(ctx context.Context, deleter S3BackupDeleter, bucket, 
 				)
 				return
 			}
-			objectCount++
+			objectCount.Add(1)
 			select {
 			case objectsCh <- obj:
 			case <-ctx.Done():
@@ -617,7 +622,7 @@ func deleteStorageObjects(ctx context.Context, deleter S3BackupDeleter, bucket, 
 		"resource_id", resourceID,
 		"token", logsafe.Token(token),
 		"prefix", prefix,
-		"objects_listed", objectCount,
+		"objects_listed", objectCount.Load(),
 		"remove_errors", removeErrors,
 		"job_id", jobID,
 	)
