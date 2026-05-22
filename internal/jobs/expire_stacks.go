@@ -28,6 +28,20 @@ import (
 // services, ingress, and TLS cert forever with no DB pointer.
 const ExpireStacksNamespacePrefix = "instant-stack-"
 
+// saTokenFile / saCAFile are the in-cluster ServiceAccount projected-volume
+// paths. They are package vars (not consts) ONLY so tests can point them at
+// a temp file to exercise the in-cluster HTTP teardown path; production never
+// reassigns them.
+var (
+	saTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	saCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+)
+
+// k8sAPIBaseURL is the in-cluster Kubernetes API base. Package var ONLY so
+// tests can redirect the DELETE at an httptest server; production keeps the
+// default in-cluster service DNS name.
+var k8sAPIBaseURL = "https://kubernetes.default.svc"
+
 // ExpireStacksArgs holds the arguments for the ExpireStacksJob.
 // No fields are needed — it's a periodic maintenance job.
 type ExpireStacksArgs struct{}
@@ -37,14 +51,10 @@ func (ExpireStacksArgs) Kind() string { return "expire_stacks" }
 // inClusterK8sClient builds an HTTP client using the pod's projected ServiceAccount
 // token and CA certificate. Returns nil (with a warning) if not running in-cluster.
 func inClusterK8sClient() *http.Client {
-	const (
-		tokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-		caFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	)
-	if _, err := os.Stat(tokenFile); err != nil {
+	if _, err := os.Stat(saTokenFile); err != nil {
 		return nil // not running in-cluster
 	}
-	ca, err := os.ReadFile(caFile)
+	ca, err := os.ReadFile(saCAFile)
 	if err != nil {
 		slog.Warn("expire_stacks: cannot read SA CA cert — namespace teardown disabled", "error", err)
 		return nil
@@ -68,12 +78,12 @@ func deleteK8sNamespace(ctx context.Context, client *http.Client, namespace, nsP
 		return nil
 	}
 
-	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	tokenBytes, err := os.ReadFile(saTokenFile)
 	if err != nil {
 		return fmt.Errorf("deleteK8sNamespace: read SA token: %w", err)
 	}
 
-	apiURL := "https://kubernetes.default.svc/api/v1/namespaces/" + namespace
+	apiURL := k8sAPIBaseURL + "/api/v1/namespaces/" + namespace
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiURL, nil)
 	if err != nil {
 		return fmt.Errorf("deleteK8sNamespace: build request: %w", err)
