@@ -18,6 +18,17 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
+// Package-private function pointers for test injection. Production
+// code points them at the real OTel SDK constructors; tests overwrite
+// them via the `setExporterCtor` / `setResourceCtor` helpers below so
+// the rare-but-real failure branches (exporter build error, resource
+// build error) become reachable in unit tests without standing up a
+// broken collector.
+var (
+	newExporterFn = otlptracegrpc.New
+	newResourceFn = resource.New
+)
+
 // InitTracer configures the global OpenTelemetry tracer provider.
 //
 // Endpoint selection (in order of precedence):
@@ -90,13 +101,13 @@ func InitTracer(serviceName, otlpEndpoint string) func(context.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	exporter, err := otlptracegrpc.New(ctx, opts...)
+	exporter, err := newExporterFn(ctx, opts...)
 	if err != nil {
 		slog.Error("telemetry.otlp_exporter_failed", "error", err, "endpoint", ep, "tls", useTLS)
 		return func(context.Context) error { return nil }
 	}
 
-	res, err := resource.New(ctx,
+	res, err := newResourceFn(ctx,
 		resource.WithAttributes(semconv.ServiceName(serviceName)),
 	)
 	if err != nil {
