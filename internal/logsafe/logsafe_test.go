@@ -37,6 +37,31 @@ func TestToken_BasicShapes(t *testing.T) {
 	}
 }
 
+// TestItoa covers the internal base-10 itoa helper directly, including
+// the n==0 and (defensive) n<0 branches that Token() can never reach via
+// a real len() argument. Pinning these keeps the helper safe to reuse.
+func TestItoa(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{1, "1"},
+		{7, "7"},
+		{42, "42"},
+		{1000, "1000"},
+		// Defensive negative path — len() can't produce this, but the
+		// helper must not crash and must render a leading minus sign.
+		{-1, "-1"},
+		{-42, "-42"},
+	}
+	for _, c := range cases {
+		if got := itoa(c.in); got != c.want {
+			t.Errorf("itoa(%d) = %q; want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestToken_NoLeakBeyondPrefix is the substantive regression guard:
 // for any token longer than 8 chars, the redacted output must NOT
 // contain any character from position [8:] of the original. Catches

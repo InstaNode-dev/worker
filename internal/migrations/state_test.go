@@ -99,6 +99,65 @@ func TestReader_NilDB(t *testing.T) {
 	}
 }
 
+// TestNewReader_Defaults exercises both fallback branches: ttl <= 0 must
+// clamp to defaultTTL, and a nil clock must default to time.Now. We can't
+// read the unexported fields from outside, so we verify behaviourally:
+// with the defaulted clock + TTL, a fresh Get refreshes from the DB and a
+// second immediate Get serves from cache (proving the TTL is the positive
+// defaultTTL, not the passed-in 0).
+func TestNewReader_Defaults(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Exactly one query pair — the second Get must hit the cache, which
+	// only happens if ttl was clamped to a positive defaultTTL (not 0).
+	mock.ExpectQuery(`SELECT filename FROM schema_migrations`).
+		WillReturnRows(sqlmock.NewRows([]string{"filename"}).AddRow("001_initial.sql"))
+	mock.ExpectQuery(`SELECT COUNT\(\*\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	// ttl=0 -> defaultTTL; clock=nil -> time.Now.
+	r := NewReader(db, 0, nil)
+	a := r.Get(context.Background())
+	b := r.Get(context.Background())
+	if a != b || a.Status != StatusOK || a.Count != 1 {
+		t.Fatalf("expected cached StatusOK after defaulting: %+v vs %+v", a, b)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet: %v", err)
+	}
+}
+
+// TestQueryState_CountError covers the COUNT query failure path: the
+// filename query succeeds but the count query errors, so queryState must
+// return StatusUnknown + the error.
+func TestQueryState_CountError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT filename FROM schema_migrations`).
+		WillReturnRows(sqlmock.NewRows([]string{"filename"}).AddRow("042_x.sql"))
+	mock.ExpectQuery(`SELECT COUNT\(\*\)`).
+		WillReturnError(errors.New("count query failed"))
+
+	s, err := queryState(context.Background(), db)
+	if err == nil {
+		t.Fatalf("expected error from count query")
+	}
+	if s.Status != StatusUnknown {
+		t.Fatalf("Status: got %q want %q", s.Status, StatusUnknown)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet: %v", err)
+	}
+}
+
 // TestQueryState_NoRows surfaces StatusOK with empty filename. A fresh DB
 // where schema_migrations exists but is empty (boot-time race) is valid.
 func TestQueryState_NoRows(t *testing.T) {
