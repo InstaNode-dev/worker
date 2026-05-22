@@ -55,6 +55,13 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
+// jsonMarshal is the indirection point for encoding/json.Marshal. Production
+// binds it to the stdlib func; tests override it to exercise the metadata
+// marshal-error fail-open arm in Work, which is otherwise unreachable because
+// a map[string]any of primitive-only values never fails to marshal in
+// practice. Reset to json.Marshal after override.
+var jsonMarshal = json.Marshal
+
 // ExpireImminentArgs is the River job payload — no fields, runs as a sweep.
 type ExpireImminentArgs struct{}
 
@@ -254,7 +261,7 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 			"upgrade_url":     "https://instanode.dev/app/billing?upgrade=hobby&source=resource_expiry_imminent",
 			"resource_url":    "https://instanode.dev/app/resources/" + r.resourceID.String(),
 		}
-		metaBytes, mErr := json.Marshal(meta)
+		metaBytes, mErr := jsonMarshal(meta)
 		if mErr != nil {
 			// json.Marshal on a map[string]any of primitives can't
 			// fail in practice; treat as a logged skip just in case.
