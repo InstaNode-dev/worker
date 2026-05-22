@@ -37,6 +37,21 @@ import (
 	"instant.dev/worker/internal/logsafe"
 )
 
+// sqlOpen is the indirection point for database/sql.Open. Production binds it
+// to the stdlib func; tests override it to exercise the open-error fail-open
+// arms in revokePostgres / grantPostgres. With lib/pq those arms are otherwise
+// unreachable — its Open is fully lazy and surfaces connection errors only on
+// first use (the already-covered Exec path). Reset to sql.Open after override.
+var sqlOpen = sql.Open
+
+// validateIdent is the indirection point for validateSuspendIdent. Production
+// binds it to the real validator; tests override it to drive the user-arm
+// error return in revokePostgres / grantPostgres, which is otherwise
+// unreachable because db_<token> and usr_<token> share the same token (so the
+// db check always fails first for any token that would fail validation).
+// Reset to validateSuspendIdent after override.
+var validateIdent = validateSuspendIdent
+
 // ResourceInfraRevoker is a narrow interface for the worker's infra-revoke path.
 // The production implementation is directResourceRevoker (below). Tests inject
 // a mock so the quota worker can be tested without real DB/Redis/Mongo.
@@ -125,14 +140,14 @@ func (r *directResourceRevoker) revokePostgres(ctx context.Context, token string
 	}
 	dbName := "db_" + token
 	username := "usr_" + token
-	if err := validateSuspendIdent(dbName); err != nil {
+	if err := validateIdent(dbName); err != nil {
 		return fmt.Errorf("revokePostgres: db: %w", err)
 	}
-	if err := validateSuspendIdent(username); err != nil {
+	if err := validateIdent(username); err != nil {
 		return fmt.Errorf("revokePostgres: user: %w", err)
 	}
 
-	conn, err := sql.Open("postgres", r.customerDatabaseURL)
+	conn, err := sqlOpen("postgres", r.customerDatabaseURL)
 	if err != nil {
 		slog.Warn("quota_infra.revokePostgres: open failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
@@ -164,14 +179,14 @@ func (r *directResourceRevoker) grantPostgres(ctx context.Context, token string)
 	}
 	dbName := "db_" + token
 	username := "usr_" + token
-	if err := validateSuspendIdent(dbName); err != nil {
+	if err := validateIdent(dbName); err != nil {
 		return fmt.Errorf("grantPostgres: db: %w", err)
 	}
-	if err := validateSuspendIdent(username); err != nil {
+	if err := validateIdent(username); err != nil {
 		return fmt.Errorf("grantPostgres: user: %w", err)
 	}
 
-	conn, err := sql.Open("postgres", r.customerDatabaseURL)
+	conn, err := sqlOpen("postgres", r.customerDatabaseURL)
 	if err != nil {
 		slog.Warn("quota_infra.grantPostgres: open failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
