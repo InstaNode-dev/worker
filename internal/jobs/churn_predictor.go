@@ -123,6 +123,12 @@ const churnRiskActor = "system"
 // comfortable for a single daily scan.
 const churnPredictorBatchLimit = 500
 
+// churnMetaMarshal serialises the churn-risk audit metadata. It is a package
+// var (defaulting to encoding/json) so the otherwise-unreachable marshal-error
+// branch can be exercised in tests — json.Marshal on a map of primitives never
+// fails at runtime, so this is the only way to cover the defensive guard.
+var churnMetaMarshal = json.Marshal
+
 // ChurnPredictorWorker scans every non-Team team for churn-risk signal
 // (7+ days inactivity, still has resources, not recently flagged) and
 // writes one churn.risk_flagged audit_log row per qualifying team.
@@ -305,7 +311,7 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 			"active_resource_count":   r.activeResourceCount,
 			"email":                   r.ownerEmail.String,
 		}
-		metaBytes, mErr := json.Marshal(meta)
+		metaBytes, mErr := churnMetaMarshal(meta)
 		if mErr != nil {
 			// json.Marshal on a map[string]any of primitives can't
 			// fail in practice; treat as a logged skip just in case.
