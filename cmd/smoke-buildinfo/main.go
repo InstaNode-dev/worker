@@ -7,11 +7,19 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"os"
 
 	"instant.dev/common/buildinfo"
 )
 
-func main() {
-	fmt.Printf("GitSHA=%s BuildTime=%s Version=%s\n",
+// render writes the buildinfo smoke line to w. Extracted from main() so the
+// output shape is unit-testable without spawning the binary.
+func render(w io.Writer) {
+	fmt.Fprintf(w, "GitSHA=%s BuildTime=%s Version=%s\n",
 		buildinfo.GitSHA, buildinfo.BuildTime, buildinfo.Version)
+}
+
+func main() {
+	render(os.Stdout)
 }
