@@ -160,7 +160,7 @@ func (w *RefreshGeoDBWorker) Work(ctx context.Context, job *river.Job[RefreshGeo
 	if err != nil {
 		return fmt.Errorf("RefreshGeoDBWorker: download failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("RefreshGeoDBWorker: unexpected status %d", resp.StatusCode)
@@ -174,12 +174,12 @@ func (w *RefreshGeoDBWorker) Work(ctx context.Context, job *river.Job[RefreshGeo
 	// extract only the *.mmdb member before the atomic rename.
 	tmpPath := job.Args.DBPath + ".tmp"
 	if err := extractGeoLite2MMDB(resp.Body, tmpPath); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("RefreshGeoDBWorker: extract failed: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, job.Args.DBPath); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("RefreshGeoDBWorker: rename failed: %w", err)
 	}
 
@@ -203,7 +203,7 @@ func extractGeoLite2MMDB(r io.Reader, dstPath string) error {
 	if err != nil {
 		return fmt.Errorf("extractGeoLite2MMDB: gzip reader: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	for {
@@ -228,7 +228,7 @@ func extractGeoLite2MMDB(r io.Reader, dstPath string) error {
 		// Bound the copy to the declared tar-header size to avoid a
 		// decompression-bomb writing unbounded bytes.
 		if _, err := io.Copy(f, io.LimitReader(tr, hdr.Size)); err != nil {
-			f.Close()
+			_ = f.Close()
 			return fmt.Errorf("extractGeoLite2MMDB: write temp file: %w", err)
 		}
 		if err := f.Close(); err != nil {

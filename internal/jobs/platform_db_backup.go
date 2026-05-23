@@ -323,7 +323,7 @@ func (w *PlatformDBBackupWorker) Work(ctx context.Context, job *river.Job[Platfo
 	if err != nil {
 		return fmt.Errorf("PlatformDBBackupWorker: acquire conn: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	var locked bool
 	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, platformDBBackupLockKey).Scan(&locked); err != nil {

@@ -181,7 +181,7 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 	if err != nil {
 		return fmt.Errorf("ExpireImminentWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []expireImminentRow
 	for rows.Next() {
@@ -199,7 +199,7 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("ExpireImminentWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// #146 (BugBash 2026-05-20 idle-tick noise pass): 10-min tick =

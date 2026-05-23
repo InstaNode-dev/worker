@@ -217,7 +217,7 @@ func (w *MagicLinkReconcilerWorker) listReconcileCandidates(ctx context.Context)
 	if err != nil {
 		return nil, fmt.Errorf("query magic_links: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []magicLinkReconcileRow
 	for rows.Next() {
@@ -271,7 +271,7 @@ func (w *MagicLinkReconcilerWorker) driveResend(ctx context.Context, r magicLink
 		)
 		return reconcileOutcomeSkipped
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))

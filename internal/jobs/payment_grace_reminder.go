@@ -123,7 +123,7 @@ func (w *PaymentGraceReminderWorker) Work(ctx context.Context, job *river.Job[Pa
 	if err != nil {
 		return fmt.Errorf("PaymentGraceReminderWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []paymentGraceReminderRow
 	for rows.Next() {
@@ -137,7 +137,7 @@ func (w *PaymentGraceReminderWorker) Work(ctx context.Context, job *river.Job[Pa
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("PaymentGraceReminderWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// P1-1 (BugBash 2026-05-19): idle tick — demoted INFO → DEBUG.

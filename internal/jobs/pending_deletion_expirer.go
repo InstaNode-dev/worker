@@ -116,7 +116,7 @@ func (w *PendingDeletionExpirerWorker) Work(ctx context.Context, job *river.Job[
 	if err != nil {
 		return fmt.Errorf("pending_deletion_expirer: sweep failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var expired []expiredPendingDeletionRow
 	for rows.Next() {

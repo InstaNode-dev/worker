@@ -104,7 +104,7 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 	if err != nil {
 		return fmt.Errorf("DeploymentExpirerWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []deployExpirerRow
 	for rows.Next() {
@@ -119,7 +119,7 @@ func (w *DeploymentExpirerWorker) Work(ctx context.Context, job *river.Job[Deplo
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("DeploymentExpirerWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.

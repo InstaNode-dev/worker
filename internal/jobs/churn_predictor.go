@@ -76,12 +76,6 @@ type ChurnPredictorArgs struct{}
 // Kind is the River worker key.
 func (ChurnPredictorArgs) Kind() string { return "churn_predictor" }
 
-// churnPredictorInterval is the periodic dispatch cadence — daily.
-// The 30-day dedupe window means cadence below ~daily produces no
-// additional flags; daily gives at most one chance per day to catch a
-// team that crossed the 7-day threshold yesterday.
-const churnPredictorInterval = 24 * time.Hour
-
 // churnInactivityWindow is the silence period that defines a churn
 // candidate. 7 days is the brief's threshold — long enough that a
 // vacation or busy week doesn't trigger a "we miss you" email
@@ -231,7 +225,7 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 	if err != nil {
 		return fmt.Errorf("ChurnPredictorWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []churnCandidateRow
 	for rows.Next() {
@@ -249,7 +243,7 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("ChurnPredictorWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		slog.Info("jobs.churn_predictor.completed",

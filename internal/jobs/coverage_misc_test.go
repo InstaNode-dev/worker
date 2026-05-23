@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1277,10 +1276,6 @@ func TestProber_UptimeRetention_DBError_Propagates(t *testing.T) {
 // ─── real_prober.go ────────────────────────────────────────────────────────────
 
 func TestProber_NormalizeStorageURL_AllArms(t *testing.T) {
-	if _, err := url.Parse("://bad"); err == nil {
-		// just here to silence the unused-import linter if it ever fires
-	}
-
 	// http/https → returned untouched.
 	if got, err := normalizeStorageURL("https://example.com/bucket"); err != nil || got != "https://example.com/bucket" {
 		t.Errorf("https returned (%q, %v)", got, err)

@@ -198,9 +198,15 @@ func TestWorkers_Stop_NoCancelBeforeStopReturns(t *testing.T) {
 	// a seam (or we wire in a `riverclient.Stoppable` interface).
 	//
 	// Field-shape sanity-check (no nil deref): a real value retains
-	// the *river.Client[pgx.Tx] and context.CancelFunc field types.
+	// the *river.Client[pgx.Tx] and context.CancelFunc field types. The
+	// explicitly-typed parameters of these no-op sinks are the assertion —
+	// the call fails to compile if a field's type ever drifts.
 	w := Workers{}
-	var _ *river.Client[pgx.Tx] = w.client
-	var _ context.CancelFunc = w.cancel
+	pinRiverClient(w.client)
+	pinCancelFunc(w.cancel)
 	_ = w
 }
+
+// pinRiverClient / pinCancelFunc pin the Workers field types at compile time.
+func pinRiverClient(*river.Client[pgx.Tx]) {}
+func pinCancelFunc(context.CancelFunc)      {}

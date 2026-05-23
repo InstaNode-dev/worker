@@ -803,7 +803,7 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 	if err != nil {
 		return fmt.Errorf("BillingReconcilerWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var teams []billingReconcilerTeamRow
 	for rows.Next() {
@@ -817,7 +817,7 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return fmt.Errorf("BillingReconcilerWorker: rows error: %w", rowsErr)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	metrics.BillingReconcilerTeamsScanned.Add(float64(len(teams)))
 
@@ -1071,7 +1071,7 @@ func (w *BillingReconcilerWorker) scanChargeUndeliverable(ctx context.Context) i
 			"error", err, "note", "fail-open — retry next tick")
 		return 0
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var count int
 	var maxCreated time.Time
@@ -1176,7 +1176,7 @@ func (w *BillingReconcilerWorker) runOrphanSweep(ctx context.Context) (scanned, 
 		)
 		return 0, 0
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []billingReconcilerOrphanRow
 	for rows.Next() {
@@ -1191,7 +1191,7 @@ func (w *BillingReconcilerWorker) runOrphanSweep(ctx context.Context) (scanned, 
 		slog.Warn("billing.reconciler.orphan_rows_error", "error", rowsErr)
 		return 0, 0
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	for i, c := range candidates {
 		// 100ms stagger between Razorpay calls, same as the primary sweep.

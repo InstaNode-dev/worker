@@ -9,6 +9,8 @@ package jobs
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -109,6 +111,33 @@ func TestEntitlementRegraderAdapter_ErrorArm(t *testing.T) {
 	}
 }
 
+// newMinioAdminClient: empty endpoint short-circuits to (nil, nil); a
+// configured endpoint builds an admin client without contacting it
+// (madmin.NewWithOptions only parses the endpoint URL, no network I/O).
+func TestNewMinioAdminClient_EmptyEndpoint_ReturnsNil(t *testing.T) {
+	mc, err := newMinioAdminClient(&config.Config{MinioEndpoint: ""})
+	if err != nil {
+		t.Fatalf("empty endpoint returned err: %v", err)
+	}
+	if mc != nil {
+		t.Errorf("empty endpoint returned non-nil client %v, want nil", mc)
+	}
+}
+
+func TestNewMinioAdminClient_ConfiguredEndpoint_BuildsClient(t *testing.T) {
+	mc, err := newMinioAdminClient(&config.Config{
+		MinioEndpoint:     "minio.example.com:9000",
+		MinioRootUser:     "minioadmin",
+		MinioRootPassword: "minioadmin",
+	})
+	if err != nil {
+		t.Fatalf("configured endpoint returned err: %v", err)
+	}
+	if mc == nil {
+		t.Error("configured endpoint returned nil client, want non-nil")
+	}
+}
+
 // StartWorkers early-return guards. We don't start a real worker pool here —
 // only the synchronous early-exit branches.
 func TestStartWorkers_BadDatabaseURL_ReturnsEmpty(t *testing.T) {
@@ -178,4 +207,64 @@ func TestStartWorkers_FullBoot(t *testing.T) {
 		// this stays robust across environments.
 		t.Skip("StartWorkers did not reach started=true (River migrate/start gated by DB perms) — body still executed for coverage")
 	}
+}
+
+// TestStartWorkers_BootInIsolatedDB drives StartWorkers past the
+// email-provider init into the MinIO-client + worker-registration body using
+// a throwaway database created from the root test-pg connection. Unlike
+// TestStartWorkers_FullBoot (which needs the dedicated TEST_WORKER_STARTUP_DSN
+// and skips in CI), this self-provisions its own DB so River's schema
+// migrations never touch the shared TEST_DATABASE_URL schema — giving CI
+// coverage of the post-email-init body (incl. the newMinioAdminClient call
+// site) without the cross-test perturbation risk that motivated the separate
+// DSN. Skips cleanly when the root pg container is unreachable.
+func TestStartWorkers_BootInIsolatedDB(t *testing.T) {
+	root, err := sql.Open("postgres", pgTestDSN())
+	if err != nil {
+		t.Skipf("postgres open: %v", err)
+	}
+	defer root.Close()
+	root.SetConnMaxLifetime(5 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := root.PingContext(ctx); err != nil {
+		t.Skipf("postgres ping failed (docker test-pg not reachable): %v", err)
+	}
+
+	dbName := fmt.Sprintf("worker_boot_%d", time.Now().UnixNano()%1_000_000)
+	if _, err := root.ExecContext(ctx, `CREATE DATABASE `+quoteIdent(dbName)); err != nil {
+		t.Skipf("CREATE DATABASE: %v", err)
+	}
+	t.Cleanup(func() { _, _ = root.Exec(`DROP DATABASE IF EXISTS ` + quoteIdent(dbName)) })
+
+	// Rewrite the path of pgTestDSN to point at the throwaway DB.
+	bootDSN := dsnWithDB(pgTestDSN(), dbName)
+
+	cfg := &config.Config{
+		DatabaseURL: bootDSN,
+		Environment: "development",
+		// EmailProvider empty → NoopProvider; all optional deps unset →
+		// every worker wired fail-open. A deliberately-malformed MinioEndpoint
+		// makes newMinioAdminClient return an error so the call site's
+		// fail-open WARN branch is exercised (minioClient stays nil and boot
+		// continues — proving the cleanup-client init never blocks startup).
+		MinioEndpoint: "::::bad",
+	}
+
+	w := StartWorkers(context.Background(), nil, nil, cfg, nil, nil, nil, nil, nil, nil)
+	if w == nil {
+		t.Fatal("StartWorkers returned nil")
+	}
+	defer w.Stop()
+}
+
+// dsnWithDB replaces the database name (the URL path) in a postgres DSN.
+func dsnWithDB(dsn, db string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn
+	}
+	u.Path = "/" + db
+	return u.String()
 }

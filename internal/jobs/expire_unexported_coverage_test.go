@@ -30,13 +30,20 @@ import (
 	"github.com/google/uuid"
 	madmin "github.com/minio/madmin-go/v3"
 	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"instant.dev/worker/internal/provisioner"
 )
 
-// madminNew is a thin alias so the test reads naturally; madmin.New
-// builds an admin client that signs requests against the given endpoint.
-var madminNew = madmin.New
+// madminNew is a thin alias so the test reads naturally; it builds an admin
+// client (via madmin.NewWithOptions) that signs requests against the given
+// endpoint. Keeps the historical 4-arg call shape at the test call site.
+func madminNew(endpoint, accessKey, secretKey string, secure bool) (*madmin.AdminClient, error) {
+	return madmin.NewWithOptions(endpoint, &madmin.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: secure,
+	})
+}
 
 // TestInClusterK8sClient_NotInCluster: the function checks for the
 // /var/run/secrets/kubernetes.io/serviceaccount/token file. Outside a

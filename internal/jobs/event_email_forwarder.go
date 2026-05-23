@@ -898,7 +898,10 @@ batchLoop:
 			// on a cursor reset, which is harmless. classification is
 			// permanent_drop so a support grep against the 059 columns
 			// finds these alongside the F4 missing_renderer drops.
-			if claimed, ledgerErr := w.ledger.markSent(ctx, ledgerClaim{
+			// A non-nil error is logged; a successful claim and an
+			// already-claimed (claimed==false) outcome are both benign, so
+			// the boolean return is intentionally discarded.
+			if _, ledgerErr := w.ledger.markSent(ctx, ledgerClaim{
 				AuditID:        row.ID,
 				Provider:       w.provider.Name(),
 				ProviderID:     evt.IdempotencyKey,
@@ -913,8 +916,6 @@ batchLoop:
 					"error", ledgerErr,
 					"note", "terminal class but ledger claim failed — cursor still advances; cursor-reset may re-attempt this row",
 				)
-			} else if !claimed {
-				// Already claimed by a prior attempt; benign.
 			}
 			slog.Info("jobs.event_email_forwarder.row_skipped",
 				"kind", row.Kind,
@@ -1037,7 +1038,7 @@ func (w *EventEmailForwarderWorker) fetchBatch(ctx context.Context, c eventCurso
 	if err != nil {
 		return nil, fmt.Errorf("fetchBatch query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []auditRow
 	for rows.Next() {

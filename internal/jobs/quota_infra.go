@@ -152,7 +152,7 @@ func (r *directResourceRevoker) revokePostgres(ctx context.Context, token string
 		slog.Warn("quota_infra.revokePostgres: open failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`REVOKE CONNECT ON DATABASE %q FROM %q`, dbName, username)); err != nil {
@@ -191,7 +191,7 @@ func (r *directResourceRevoker) grantPostgres(ctx context.Context, token string)
 		slog.Warn("quota_infra.grantPostgres: open failed (fail-open)", "token", logsafe.Token(token), "error", err)
 		return nil
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %q`, dbName, username)); err != nil {
@@ -316,7 +316,7 @@ func setCustomerRedisACL(ctx context.Context, adminURL, username string, enable 
 		return nil
 	}
 	client := goredis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	state := "off"
 	if enable {
 		state = "on"
@@ -408,7 +408,8 @@ func validateSuspendIdent(s string) error {
 		return fmt.Errorf("empty identifier")
 	}
 	for _, ch := range s {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+		allowed := (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-'
+		if !allowed {
 			return fmt.Errorf("unsafe identifier %q", s)
 		}
 	}

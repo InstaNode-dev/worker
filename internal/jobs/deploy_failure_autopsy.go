@@ -192,7 +192,7 @@ func (c *k8sAutopsyClient) GetPodLogs(ctx context.Context, namespace, podName st
 			return nil, nil //nolint:nilerr
 		}
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	return readLogLines(stream)
 }
 

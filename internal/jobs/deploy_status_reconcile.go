@@ -517,7 +517,7 @@ func (w *DeployStatusReconciler) listActiveDeployments(ctx context.Context) ([]a
 	if err != nil {
 		return nil, fmt.Errorf("listActiveDeployments: query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []activeDeployment
 	for rows.Next() {

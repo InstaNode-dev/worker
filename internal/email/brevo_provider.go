@@ -388,7 +388,7 @@ func (p *BrevoProvider) doRequest(ctx context.Context, evt EventEmail, body []by
 		)
 		return "", &SendError{Class: SendClassTransient, Cause: err, Message: "brevo: http"}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, brevoBodyReadCap))
 	statusLabel := strconv.Itoa(resp.StatusCode)
 

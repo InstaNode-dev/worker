@@ -128,7 +128,7 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 	if err != nil {
 		return fmt.Errorf("CustomerBackupSchedulerWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type cand struct {
 		id     string

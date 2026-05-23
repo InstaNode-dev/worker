@@ -224,25 +224,6 @@ func (f *fakePodStateProvider) ListPodWaitingReasons(_ context.Context, namespac
 	return out, nil
 }
 
-// expectEmptyPass4 queues the sqlmock expectation for PASS 4's live-token
-// query returning nothing — used when the fake reports customer namespaces
-// but a test only cares about the earlier passes, OR when the fake reports
-// no customer namespaces (PASS 4 short-circuits before the query, so callers
-// with an empty customer-namespace set must NOT queue this).
-func expectEmptyPass4(mock sqlmock.Sqlmock) {
-	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources`).
-		WillReturnRows(sqlmock.NewRows([]string{"token"}))
-}
-
-// expectEmptyPass5 queues the sqlmock expectation for PASS 5's live-stack-id
-// query returning nothing — same shape as expectEmptyPass4 but for stacks.
-// Only call this when the fake reports a non-empty stackNamespaces slice;
-// PASS 5 short-circuits before the query on an empty namespaces list.
-func expectEmptyPass5(mock sqlmock.Sqlmock) {
-	mock.ExpectQuery(`SELECT id::text FROM stacks`).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-}
-
 // captureBytesArgOSR captures a JSONB column's bytes for audit assertions.
 type captureBytesArgOSR struct{ out *[]byte }
 

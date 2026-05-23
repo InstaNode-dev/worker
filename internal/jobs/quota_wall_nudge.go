@@ -121,7 +121,7 @@ func (w *QuotaWallNudgeWorker) Work(ctx context.Context, job *river.Job[QuotaWal
 	if err != nil {
 		return fmt.Errorf("QuotaWallNudgeWorker: list teams: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	scanned, nudged, skipped := 0, 0, 0
 

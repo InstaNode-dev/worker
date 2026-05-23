@@ -341,7 +341,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 	if err != nil {
 		return fmt.Errorf("EntitlementReconcilerWorker: postgres query failed: %w", err)
 	}
-	defer pgRows.Close()
+	defer func() { _ = pgRows.Close() }()
 
 	var pgCandidates []entitlementCandidate
 	for pgRows.Next() {
@@ -358,7 +358,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 	if rowsErr := pgRows.Err(); rowsErr != nil {
 		return fmt.Errorf("EntitlementReconcilerWorker: postgres rows error: %w", rowsErr)
 	}
-	pgRows.Close()
+	_ = pgRows.Close()
 
 	var pgScanned, pgDrifted, pgRegraded, pgFailed, pgSkippedTier int
 	for _, c := range pgCandidates {
@@ -513,7 +513,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 		// River retries the whole tick, which will re-run both sweeps.
 		return fmt.Errorf("EntitlementReconcilerWorker: redis query failed: %w", redisErr)
 	}
-	defer redisRows.Close()
+	defer func() { _ = redisRows.Close() }()
 
 	var redisCandidates []redisEntitlementCandidate
 	for redisRows.Next() {
@@ -538,7 +538,7 @@ func (w *EntitlementReconcilerWorker) Work(ctx context.Context, job *river.Job[E
 	if rowsErr := redisRows.Err(); rowsErr != nil {
 		return fmt.Errorf("EntitlementReconcilerWorker: redis rows error: %w", rowsErr)
 	}
-	redisRows.Close()
+	_ = redisRows.Close()
 
 	var redisChecked, redisApplied, redisSkipped, redisFailed, redisSkippedTier int
 	for _, c := range redisCandidates {
@@ -711,7 +711,7 @@ func (w *EntitlementReconcilerWorker) sweepMongoEntitlements(ctx context.Context
 		)
 		return 0, 0, 0, 0, 0
 	}
-	defer mongoRows.Close()
+	defer func() { _ = mongoRows.Close() }()
 
 	var mongoCandidates []mongoEntitlementCandidate
 	for mongoRows.Next() {
@@ -732,7 +732,7 @@ func (w *EntitlementReconcilerWorker) sweepMongoEntitlements(ctx context.Context
 		slog.Warn("jobs.entitlement_reconciler.mongo.rows_failed", "error", rowsErr)
 		return checked, applied, skipped, failed, skippedTier
 	}
-	mongoRows.Close()
+	_ = mongoRows.Close()
 
 	for _, c := range mongoCandidates {
 		checked++

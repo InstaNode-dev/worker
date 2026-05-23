@@ -350,7 +350,7 @@ func (w *UptimeProberWorker) httpHEAD(ctx context.Context, url string, useHead b
 	if err != nil {
 		return false, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// 5xx → unhealthy; everything else → healthy (TLS+routing+upstream
 	// returned a response). 4xx is healthy because the dispatcher /
 	// ingress is functional even if the route doesn't exist on the

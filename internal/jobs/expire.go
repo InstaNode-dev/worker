@@ -195,7 +195,7 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	if err != nil {
 		return fmt.Errorf("ExpireAnonymousWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []toExpire
 	for rows.Next() {
@@ -209,7 +209,7 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("ExpireAnonymousWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		return nil

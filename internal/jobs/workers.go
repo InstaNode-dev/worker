@@ -8,6 +8,7 @@ import (
 	"time"
 
 	madmin "github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/newrelic/go-agent/v3/newrelic"
@@ -293,6 +294,24 @@ func (dailyAt2UTCSchedule) Next(t time.Time) time.Time {
 //
 // Pass nil to fall back to the legacy hardcoded 7-day retention default
 // — retentionDaysForTier WARNs in that case.
+
+// newMinioAdminClient builds the MinIO admin client used for storage IAM
+// cleanup. It returns (nil, nil) when no MINIO_* endpoint is configured —
+// the common case with the OBJECT_STORE_* shared-key backend (DO Spaces /
+// AWS / GCS / R2), where no per-customer IAM user was ever created. Only
+// the legacy self-hosted MinIO backend sets MinioEndpoint. Extracted from
+// StartWorkers so the credential-construction path is unit-testable without
+// booting the full worker pool.
+func newMinioAdminClient(cfg *config.Config) (*madmin.AdminClient, error) {
+	if cfg.MinioEndpoint == "" {
+		return nil, nil
+	}
+	return madmin.NewWithOptions(cfg.MinioEndpoint, &madmin.Options{
+		Creds:  credentials.NewStaticV4(cfg.MinioRootUser, cfg.MinioRootPassword, ""),
+		Secure: false,
+	})
+}
+
 func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, backupPlans BackupPlanRegistry, deployStatusK8s deployStatusK8sProvider, deployAutopsyK8s deployAutopsyK8sProvider, nrApp *newrelic.Application) *Workers {
 	// rdb is used by LoopsEventForwarderWorker (cursor storage). Other
 	// workers access redis indirectly via the platform DB.
@@ -351,13 +370,9 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// release per-IAM-user resources (i.e. self-hosted MinIO backend). With
 	// the OBJECT_STORE_* shared-key backend (DO Spaces / AWS / GCS / R2) this
 	// stays nil because no per-customer IAM was created in the first place.
-	var minioClient *madmin.AdminClient
-	if cfg.MinioEndpoint != "" {
-		if mc, err := madmin.New(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, false); err != nil {
-			slog.Warn("jobs.workers.minio_client_init_failed", "error", err)
-		} else {
-			minioClient = mc
-		}
+	minioClient, err := newMinioAdminClient(cfg)
+	if err != nil {
+		slog.Warn("jobs.workers.minio_client_init_failed", "error", err)
 	}
 
 	// Build the storage_bytes scanner — provider-agnostic, uses plain S3 API

@@ -209,7 +209,7 @@ func (p *realProber) probePostgres(ctx context.Context, connURL string) (ProbeOu
 	if err != nil {
 		return ProbeUnreachable, fmt.Errorf("postgres: sql.Open: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Tighten dial timeout so a black-holed host fails fast rather than
 	// hanging the goroutine for the driver default.
@@ -241,7 +241,7 @@ func (p *realProber) probeRedis(ctx context.Context, connURL string) (ProbeOutco
 	opts.MinIdleConns = 0
 
 	client := redis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if err := client.Ping(ctx).Err(); err != nil {
 		return ProbeUnreachable, fmt.Errorf("redis: PING: %w", err)
@@ -296,7 +296,7 @@ func (p *realProber) probeStorage(ctx context.Context, connURL string) (ProbeOut
 	if err != nil {
 		return ProbeUnreachable, fmt.Errorf("storage: HEAD %s: %w", target, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Any HTTP status is fine — we just needed a TCP+TLS handshake.
 	return ProbeReachable, nil
 }
@@ -352,7 +352,7 @@ func (p *realProber) probeQueue(ctx context.Context, connURL string) (ProbeOutco
 	if err != nil {
 		return ProbeUnreachable, fmt.Errorf("queue: GET %s: %w", target, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return ProbeUnreachable, fmt.Errorf("queue: NATS unhealthy (HTTP %d)", resp.StatusCode)
 	}
