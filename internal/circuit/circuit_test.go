@@ -160,6 +160,88 @@ func TestBreaker_OnOpenCallback(t *testing.T) {
 	}
 }
 
+// TestBreaker_NewBreakerClampsInvalidArgs — threshold < 1 is clamped to 1
+// and a non-positive cooldown defaults to 30s. Exercises the two guard
+// branches in NewBreaker (otherwise only the happy path is hit).
+func TestBreaker_NewBreakerClampsInvalidArgs(t *testing.T) {
+	// threshold 0 → clamped to 1: a single failure must trip the breaker.
+	b := NewBreaker("worker_test_clamp_threshold", 0, 10*time.Millisecond)
+	if !b.Allow() {
+		t.Fatal("fresh breaker should allow")
+	}
+	b.Record(errBoom)
+	if b.State() != StateOpen {
+		t.Fatalf("threshold should clamp to 1 (single failure opens), got %s", b.State())
+	}
+
+	// cooldown <= 0 → defaults to 30s. We can't wait 30s, but we can prove
+	// the breaker is still open well past a tiny sleep (a 0 cooldown would
+	// have re-admitted immediately).
+	b2 := NewBreaker("worker_test_clamp_cooldown", 1, 0)
+	_ = b2.Allow()
+	b2.Record(errBoom)
+	time.Sleep(5 * time.Millisecond)
+	if b2.Allow() {
+		t.Fatal("cooldown should default to 30s; breaker must still reject after 5ms")
+	}
+	if b2.State() != StateOpen {
+		t.Fatalf("expected open within default cooldown, got %s", b2.State())
+	}
+}
+
+// TestBreaker_StateOpenWithinCooldown — when the breaker is open and the
+// cooldown has NOT elapsed, State() takes the `now < openUntilNs` branch
+// and reports open. Distinct from the half-open trial path.
+func TestBreaker_StateOpenWithinCooldown(t *testing.T) {
+	b := NewBreaker("worker_test_state_within_cooldown", 1, time.Hour)
+	_ = b.Allow()
+	b.Record(errBoom)
+	// halfOpen is false, openUntil is set, now < openUntil → first return.
+	if got := b.State(); got != StateOpen {
+		t.Fatalf("breaker within cooldown should report open, got %s", got)
+	}
+}
+
+// TestBreaker_StateOpenAfterCooldownBeforeTrial — once the cooldown has
+// elapsed but no caller has claimed the half-open trial yet, State() falls
+// through past the `now < openUntilNs` check and still reports open (the
+// final return). This exercises the trailing branch of State().
+func TestBreaker_StateOpenAfterCooldownBeforeTrial(t *testing.T) {
+	b := NewBreaker("worker_test_state_after_cooldown", 1, 10*time.Millisecond)
+	_ = b.Allow()
+	b.Record(errBoom)
+	time.Sleep(15 * time.Millisecond)
+	// Cooldown elapsed, but we have NOT called Allow() — so halfOpen is
+	// still false and openUntil is still in the past.
+	if got := b.State(); got != StateOpen {
+		t.Fatalf("breaker after cooldown but before trial should report open, got %s", got)
+	}
+}
+
+// TestBreaker_StateHalfOpenReported — once a caller claims the half-open
+// trial slot (Allow() after cooldown), State() takes the leading
+// `halfOpen.Load()` branch and reports half_open.
+func TestBreaker_StateHalfOpenReported(t *testing.T) {
+	b := NewBreaker("worker_test_state_half_open", 1, 10*time.Millisecond)
+	_ = b.Allow()
+	b.Record(errBoom)
+	time.Sleep(15 * time.Millisecond)
+	if !b.Allow() {
+		t.Fatal("first Allow() after cooldown should claim the half-open trial")
+	}
+	if got := b.State(); got != StateHalfOpen {
+		t.Fatalf("breaker mid-trial should report half_open, got %s", got)
+	}
+}
+
+// TestBreaker_Name — the metric-label accessor returns the configured name.
+func TestBreaker_Name(t *testing.T) {
+	b := NewBreaker("worker_test_name_accessor", 1, time.Second)
+	if got := b.Name(); got != "worker_test_name_accessor" {
+		t.Fatalf("Name() = %q, want %q", got, "worker_test_name_accessor")
+	}
+}
+
 // TestBreaker_StateStringValues — NR runbook references these exact
 // strings.
 func TestBreaker_StateStringValues(t *testing.T) {

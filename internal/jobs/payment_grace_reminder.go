@@ -74,6 +74,12 @@ const auditKindPaymentGraceReminder = "payment.grace_reminder"
 // worker's periodic emitters.
 const paymentGraceReminderActor = "system"
 
+// graceReminderMetaMarshal serialises the grace-reminder audit metadata. It is
+// a package var (defaulting to encoding/json) so the otherwise-unreachable
+// marshal-error guard can be exercised in tests — json.Marshal on a map of
+// primitives never fails at runtime.
+var graceReminderMetaMarshal = json.Marshal
+
 // PaymentGraceReminderWorker scans the dunning table for due reminders.
 type PaymentGraceReminderWorker struct {
 	river.WorkerDefaults[PaymentGraceReminderArgs]
@@ -184,7 +190,7 @@ func (w *PaymentGraceReminderWorker) Work(ctx context.Context, job *river.Job[Pa
 			"hours_remaining":  hoursRemaining,
 			"grace_ends_at":    r.expiresAt.UTC().Format(time.RFC3339),
 		}
-		metaBytes, mErr := json.Marshal(meta)
+		metaBytes, mErr := graceReminderMetaMarshal(meta)
 		if mErr != nil {
 			slog.Error("jobs.payment_grace_reminder.metadata_marshal_failed",
 				"grace_id", r.id.String(),

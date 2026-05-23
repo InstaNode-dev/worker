@@ -316,6 +316,14 @@ func (w *CustomDomainReconciler) reconcileCertReady(ctx context.Context, d activ
 	return reconcileRecordedErr
 }
 
+// txtLookupFunc is the TXT-resolution seam. Defaults to the stdlib resolver;
+// overridden in tests so the verification-match / miss / error arms can be
+// exercised without real DNS.
+var txtLookupFunc = func(ctx context.Context, name string) ([]string, error) {
+	resolver := &net.Resolver{}
+	return resolver.LookupTXT(ctx, name)
+}
+
 // lookupTXT runs a context-bound TXT lookup at "_instanode.<hostname>" and
 // returns whether any record matches "instanode-verify-<token>". Trims
 // surrounding quotes some resolvers leave on TXT contents — same logic the
@@ -324,8 +332,7 @@ func (w *CustomDomainReconciler) lookupTXT(parent context.Context, hostname, tok
 	lookupCtx, cancel := context.WithTimeout(parent, txtLookupTimeout)
 	defer cancel()
 
-	resolver := &net.Resolver{}
-	records, err := resolver.LookupTXT(lookupCtx, txtChallengePrefix+hostname)
+	records, err := txtLookupFunc(lookupCtx, txtChallengePrefix+hostname)
 	if err != nil {
 		return false, fmt.Errorf("TXT lookup for %s failed: %w", txtChallengePrefix+hostname, err)
 	}

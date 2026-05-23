@@ -156,7 +156,7 @@ type deployAutopsyK8sProvider interface {
 // wraps the same Clientset for GetDeployment; both can share a single
 // kubernetes.Clientset instance at startup.
 type k8sAutopsyClient struct {
-	cs *kubernetes.Clientset
+	cs kubernetes.Interface
 }
 
 // ListPods implements deployAutopsyK8sProvider.
@@ -199,7 +199,7 @@ func (c *k8sAutopsyClient) GetPodLogs(ctx context.Context, namespace, podName st
 // NewK8sAutopsyClient constructs a k8sAutopsyClient from the same clientset
 // used by the status reconciler. Call this in StartWorkers after constructing
 // the status reconciler's client so both share one TCP connection pool.
-func NewK8sAutopsyClient(cs *kubernetes.Clientset) deployAutopsyK8sProvider {
+func NewK8sAutopsyClient(cs kubernetes.Interface) deployAutopsyK8sProvider {
 	return &k8sAutopsyClient{cs: cs}
 }
 

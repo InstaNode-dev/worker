@@ -33,7 +33,11 @@ func NewRefreshGeoDBWorker() *RefreshGeoDBWorker {
 	return &RefreshGeoDBWorker{}
 }
 
-const geoLite2DownloadURL = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=%s&suffix=tar.gz"
+// geoLite2DownloadURL is the MaxMind GeoLite2-City download template (the
+// license key is interpolated in). It is a package var rather than a const
+// so the happy-path download→extract→rename pipeline in Work can be driven
+// against an httptest server in tests; production never reassigns it.
+var geoLite2DownloadURL = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=%s&suffix=tar.gz"
 
 // geoLite2MMDBSuffix is the file-name suffix of the MMDB member inside the
 // MaxMind tarball. The archive contains a dated directory
