@@ -217,7 +217,7 @@ func reachRazorpayHTTPTimeout(t *testing.T, c jobs.OrphanSubscriptionCanceler) t
 	t.Helper()
 	v := reflect.ValueOf(c)
 	// canceler is *razorpayOrphanCanceler — dereference.
-	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
 		v = v.Elem()
 	}
 	clientFld := v.FieldByName("client")
@@ -226,7 +226,7 @@ func reachRazorpayHTTPTimeout(t *testing.T, c jobs.OrphanSubscriptionCanceler) t
 	}
 	// clientFld is razorpaySubCancelClient (interface).
 	adapter := clientFld.Elem()
-	for adapter.Kind() == reflect.Ptr {
+	for adapter.Kind() == reflect.Pointer {
 		adapter = adapter.Elem()
 	}
 	cFld := adapter.FieldByName("c")
@@ -235,7 +235,7 @@ func reachRazorpayHTTPTimeout(t *testing.T, c jobs.OrphanSubscriptionCanceler) t
 	}
 	// cFld is *razorpay.Client; deref then read Request.HTTPClient.Timeout.
 	sdkClient := cFld
-	for sdkClient.Kind() == reflect.Ptr {
+	for sdkClient.Kind() == reflect.Pointer {
 		sdkClient = sdkClient.Elem()
 	}
 	reqFld := sdkClient.FieldByName("Request")
@@ -243,7 +243,7 @@ func reachRazorpayHTTPTimeout(t *testing.T, c jobs.OrphanSubscriptionCanceler) t
 		t.Fatalf("razorpay.Client has no `Request` field. type=%s", sdkClient.Type())
 	}
 	req := reqFld
-	for req.Kind() == reflect.Ptr {
+	for req.Kind() == reflect.Pointer {
 		req = req.Elem()
 	}
 	httpFld := req.FieldByName("HTTPClient")
@@ -251,7 +251,7 @@ func reachRazorpayHTTPTimeout(t *testing.T, c jobs.OrphanSubscriptionCanceler) t
 		t.Fatalf("requests.Request has no `HTTPClient`. type=%s", req.Type())
 	}
 	httpClient := httpFld
-	for httpClient.Kind() == reflect.Ptr {
+	for httpClient.Kind() == reflect.Pointer {
 		httpClient = httpClient.Elem()
 	}
 	timeoutFld := httpClient.FieldByName("Timeout")

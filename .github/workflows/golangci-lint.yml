@@ -39,6 +39,10 @@ jobs:
           go-version-file: worker/go.mod
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          # Pinned (was `latest`) so a new upstream release can't silently
+          # introduce analyzers/findings that fail a previously-green PR —
+          # `latest` floated to v2.12.2 and turned on a govet `inline` check
+          # mid-PR. Bump deliberately + re-run `make gate` when upgrading.
+          version: v2.12.2
           working-directory: worker
           args: --timeout=5m
