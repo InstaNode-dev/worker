@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Fail if PR branch is behind its base branch
@@ -53,10 +53,10 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout proto sibling (replace ../proto)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           # REPO_ACCESS_TOKEN is a fine-grained PAT with read on the private
@@ -66,7 +66,7 @@ jobs:
       - run: mv _proto_ci ../proto
 
       - name: Checkout common sibling (replace ../common)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
@@ -80,7 +80,7 @@ jobs:
       # to developer machines only. INSTANT_API_REPO is set on the test step
       # below so findApiRepoRoot() locates the sibling deterministically.
       - name: Checkout api sibling (for cross-repo registry-iterating tests)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
@@ -88,9 +88,9 @@ jobs:
           fetch-depth: 1
       - run: mv _api_ci ../api
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version: '1.25'
 
       - run: go build ./...
       - run: go vet ./...
