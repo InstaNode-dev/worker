@@ -461,7 +461,7 @@ func (w *DeployNotifyWebhookWorker) fetchBatch(ctx context.Context, c deployNoti
 	if err != nil {
 		return nil, fmt.Errorf("fetchBatch query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []deployNotifyAuditRow
 	for rows.Next() {
@@ -569,7 +569,7 @@ func (w *DeployNotifyWebhookWorker) dispatch(ctx context.Context, urlStr string,
 			// Drain + close body unconditionally so the connection
 			// returns to the keep-alive pool.
 			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				return nil
 			}

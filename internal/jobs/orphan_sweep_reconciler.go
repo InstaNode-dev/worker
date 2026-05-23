@@ -386,12 +386,12 @@ func (w *OrphanSweepReconciler) sweepStuckPendingTeams(ctx context.Context) (fin
 	for rows.Next() {
 		var c teamPendingDeletion
 		if scanErr := rows.Scan(&c.teamID, &c.deletionRequestedAt); scanErr != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, 0, fmt.Errorf("scan stuck-pending team: %w", scanErr)
 		}
 		candidates = append(candidates, c)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return 0, 0, err
 	}
@@ -449,12 +449,12 @@ func (w *OrphanSweepReconciler) sweepOrphanedSubscriptions(ctx context.Context) 
 	for rows.Next() {
 		var o orphanedSub
 		if scanErr := rows.Scan(&o.teamID, &o.subscriptionID); scanErr != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, 0, fmt.Errorf("scan orphaned sub: %w", scanErr)
 		}
 		orphans = append(orphans, o)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return 0, 0, err
 	}
@@ -697,7 +697,7 @@ func (w *OrphanSweepReconciler) fetchDeployRowsByAppID(ctx context.Context) (map
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make(map[string]deployRowSnapshot)
 	for rows.Next() {
 		var (
@@ -816,7 +816,7 @@ func (w *OrphanSweepReconciler) fetchLiveResourceTokens(ctx context.Context) (ma
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make(map[string]bool)
 	for rows.Next() {
 		var token string
@@ -923,7 +923,7 @@ func (w *OrphanSweepReconciler) fetchLiveStackIDs(ctx context.Context) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make(map[string]bool)
 	for rows.Next() {
 		var id string
@@ -1083,7 +1083,7 @@ func (w *OrphanSweepReconciler) fetchStuckBuildCandidates(ctx context.Context) (
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []stuckBuildCandidate
 	for rows.Next() {
 		var c stuckBuildCandidate

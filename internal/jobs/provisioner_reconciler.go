@@ -155,7 +155,7 @@ func (w *ProvisionerReconcilerWorker) Work(ctx context.Context, job *river.Job[P
 	if err != nil {
 		return fmt.Errorf("ProvisionerReconcilerWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []reconcilerCandidate
 	for rows.Next() {
@@ -176,7 +176,7 @@ func (w *ProvisionerReconcilerWorker) Work(ctx context.Context, job *river.Job[P
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return fmt.Errorf("ProvisionerReconcilerWorker: rows error: %w", rowsErr)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG.

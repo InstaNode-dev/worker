@@ -543,7 +543,7 @@ func (w *PropagationRunnerWorker) pickEligible(ctx context.Context) ([]propagati
 	if err != nil {
 		return nil, fmt.Errorf("select eligible: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []propagationRow
 	for rows.Next() {
@@ -557,7 +557,7 @@ func (w *PropagationRunnerWorker) pickEligible(ctx context.Context) ([]propagati
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return nil, fmt.Errorf("rows iteration: %w", rowsErr)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	// D22-P3 lease bump (2026-05-21). Push next_attempt_at on the
 	// just-picked, still-locked rows so a pod crash between COMMIT below
@@ -1077,7 +1077,7 @@ func handleTierElevation(ctx context.Context, db *sql.DB, regrader propagationRe
 	if err != nil {
 		return fmt.Errorf("select team resources: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type res struct {
 		id           uuid.UUID
@@ -1099,7 +1099,7 @@ func handleTierElevation(ctx context.Context, db *sql.DB, regrader propagationRe
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return fmt.Errorf("iterate resources: %w", rowsErr)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	// Empty team is success — there is nothing to regrade. The customer
 	// upgraded but hasn't provisioned anything yet; future provisions

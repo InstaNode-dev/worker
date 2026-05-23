@@ -192,7 +192,7 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 	if err != nil {
 		return fmt.Errorf("ExpiryReminderWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []expiryReminderRow
 	for rows.Next() {
@@ -207,7 +207,7 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("ExpiryReminderWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// P1-1 (BugBash 2026-05-19): idle tick — demoted INFO → DEBUG.

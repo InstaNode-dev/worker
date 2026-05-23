@@ -196,20 +196,20 @@ func renderAnonExpiryEmail(params map[string]string) (subject, html, text string
 		// forwarder. The bug will show up in slog (downstream) — the
 		// forwarder logs every send.
 		htmlBuf.Reset()
-		htmlBuf.WriteString(fmt.Sprintf(
+		fmt.Fprintf(&htmlBuf,
 			"<p>Your instanode %s resource expires in %s %s. Visit %s to keep it.</p>",
 			view.ResourceType, view.HoursRemaining, hourWord(view.Plural), view.UpgradeURL,
-		))
+		)
 	}
 	html = htmlBuf.String()
 
 	var textBuf bytes.Buffer
 	if err := anonExpiryTextTmpl.Execute(&textBuf, view); err != nil {
 		textBuf.Reset()
-		textBuf.WriteString(fmt.Sprintf(
+		fmt.Fprintf(&textBuf,
 			"Your instanode %s resource expires in %s %s. Visit %s to keep it.\n",
 			view.ResourceType, view.HoursRemaining, hourWord(view.Plural), view.UpgradeURL,
-		))
+		)
 	}
 	text = textBuf.String()
 

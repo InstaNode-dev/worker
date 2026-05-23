@@ -435,9 +435,6 @@ func TestForwarder_NewEventEmailForwarderWorker_ProductionConstructorWiresProvid
 
 // ── Work() error branches not yet exercised ───────────────────────────────
 
-// flakyProvider returns a configurable messageId+err per call.
-type flakyProvider struct{ fakeProvider }
-
 // failingLedger captures call counts and lets the test fail any of the
 // three operations. Used to drive Work() branches where the ledger probe
 // errors or markSent fails post-2xx.

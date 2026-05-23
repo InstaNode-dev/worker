@@ -1,0 +1,43 @@
+# golangci-lint v2 config — start conservative, expand once baseline is clean
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # Default linter set is govet+errcheck+ineffassign+staticcheck+unused.
+  # We explicitly add misspell + gocyclo on top. gosimple folded into staticcheck in v2.
+  enable:
+    - errcheck       # checks unchecked errors
+    - govet          # standard vet
+    - ineffassign    # ineffective assignments
+    - staticcheck    # bug detection (subsumes gosimple in v2)
+    - unused         # unused code
+    - misspell       # spelling
+    - gocyclo        # cyclomatic complexity
+  settings:
+    gocyclo:
+      # Set just above the current top offender (33: entitlement_reconciler
+      # / event_email_forwarder Work funcs). These are inherently branchy
+      # job dispatch/reconcile loops; a config bump is preferred over a
+      # behaviour-changing refactor for this mechanical lint-gate pass.
+      min-complexity: 34
+    errcheck:
+      # The fmt.Fprint* family writes to stdout/stderr/buffers in CLI and
+      # diagnostic code where a write error is neither actionable nor
+      # meaningful. Matches the convention adopted by the sibling repos.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocyclo
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -183,7 +183,7 @@ func (e *directRedisEvictor) EvictTenantToCap(ctx context.Context, token string,
 		return 0, 0, fmt.Errorf("EvictTenantToCap: parse admin URL: %w", err)
 	}
 	client := goredis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	return evictTenantToCap(ctx, client, token, limitBytes)
 }
 

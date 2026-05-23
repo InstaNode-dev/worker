@@ -157,7 +157,7 @@ func (w *ResourceHeartbeatWorker) Work(ctx context.Context, job *river.Job[Resou
 	if err != nil {
 		return fmt.Errorf("ResourceHeartbeatWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []heartbeatCandidate
 	for rows.Next() {
@@ -178,7 +178,7 @@ func (w *ResourceHeartbeatWorker) Work(ctx context.Context, job *river.Job[Resou
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return fmt.Errorf("ResourceHeartbeatWorker: rows error: %w", rowsErr)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// Wave 3 / Worker T21 P1-1 follow-up (#146): demote idle-tick INFO →
@@ -391,7 +391,7 @@ func (w *ResourceHeartbeatWorker) sampleDegradedGauge(ctx context.Context) {
 		slog.Warn("jobs.resource_heartbeat.sample_gauge_failed", "error", err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	seen := map[string]bool{}
 	for rows.Next() {
 		var rt string

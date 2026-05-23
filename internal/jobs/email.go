@@ -106,7 +106,7 @@ func (w *WeeklyDigestWorker) Work(ctx context.Context, job *river.Job[WeeklyDige
 	if err != nil {
 		return fmt.Errorf("weekly_digest.Work query users: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type userTeam struct {
 		email    string
@@ -180,7 +180,7 @@ func (w *WeeklyDigestWorker) buildResourceDigestCounts(ctx context.Context, team
 	if err != nil {
 		return nil, fmt.Errorf("buildResourceDigestCounts query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var stats []DigestResourceCount
 	for rows.Next() {

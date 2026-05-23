@@ -185,7 +185,7 @@ func (w *GitHubDeployDispatcher) claimBatch(ctx context.Context) ([]pendingGitHu
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	rs, err := tx.QueryContext(ctx, `
 		WITH claimed AS (
@@ -211,12 +211,12 @@ func (w *GitHubDeployDispatcher) claimBatch(ctx context.Context) ([]pendingGitHu
 	for rs.Next() {
 		var r pendingGitHubDeploy
 		if err := rs.Scan(&r.id, &r.connectionID, &r.appUUID, &r.commitSHA, &r.attempts); err != nil {
-			rs.Close()
+			_ = rs.Close()
 			return nil, err
 		}
 		out = append(out, r)
 	}
-	rs.Close()
+	_ = rs.Close()
 
 	// Enrich with parent metadata. Done one-by-one inside the same tx so
 	// the claim and the read are atomic.
@@ -272,7 +272,7 @@ func (w *GitHubDeployDispatcher) fetchTarball(ctx context.Context, url string) (
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		// Permanent — repo / ref doesn't exist (or is private + no auth).
 		// Don't retry.
@@ -306,7 +306,7 @@ func (w *GitHubDeployDispatcher) postRedeploy(ctx context.Context, appIDSlug str
 	if _, err := part.Write(tarball); err != nil {
 		return err
 	}
-	mw.Close()
+	_ = mw.Close()
 
 	url := w.apiBaseURL + "/deploy/" + appIDSlug + "/redeploy"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
@@ -338,8 +338,8 @@ func (w *GitHubDeployDispatcher) postRedeploy(ctx context.Context, appIDSlug str
 		}
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body) // drain so keep-alive is happy
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body) // drain so keep-alive is happy
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		return &permanentError{Code: resp.StatusCode, Msg: "api redeploy 4xx"}
 	}

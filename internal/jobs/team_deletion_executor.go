@@ -311,7 +311,7 @@ func (w *TeamDeletionExecutorWorker) fetchCandidates(ctx context.Context) ([]tea
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []teamPendingDeletion
 	for rows.Next() {
@@ -525,7 +525,7 @@ func (w *TeamDeletionExecutorWorker) fetchTeamDeployAppIDs(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []string
 	for rows.Next() {
@@ -551,7 +551,7 @@ func (w *TeamDeletionExecutorWorker) fetchTeamResources(ctx context.Context, tea
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []pendingResource
 	for rows.Next() {

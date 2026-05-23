@@ -277,7 +277,7 @@ func run(ctx context.Context, d deps) int {
 	cfg := d.loadConfig() // panics on missing required env vars in production
 
 	database := d.connectPostgres(cfg.DatabaseURL)
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Pool-saturation observability (Wave-3 chaos verify, 2026-05-21):
 	// pushes *sql.DB.Stats onto instant_pg_pool_* gauges so operators can
@@ -287,7 +287,7 @@ func run(ctx context.Context, d deps) int {
 	d.startPoolStats(poolStatsCtx, database, "platform_db")
 
 	rdb := d.connectRedis(cfg.RedisURL)
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	workers := d.startWorkers(ctx, database, rdb, cfg)
 	defer workers.Stop()

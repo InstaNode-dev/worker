@@ -94,7 +94,7 @@ func deleteK8sNamespace(ctx context.Context, client *http.Client, namespace, nsP
 	if err != nil {
 		return fmt.Errorf("deleteK8sNamespace: DELETE %s: %w", namespace, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusAccepted, http.StatusNotFound:
@@ -139,7 +139,7 @@ func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStac
 	if err != nil {
 		return fmt.Errorf("ExpireStacksWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type expiredStack struct {
 		id        string
@@ -157,7 +157,7 @@ func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStac
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("ExpireStacksWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	var deleted int
 	for _, s := range expired {

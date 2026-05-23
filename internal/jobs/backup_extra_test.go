@@ -1592,7 +1592,7 @@ func TestDefaultPgDumpExec_StderrTruncates(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "noisy_pg_dump")
 	// Write 1000 bytes to stderr then exit 1.
-	script := fmt.Sprintf("#!/bin/sh\nfor i in $(seq 1 100); do printf 'XXXXXXXXXX' >&2; done\nexit 1\n")
+	script := "#!/bin/sh\nfor i in $(seq 1 100); do printf 'XXXXXXXXXX' >&2; done\nexit 1\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}

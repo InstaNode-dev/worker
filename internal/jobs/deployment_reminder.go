@@ -227,7 +227,7 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 	if err != nil {
 		return fmt.Errorf("DeploymentReminderWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []deployReminderRow
 	for rows.Next() {
@@ -242,7 +242,7 @@ func (w *DeploymentReminderWorker) Work(ctx context.Context, job *river.Job[Depl
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("DeploymentReminderWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	// Sample TTL state for the gauge — counts apply to BOTH the
 	// candidates-in-window set and the broader population. The gauge
@@ -346,7 +346,7 @@ func (w *DeploymentReminderWorker) sampleTTLGauge(ctx context.Context) {
 		slog.Warn("jobs.deployment_reminder.gauge_sample_failed", "error", err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	seen := map[string]bool{}
 	for rows.Next() {
 		var policy string

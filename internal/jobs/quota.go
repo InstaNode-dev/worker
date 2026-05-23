@@ -222,7 +222,7 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 	if err != nil {
 		return 0, fmt.Errorf("EnforceStorageQuotaWorker.redisEvictionLoop: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	checked, enforced := 0, 0
 
@@ -325,7 +325,7 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 	if err != nil {
 		return nil, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	checked := 0
 	suspendedIDs := make([]string, 0)
@@ -475,7 +475,7 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 	if err != nil {
 		return 0, fmt.Errorf("EnforceStorageQuotaWorker.unsuspendLoop: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	unsuspended := 0
 

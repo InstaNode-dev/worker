@@ -85,7 +85,7 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 	if err != nil {
 		return fmt.Errorf("UpdateStorageBytesWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	updated := 0
 	for rows.Next() {

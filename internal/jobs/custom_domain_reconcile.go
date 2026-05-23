@@ -294,7 +294,7 @@ func (w *CustomDomainReconciler) reconcileCertReady(ctx context.Context, d activ
 		_ = w.updateLastCheck(ctx, d.id, fmt.Sprintf("HTTPS HEAD probe failed: %v", err))
 		return reconcileNoop
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		if err := w.updateStatus(ctx, d.id, statusLive, ""); err != nil {
@@ -366,7 +366,7 @@ func (w *CustomDomainReconciler) listActiveDomains(ctx context.Context) ([]activ
 	if err != nil {
 		return nil, fmt.Errorf("listActiveDomains: query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []activeCustomDomain
 	for rows.Next() {

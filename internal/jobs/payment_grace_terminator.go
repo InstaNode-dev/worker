@@ -158,7 +158,7 @@ func (w *PaymentGraceTerminatorWorker) Work(ctx context.Context, job *river.Job[
 	if err != nil {
 		return fmt.Errorf("PaymentGraceTerminatorWorker: query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []paymentGraceTerminatorRow
 	for rows.Next() {
@@ -172,7 +172,7 @@ func (w *PaymentGraceTerminatorWorker) Work(ctx context.Context, job *river.Job[
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("PaymentGraceTerminatorWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// P1-1 (BugBash 2026-05-19): idle tick — demoted INFO → DEBUG.
@@ -291,7 +291,7 @@ func (w *PaymentGraceTerminatorWorker) terminate(ctx context.Context, teamID uui
 		}
 		return fmt.Errorf("api request: %w", doErr)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("api status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

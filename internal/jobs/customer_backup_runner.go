@@ -231,7 +231,7 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	if err != nil {
 		return fmt.Errorf("CustomerBackupRunnerWorker: select pending failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type pending struct {
 		backupID     string
@@ -258,7 +258,7 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("CustomerBackupRunnerWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	processed := 0
 	succeeded := 0
@@ -695,7 +695,7 @@ func (w *CustomerBackupRunnerWorker) runRetentionSweep(ctx context.Context) {
 			}
 			victims = append(victims, v)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		for _, v := range victims {
 			if delErr := w.store.DeleteObject(ctx, w.bucket, v.s3Key); delErr != nil {
@@ -796,7 +796,7 @@ func (w *CustomerBackupRunnerWorker) refundManualBackupQuota(teamID uuid.UUID, b
 		}
 		return fmt.Errorf("api request: %w", doErr)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("api status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

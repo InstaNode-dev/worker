@@ -161,7 +161,7 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 	if err != nil {
 		return fmt.Errorf("CustomerRestoreRunnerWorker: select pending failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type pending struct {
 		restoreID    string
@@ -189,7 +189,7 @@ func (w *CustomerRestoreRunnerWorker) Work(ctx context.Context, job *river.Job[C
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("CustomerRestoreRunnerWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	processed := 0
 	succeeded := 0
@@ -352,7 +352,7 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 
 	tmpFile, tmpErr := os.CreateTemp("", "instant-restore-*.dump.gz")
 	if tmpErr != nil {
-		obj.Close()
+		_ = obj.Close()
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("create temp file: %v", tmpErr), start, p)
 		return false
 	}
@@ -366,11 +366,11 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 	hasher := sha256.New()
 	tee := io.TeeReader(obj, hasher)
 	if _, copyErr := io.Copy(tmpFile, tee); copyErr != nil {
-		obj.Close()
+		_ = obj.Close()
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("S3 read failed: %v", copyErr), start, p)
 		return false
 	}
-	obj.Close()
+	_ = obj.Close()
 
 	// Integrity gate (same semantics as before — only the hashing path
 	// changed). The backup runner (customer_backup_runner.go, FIX-H #59)
@@ -412,7 +412,7 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("gunzip header: %v", gzErr), start, p)
 		return false
 	}
-	defer gzReader.Close()
+	defer func() { _ = gzReader.Close() }()
 
 	if runErr := w.pgRestore.Run(ctx, plainConn, gzReader); runErr != nil {
 		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("pg_restore failed: %v", runErr), start, p)

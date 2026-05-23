@@ -158,7 +158,7 @@ func (w *CheckoutReconcileWorker) Work(ctx context.Context, job *river.Job[Check
 	if err != nil {
 		return fmt.Errorf("CheckoutReconcileWorker: candidate query failed: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var candidates []checkoutRow
 	for rows.Next() {
@@ -172,7 +172,7 @@ func (w *CheckoutReconcileWorker) Work(ctx context.Context, job *river.Job[Check
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("CheckoutReconcileWorker: rows error: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		// P1-1 (BugBash 2026-05-19): idle tick — zero candidates carries
