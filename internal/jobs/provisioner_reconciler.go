@@ -382,11 +382,23 @@ func nullableTeamID(v sql.NullString) any {
 // probeErrString defends against nil-error inputs from ProbeUnreachable.
 // Per prober.go's contract, ProbeUnreachable comes with a non-nil err, but
 // belt-and-braces — a misbehaving prober shouldn't crash the sweep.
+//
+// SEC-WORKER FINDING-3 (2026-05-29): the returned string flows into three
+// persistent surfaces:
+//   1. resources.degraded_reason (DB column, surfaced in dashboard banner)
+//   2. audit_log.metadata.error  (JSON column, visible to admins)
+//   3. slog.Error                (shipped to New Relic Logs)
+//
+// Driver errors — especially mongo-driver and redis — can embed the full
+// connection URI including userinfo (user:password@) in the error string.
+// We run the output through logsafe.ScrubURL so any such embedded URI gets
+// its userinfo stripped before persistence. Conservative: only strips
+// `scheme://userinfo@` shapes; leaves everything else untouched.
 func probeErrString(err error) string {
 	if err == nil {
 		return "probe returned unreachable but no error message"
 	}
-	return err.Error()
+	return logsafe.ScrubURL(err.Error())
 }
 
 // truncateReason caps a probe error string at 500 chars so the audit_log
