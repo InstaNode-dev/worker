@@ -623,18 +623,39 @@ func durationSeconds(d time.Duration) float64 {
 type defaultPgDumpExec struct{}
 
 // Dump runs pg_dump and streams its stdout to w.
+//
+// SEC-WORKER FINDING-1 (2026-05-29): the connection password is passed
+// to pg_dump out-of-band via PGPASSWORD env, NOT embedded in the URL on
+// argv. argv is world-readable via /proc/<pid>/cmdline for any sidecar /
+// debug shell / log-shipper / kube-exec process for the entire backup
+// window.
 func (defaultPgDumpExec) Dump(ctx context.Context, databaseURL string, w io.Writer) (int64, error) {
 	bin := os.Getenv("PG_DUMP_BIN")
 	if bin == "" {
 		bin = "pg_dump"
+	}
+	// Split password out of the URL → into PGPASSWORD env. If parse fails
+	// we fall back to the original URL (no regression): the same code path
+	// it has always run. The downside of fail-open is that a malformed
+	// URL would still leak; the alternative is hard-fail on every backup
+	// run because of one operator typo — caller chose the safer default.
+	dsn, pw, splitErr := splitPGPassword(databaseURL)
+	if splitErr != nil {
+		// non-fatal — fall back to original URL on argv
+		dsn = databaseURL
+		pw = ""
 	}
 	cmd := exec.CommandContext(ctx, bin,
 		"--no-owner",
 		"--no-acl",
 		"--format=custom",
 		"--compress=9",
-		databaseURL,
+		dsn,
 	)
+	if pw != "" {
+		// Inherit parent env so pg_dump still sees PATH, HOME, etc.
+		cmd.Env = append(os.Environ(), "PGPASSWORD="+pw)
+	}
 	// Capture stderr to a small buffer so a pg_dump failure produces a
 	// useful error message. stdout streams straight to w.
 	var stderr strings.Builder
