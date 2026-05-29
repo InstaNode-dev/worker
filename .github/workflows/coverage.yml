@@ -71,24 +71,24 @@ jobs:
       # the drift-detection coverage. Mirrors ci.yml.
       INSTANT_API_REPO: ${{ github.workspace }}/../api
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: worker
           # Full history so diff-cover can resolve origin/<base_ref>.
           fetch-depth: 0
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           path: proto
 
       - name: Checkout common sibling (for go.mod replace ../common)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           path: common
 
       # Cross-repo registry-iterating tests (CLAUDE.md rule 18) text-walk
@@ -97,15 +97,15 @@ jobs:
       # in CI, leaving cross-repo drift detection to developer machines
       # only. INSTANT_API_REPO env (set above) locates this checkout.
       - name: Checkout api sibling (for cross-repo registry-iterating tests)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           path: _api_ci
           fetch-depth: 1
       - run: mv _api_ci ../api
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: worker/go.mod
 
@@ -153,7 +153,7 @@ jobs:
         continue-on-error: true
         run: go test ./... -short -count=1 -p 1 -coverprofile=coverage.out -covermode=atomic
 
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v6
         with:
           files: worker/coverage.out
           flags: worker
@@ -166,7 +166,7 @@ jobs:
       # "Generate coverage" step is `|| true` so it still produces
       # coverage.out even on a flaky test — the gate reads that file.
       # ------------------------------------------------------------------
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: github.event_name == 'pull_request'
         with:
           python-version: '3.12'
