@@ -71,6 +71,7 @@ import (
 	"go.opentelemetry.io/otel"
 
 	commonv1 "instant.dev/proto/common/v1"
+	"instant.dev/worker/internal/logsafe"
 	"instant.dev/worker/internal/metrics"
 )
 
@@ -1020,7 +1021,16 @@ func (w *PropagationRunnerWorker) insertPropagationAuditRow(ctx context.Context,
 // truncatePropagationError caps the persisted last_error at
 // propagationLastErrorMax bytes. Avoids unbounded growth from a chatty
 // gRPC error string.
+//
+// SEC-WORKER FINDING-6 (2026-05-29): the truncated string persists into
+// pending_propagations.last_error (DB) and audit_log.metadata.last_error
+// (JSON, surfaced to operators). A provisioner gRPC error can embed
+// connection URIs with userinfo from inner driver errors. Scrub via
+// logsafe.ScrubURL BEFORE truncation so the scrub does not chop a
+// half-URI mid-userinfo (a half-stripped URI is worse than a fully
+// stripped one).
 func truncatePropagationError(s string) string {
+	s = logsafe.ScrubURL(s)
 	if len(s) <= propagationLastErrorMax {
 		return s
 	}

@@ -1,5 +1,17 @@
 // Package logsafe provides log-safe redactions for PII / credentials.
 //
+// SEC-WORKER FINDING-3 + FINDING-6 (2026-05-29): driver / gRPC errors that
+// propagate up to slog / audit_log / persisted error columns can embed the
+// underlying connection URI verbatim. The MongoDB driver in particular
+// surfaces `mongodb://user:secret@host/...` in `options.ApplyURI` parse
+// errors; lib/pq's connection-refused errors include host/port but not
+// usually password; redis.ParseURL can return URLs with embedded auth.
+// `ScrubURL` strips the userinfo (`user:password@`) component from any
+// `scheme://userinfo@host/...` substring it finds anywhere in the input.
+//
+// Conservative: matches only well-defined RFC 3986 syntax. Will never
+// double-scrub. Idempotent. Safe to call in hot per-row loops.
+//
 // T21 P1-2 (BugBash 2026-05-20): the worker logs resource bearer tokens
 // (inst_live_… / customer UUID tokens) raw at INFO/WARN/ERROR in ~20
 // sites — `worker/internal/jobs/quota_infra.go` alone has 12. The
@@ -19,6 +31,42 @@
 // reinventing it. A test in `logsafe_test.go` pins the exact shape so
 // log dashboards / alerts can rely on a stable format.
 package logsafe
+
+import "regexp"
+
+// urlUserinfoRE matches `scheme://userinfo@host` sequences and captures
+// the scheme + host so the userinfo can be replaced with `***`. The scheme
+// list is conservative: connection URIs we care about (postgres, redis,
+// mongodb, amqp, http, https, s3, nats). Matching is case-insensitive on
+// the scheme to absorb provider quirks (Postgres://, MongoDB+SRV://, ...).
+//
+// Why a regexp instead of net/url:
+//  1. The input is typically an ERROR MESSAGE with the URI embedded, not a
+//     standalone URI — net/url.Parse on `error: failed to connect to
+//     mongodb://u:p@host` would fail.
+//  2. We can apply over the whole string in one pass and catch every
+//     embedded URI even when the error wraps multiple.
+//
+// The regexp is compiled once at package init.
+var urlUserinfoRE = regexp.MustCompile(
+	`(?i)([a-z][a-z0-9+.-]*://)([^/@\s]+@)`,
+)
+
+// ScrubURL returns s with every `scheme://userinfo@host` sequence rewritten
+// to `scheme://***@host`. Idempotent — applying twice is a no-op. Safe on
+// strings with no embedded URI (returned unchanged).
+//
+// Examples:
+//   "mongo: failed mongodb://u:p@h/d"      → "mongo: failed mongodb://***@h/d"
+//   "postgres://doadmin:abc@host:25060/db" → "postgres://***@host:25060/db"
+//   "redis: dial error redis://:pw@127/0"  → "redis: dial error redis://***@127/0"
+//   "nothing to scrub here"                → "nothing to scrub here"
+func ScrubURL(s string) string {
+	if s == "" {
+		return s
+	}
+	return urlUserinfoRE.ReplaceAllString(s, "${1}***@")
+}
 
 // Token returns a log-safe rendering of a resource bearer token.
 //
