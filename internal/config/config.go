@@ -140,6 +140,17 @@ type Config struct {
 	AuthProbeReturnTo    string // AUTH_PROBE_RETURN_TO — must be on api's allow-list
 	AuthProbeOrigin      string // AUTH_PROBE_ORIGIN — must match api CORS allow-list
 	AuthProbeBearerToken string // AUTH_PROBE_BEARER_TOKEN — probe-account session JWT
+
+	// Hourly synthetic deploy prober — drives a real end-to-end deploy
+	// against the prod /deploy/new pipeline every 60 minutes so the
+	// next regression in Kaniko / k8s / Ingress / TLS pages within the
+	// 30-minute alert window. BearerToken is required for the prober to
+	// run; empty causes every leg to report result="degraded" (config
+	// drift, not outage). BaseURL + DeployHost fall back to the production
+	// hosts inside jobs.DeployProbeConfig.Defaults().
+	DeployProbeBaseURL     string // DEPLOY_PROBE_BASE_URL — default https://api.instanode.dev
+	DeployProbeDeployHost  string // DEPLOY_PROBE_DEPLOY_HOST — default deployment.instanode.dev
+	DeployProbeBearerToken string // DEPLOY_PROBE_BEARER_TOKEN — probe-team session JWT (required)
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -234,6 +245,14 @@ func Load() *Config {
 		AuthProbeReturnTo:    os.Getenv("AUTH_PROBE_RETURN_TO"),
 		AuthProbeOrigin:      os.Getenv("AUTH_PROBE_ORIGIN"),
 		AuthProbeBearerToken: os.Getenv("AUTH_PROBE_BEARER_TOKEN"),
+
+		// Hourly synthetic deploy prober — all optional; defaults applied
+		// inside jobs.DeployProbeConfig.Defaults() so a missing env var
+		// still runs against prod. Empty BearerToken keeps the prober
+		// configured-off (degraded outcomes only, no fail alerts).
+		DeployProbeBaseURL:     os.Getenv("DEPLOY_PROBE_BASE_URL"),
+		DeployProbeDeployHost:  os.Getenv("DEPLOY_PROBE_DEPLOY_HOST"),
+		DeployProbeBearerToken: os.Getenv("DEPLOY_PROBE_BEARER_TOKEN"),
 	}
 
 	// Fall back to the shared object-store bucket when the operator hasn't
