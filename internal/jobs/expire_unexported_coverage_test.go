@@ -185,6 +185,75 @@ func TestRenderAnonExpiryEmail_MissingParamsRenderEmpty(t *testing.T) {
 	}
 }
 
+// TestRenderAnonExpiryEmail_EmptyHoursConsistency pins the
+// subject-vs-body parity for an empty hours_remaining param. Prior to
+// the EMAIL-BUGBASH-WORKER-2026-05-19 P3-1 fix, the subject defaulted
+// to "1h" while the body rendered " hours" (empty value, plural form
+// = true). The body and subject MUST agree on the same fallback so
+// recipients never see " hours" with no number or a singular/plural
+// mismatch. This is a registry-style guard: every rendered surface
+// (subject, html body H2, html body "Time left" row, text body) must
+// include a non-empty hour count.
+func TestRenderAnonExpiryEmail_EmptyHoursConsistency(t *testing.T) {
+	subj, html, text := renderAnonExpiryEmail(map[string]string{
+		"resource_type":  "postgres",
+		"reminder_index": "3",
+		"token_prefix":   "tok-abcd",
+		"expires_at":     "2026-05-22T00:00:00Z",
+		"upgrade_url":    "https://x/upgrade",
+		"resource_url":   "https://x/res",
+		// hours_remaining intentionally omitted.
+	})
+
+	// Subject MUST end with "1h" (the subject's existing fallback).
+	if !strings.HasSuffix(subj, "1h") {
+		t.Errorf("subject must end with '1h' on empty hours_remaining, got %q", subj)
+	}
+
+	// Every rendered surface must contain "1 hour" (singular, matching
+	// the subject's "1h") — never " hour" or " hours" (empty number).
+	// The H2, "Time left" row, and text body all use the same template.
+	surfaces := map[string]string{"html": html, "text": text}
+	for name, body := range surfaces {
+		if !strings.Contains(body, "1 hour") {
+			t.Errorf("%s body must include '1 hour' (singular) on empty hours_remaining, got: %s", name, body)
+		}
+		if strings.Contains(body, "1 hours") {
+			t.Errorf("%s body must not include '1 hours' (incorrect plural), got: %s", name, body)
+		}
+		// Never an empty-number rendering. Catches re-introducing the bug.
+		if strings.Contains(body, " hour ") && !strings.Contains(body, "1 hour ") {
+			t.Errorf("%s body has bare ' hour ' with no preceding number, got: %s", name, body)
+		}
+		if strings.Contains(body, " hours") && !strings.Contains(body, "1 hours") &&
+			!hasDigitBefore(body, " hours") {
+			t.Errorf("%s body has ' hours' with no preceding digit, got: %s", name, body)
+		}
+	}
+}
+
+// hasDigitBefore reports whether every occurrence of `needle` in `s`
+// is preceded by an ASCII digit. Helper for the empty-number guard:
+// "12 hours" passes (digit before), " hours" fails (space before).
+func hasDigitBefore(s, needle string) bool {
+	i := 0
+	for {
+		idx := strings.Index(s[i:], needle)
+		if idx == -1 {
+			return true
+		}
+		pos := i + idx
+		if pos == 0 {
+			return false
+		}
+		c := s[pos-1]
+		if c < '0' || c > '9' {
+			return false
+		}
+		i = pos + len(needle)
+	}
+}
+
 // TestAnonExpirySubject_AllBranches walks every reminder_index prefix
 // and the default fallback (any other value).
 func TestAnonExpirySubject_AllBranches(t *testing.T) {

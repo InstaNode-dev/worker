@@ -170,19 +170,32 @@ type anonExpiryView struct {
 // template.Must). On the off-chance a future template change breaks
 // parsing, the panic surfaces in CI rather than at runtime.
 //
-// Missing param keys render as empty strings. The caller (forwarder)
-// is responsible for not invoking this for kinds other than
-// anon.expiry_warning.
+// Missing param keys render as empty strings, EXCEPT hours_remaining
+// which defaults to "1" so the subject ("expires in 1h") and the body
+// ("expires in 1 hour") stay consistent. Without this defaulting, an
+// empty hours_remaining would render "expires in  hours" (note the
+// double space + plural "s") — a P3 bug from EMAIL-BUGBASH-WORKER
+// 2026-05-19. The caller (forwarder) is responsible for not invoking
+// this for kinds other than anon.expiry_warning.
 func renderAnonExpiryEmail(params map[string]string) (subject, html, text string) {
+	// Default the hours_remaining BEFORE deciding plurality so the body
+	// matches the subject's "1h" fallback path (see anonExpirySubject).
+	// "1" is the conservative default for a final-reminder cadence — if
+	// the forwarder ever loses the field, the email still reads as a
+	// last-chance nudge rather than mysteriously empty.
+	hoursRemaining := params["hours_remaining"]
+	if hoursRemaining == "" {
+		hoursRemaining = "1"
+	}
 	view := anonExpiryView{
 		ResourceType:   params["resource_type"],
-		HoursRemaining: params["hours_remaining"],
+		HoursRemaining: hoursRemaining,
 		ExpiresAt:      params["expires_at"],
 		ReminderIndex:  params["reminder_index"],
 		TokenPrefix:    params["token_prefix"],
 		UpgradeURL:     params["upgrade_url"],
 		ResourceURL:    params["resource_url"],
-		Plural:         params["hours_remaining"] != "1",
+		Plural:         hoursRemaining != "1",
 	}
 
 	subject = anonExpirySubject(view.ReminderIndex, view.ResourceType, view.HoursRemaining)
