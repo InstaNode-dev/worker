@@ -722,6 +722,28 @@ var (
 		Name: "instant_pg_pool_wait_duration_seconds",
 		Help: "Cumulative time spent waiting for a connection since process start, in seconds (sql.DBStats.WaitDuration). Pairs with instant_pg_pool_wait_count.",
 	}, []string{"pool"})
+
+	// AuthProbeOutcomeTotal — AUTH-004 synthetic prober counters. Labelled by
+	// `leg` (email_start | exchange_headers | me) and `result` (pass | fail
+	// | degraded). result="fail" is the alert-able signal — the AUTH-004
+	// chain (broken /auth/exchange + missing ACAC header) was undetectable
+	// for ~24h because nothing drove a real browser-shaped probe against
+	// prod. NR alert: any fail in 10m → P0 (auth-probe-fail.json).
+	// Prom rule: AuthProbeFail in prometheus-rules.yaml.
+	// Emit site: worker/internal/jobs/auth_probe.go (AuthProbePromMetrics).
+	AuthProbeOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_auth_probe_outcome_total",
+		Help: "AUTH-004 synthetic prober outcomes per leg (email_start|exchange_headers|me) and result (pass|fail|degraded).",
+	}, []string{"leg", "result"})
+
+	// AuthProbeLatencySeconds — per-leg HTTP latency histogram. Only
+	// observed on a real response (DNS / TCP errors omit the observation
+	// so a sustained outage doesn't pile zeros into the bucket).
+	AuthProbeLatencySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "instant_auth_probe_latency_seconds",
+		Help:    "AUTH-004 synthetic prober per-leg latency. Buckets centred on the per-leg latency budgets (50ms…5s).",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+	}, []string{"leg"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check on this service.
