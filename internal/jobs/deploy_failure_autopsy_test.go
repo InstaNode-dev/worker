@@ -254,9 +254,11 @@ func TestUpsertAutopsyRow_Idempotent(t *testing.T) {
 // ── captureDeploymentAutopsy integration-style tests ─────────────────────────
 
 // TestCaptureDeploymentAutopsy_NilK8s verifies that when the autopsy k8s
-// client is nil, captureDeploymentAutopsy still writes an Unknown-reason row.
+// client is nil, captureDeploymentAutopsy still writes an Unknown-reason
+// autopsy row, attempts the PR 2 already_present check, error_message update,
+// and audit_log emit (all fail-soft when sqlmock doesn't expect them).
 func TestCaptureDeploymentAutopsy_NilK8s(t *testing.T) {
-	db, mock, err := sqlmock.New()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
@@ -265,8 +267,19 @@ func TestCaptureDeploymentAutopsy_NilK8s(t *testing.T) {
 	id := uuid.New()
 	providerID := "app-abc123"
 
-	// Expect one upsert with reason=Unknown.
+	// PR 2 pre-check: already_present query (returns no row → fresh capture).
+	mock.ExpectQuery(`SELECT reason FROM deployment_events`).
+		WillReturnError(sql.ErrNoRows)
+	// Autopsy row upsert.
 	mock.ExpectExec(`INSERT INTO deployment_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// PR 2 error_message update (only runs when error_message IS NULL or '').
+	mock.ExpectExec(`UPDATE deployments\s+SET error_message`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// PR 2 audit emit: team_id lookup + INSERT INTO audit_log.
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WillReturnRows(sqlmock.NewRows([]string{"team_id"}).AddRow(uuid.New()))
+	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	captureDeploymentAutopsy(context.Background(), db, id, providerID, nil)
@@ -278,7 +291,7 @@ func TestCaptureDeploymentAutopsy_NilK8s(t *testing.T) {
 
 // TestCaptureDeploymentAutopsy_FullCapture verifies that a stubbed k8s
 // provider with an OOMKilled pod produces an OOMKilled reason in the
-// upserted autopsy row.
+// upserted autopsy row + the PR 2 error_message UPDATE + audit_log emit.
 func TestCaptureDeploymentAutopsy_FullCapture(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -300,8 +313,15 @@ func TestCaptureDeploymentAutopsy_FullCapture(t *testing.T) {
 		logs:   nil,
 	}
 
-	// Expect an upsert; we inspect the args to confirm OOMKilled is the reason.
+	mock.ExpectQuery(`SELECT reason FROM deployment_events`).
+		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(`INSERT INTO deployment_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE deployments\s+SET error_message`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WillReturnRows(sqlmock.NewRows([]string{"team_id"}).AddRow(uuid.New()))
+	mock.ExpectExec(`INSERT INTO audit_log`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	captureDeploymentAutopsy(context.Background(), db, id, providerID, stub)
@@ -309,7 +329,6 @@ func TestCaptureDeploymentAutopsy_FullCapture(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
-	// Verify stub was called (all three methods).
 	if !stub.listPodsCalled {
 		t.Error("expected ListPods to be called")
 	}

@@ -95,6 +95,13 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	OrphanSweepReapedTotal.WithLabelValues("team_tombstoned").Add(0)
 	OrphanSweepReapFailedTotal.WithLabelValues("team_tombstoned").Add(0)
 	DeployJobFailedDetectedTotal.WithLabelValues("BackoffLimitExceeded").Add(0)
+	// Prime all four DeployAutopsyCapturedTotal outcome label values so
+	// /metrics exposes them from process start (lazy emit otherwise leaves
+	// the panel empty until the first real autopsy fires).
+	DeployAutopsyCapturedTotal.WithLabelValues("logs_captured").Add(0)
+	DeployAutopsyCapturedTotal.WithLabelValues("logs_unavailable").Add(0)
+	DeployAutopsyCapturedTotal.WithLabelValues("already_present").Add(0)
+	DeployAutopsyCapturedTotal.WithLabelValues("audit_emit_failed").Add(0)
 
 	// Gauge vecs
 	ResourceDegradedGauge.WithLabelValues("postgres").Set(0)
