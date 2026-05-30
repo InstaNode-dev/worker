@@ -16,6 +16,7 @@ package jobs_test
 import (
 	"context"
 	"database/sql"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -724,6 +725,151 @@ func TestDeployProbe_ServeBuildRequestErr(t *testing.T) {
 	_ = w.Work(context.Background(), fakeJob[jobs.DeployProbeArgs]())
 	if got := fm.outcomeFor("serve"); got != "fail" {
 		t.Errorf("serve: want fail (build_request), got %q", got)
+	}
+}
+
+// TestDeployProbe_Bootstrap_FirstTick404RetriesAsCreate — the headline
+// fix for the synthetic prober's first-tick wedge (worker#69 → worker#71).
+// The first POST /deploy/new with redeploy=true must hit the canonical
+// 404 `no_existing_deployment_to_redeploy` from the api. legSubmit MUST
+// transparently retry without redeploy=true and report the second
+// call's outcome as result=bootstrap (NOT pass), so the dashboard
+// distinguishes "we self-healed once" from "steady-state working".
+// Downstream legs (status + serve) MUST still run against the
+// bootstrapped app_id — they get skipped on submit fail, but bootstrap
+// is a success category for the purposes of leg dependency.
+//
+// Counts POSTs per body so the test asserts EXACTLY one bootstrap
+// retry was made (no infinite loop / duplicate slot burn).
+func TestDeployProbe_Bootstrap_FirstTick404RetriesAsCreate(t *testing.T) {
+	var (
+		mu              sync.Mutex
+		postsWithReply  int
+		postsCreatePath int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/deploy/new" && r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			hasRedeploy := strings.Contains(string(body), `name="redeploy"`)
+			if hasRedeploy {
+				postsWithReply++
+				mu.Unlock()
+				// First-tick canonical 404 — exact body shape the api returns.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"ok":false,"error":"no_existing_deployment_to_redeploy","message":"No active deployment named \"deploy-probe-test\" was found in env=development."}`))
+				return
+			}
+			postsCreatePath++
+			mu.Unlock()
+			// Bootstrap path — create returns 202 + app_id.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"ok":true,"item":{"app_id":"bootstrap-app-1"}}`))
+		case strings.HasPrefix(r.URL.Path, "/deploy/") && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true,"item":{"app_id":"bootstrap-app-1","status":"healthy"}}`))
+		case r.URL.Path == "/":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("deploy-probe-ok"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	// No ExpectExec — a bootstrap is NOT a fail; the audit_log path must
+	// not fire. mock.ExpectationsWereMet() at the end asserts this.
+
+	fm := &fakeDeployProbeMetrics{}
+	w := jobs.NewDeployProbeWorker(db, httpClientRetargetingHTTPSToServer(srv), fm, deployProbeBaseConfig(t, srv))
+	if err := w.Work(context.Background(), fakeJob[jobs.DeployProbeArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	mu.Lock()
+	gotRedeploy, gotCreate := postsWithReply, postsCreatePath
+	mu.Unlock()
+	if gotRedeploy != 1 {
+		t.Errorf("POSTs with redeploy=true: want 1, got %d", gotRedeploy)
+	}
+	if gotCreate != 1 {
+		t.Errorf("POSTs without redeploy (bootstrap): want 1, got %d", gotCreate)
+	}
+	if got := fm.outcomeFor("submit"); got != "bootstrap" {
+		t.Errorf("submit outcome: want bootstrap, got %q", got)
+	}
+	// Downstream legs must run on the bootstrapped row.
+	if got := fm.outcomeFor("status"); got != "pass" {
+		t.Errorf("status outcome (after bootstrap): want pass, got %q", got)
+	}
+	if got := fm.outcomeFor("serve"); got != "pass" {
+		t.Errorf("serve outcome (after bootstrap): want pass, got %q", got)
+	}
+	// No audit_log row was expected — bootstrap is not a failure.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected DB activity on bootstrap: %v", err)
+	}
+}
+
+// TestDeployProbe_Bootstrap_NonCanonical404StillFails — coverage gate
+// against the "any 404 is bootstrap" anti-pattern. A 404 whose body
+// does NOT carry the canonical error_code (e.g. an auth misroute, a
+// reverse-proxy 404, a future api-side regression that drops the
+// typed-error field) MUST NOT trigger the retry — it stays a hard fail
+// with an audit_log row. Otherwise a real outage gets silently masked
+// as a self-heal.
+func TestDeployProbe_Bootstrap_NonCanonical404StillFails(t *testing.T) {
+	var posts int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/deploy/new" && r.Method == http.MethodPost {
+			mu.Lock()
+			posts++
+			mu.Unlock()
+			// 404 with a DIFFERENT error code — looks like a routing 404,
+			// not the canonical missing-row signal. Must NOT trigger
+			// bootstrap retry.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"route_not_found","message":"unknown route"}`))
+		}
+	}))
+	defer srv.Close()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	// audit_log row IS expected — this is a real failure, not a self-heal.
+	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	fm := &fakeDeployProbeMetrics{}
+	w := jobs.NewDeployProbeWorker(db, httpClientRetargetingHTTPSToServer(srv), fm, deployProbeBaseConfig(t, srv))
+	if err := w.Work(context.Background(), fakeJob[jobs.DeployProbeArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	mu.Lock()
+	got := posts
+	mu.Unlock()
+	// EXACTLY one POST — the non-canonical 404 must not retry.
+	if got != 1 {
+		t.Errorf("POSTs to /deploy/new: want 1 (no retry on non-canonical 404), got %d", got)
+	}
+	if got := fm.outcomeFor("submit"); got != "fail" {
+		t.Errorf("submit outcome: want fail, got %q", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("audit_log expectation: %v", err)
 	}
 }
 

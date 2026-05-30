@@ -55,12 +55,13 @@ func TestBuildDeployProbeNginxTarball_RoundTrips(t *testing.T) {
 }
 
 // TestBuildDeployProbeMultipart_Shape — buildDeployProbeMultipart's
-// success path. Asserts the multipart body carries `tarball`, `name`,
-// `port=80`, `env`, and `redeploy=true` — the exact field set the api's
-// /deploy/new handler reads. A missing field here would silently flip
-// the prober to "fresh deploy" (no redeploy) and burn one slot per tick.
+// success path with redeploy=true. Asserts the multipart body carries
+// `tarball`, `name`, `port=80`, `env`, and `redeploy=true` — the exact
+// field set the api's /deploy/new handler reads. A missing field here
+// would silently flip the prober to "fresh deploy" (no redeploy) and
+// burn one slot per tick.
 func TestBuildDeployProbeMultipart_Shape(t *testing.T) {
-	body, contentType := buildDeployProbeMultipart("probe-name", "development")
+	body, contentType := buildDeployProbeMultipart("probe-name", "development", true)
 	if !strings.HasPrefix(contentType, "multipart/form-data; boundary=") {
 		t.Errorf("contentType: %q", contentType)
 	}
@@ -75,6 +76,30 @@ func TestBuildDeployProbeMultipart_Shape(t *testing.T) {
 	} {
 		if !strings.Contains(raw, want) {
 			t.Errorf("multipart body missing %q", want)
+		}
+	}
+}
+
+// TestBuildDeployProbeMultipart_BootstrapShape — the bootstrap retry
+// passes redeploy=false; the body must NOT carry a `redeploy` field at
+// all, so the api takes the create-semantics path. Required so a future
+// refactor that defaults the form field can't quietly re-introduce the
+// "first-tick burns a slot per tick" regression.
+func TestBuildDeployProbeMultipart_BootstrapShape(t *testing.T) {
+	body, _ := buildDeployProbeMultipart("probe-name", "development", false)
+	raw := body.String()
+	if strings.Contains(raw, `name="redeploy"`) {
+		t.Errorf("bootstrap body unexpectedly carries name=\"redeploy\" field: %s", raw)
+	}
+	// Other required fields must still be present.
+	for _, want := range []string{
+		`name="tarball"`,
+		`name="name"`, "probe-name",
+		`name="port"`, "80",
+		`name="env"`, "development",
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("bootstrap body missing %q", want)
 		}
 	}
 }
