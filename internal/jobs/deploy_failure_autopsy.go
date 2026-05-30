@@ -526,10 +526,9 @@ func findBuildPodName(ctx context.Context, k8s deployAutopsyK8sProvider, ns, app
 	return podList.Items[0].Name
 }
 
-// buildJobNamePrefix mirrors api/internal/providers/compute/k8s/client.go's
-// build Job naming convention: jobName = "build-" + sanitizeName(appID). Kept
-// duplicated (no shared import — same pattern the rest of this file uses).
-const buildJobNamePrefix = "build-"
+// buildJobNamePrefix is declared in deploy_status_reconcile.go (PR #65) as
+// `const buildJobNamePrefix = "build-"`. Both files build the kaniko Job
+// name the same way: jobName = buildJobNamePrefix + sanitizeName(appID).
 
 // updateDeploymentErrorMessage stamps the deployments.error_message column
 // with a "<reason>: <hint snippet>" one-liner so row-only readers see a
