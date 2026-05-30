@@ -534,6 +534,46 @@ var (
 		Help: "Per-component readiness status (1=ok, 0.5=degraded, 0=failed). Set by /readyz on every probe.",
 	}, []string{"service", "check"})
 
+	// ── DeployStatusReconciler — Job-failed override (silent-deploy-failure fix) ─
+	//
+	// Increments every time the reconciler detects a kaniko build Job in the
+	// `Failed` state (BackoffLimit exhausted, ActiveDeadlineSeconds exceeded,
+	// or any JobCondition of type Failed). The pre-fix reconciler only
+	// queried the runtime appsv1.Deployment and missed this whole class of
+	// failure (2026-05-30 incident: a user's deploy sat at `building` forever
+	// because the build pod was GC'd and there was no Deployment object to
+	// query). This counter is the leading indicator that the Job-query
+	// override is doing its job; pair with `instant_deploy_autopsy_captured_total`
+	// to see the autopsy follow-through.
+	//
+	// Labels:
+	//   reason — the Job's `Failed` condition reason verbatim. k8s uses a
+	//            small, stable set: "BackoffLimitExceeded", "DeadlineExceeded",
+	//            "PodFailurePolicy". Plus two bounded fallbacks set in
+	//            jobFailureReason: "failed_no_reason" (condition present but
+	//            no reason string) and "backoff_limit_exceeded" (cluster-
+	//            version backstop — JobFailed condition not stamped but
+	//            Status.Failed > BackoffLimit).
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_deploy_job_failed_detected_total[15m])) by (reason) > 0.5
+	//     for 30+ minutes → P2 page. A sustained rate of
+	//     reason="DeadlineExceeded" means the platform's kaniko build slot is
+	//     timing out for many tenants (image bloat or a degraded GHCR push
+	//     path); reason="BackoffLimitExceeded" is the modal Dockerfile-error
+	//     bucket — alert at a higher threshold or visualize on the dashboard
+	//     only.
+	//
+	// Catalog row (infra/observability/METRICS-CATALOG.md):
+	//   instant_deploy_job_failed_detected_total | counter | reason | lazy
+	//   (first observation is a real Job-failed detection — does not appear at
+	//   /metrics until then; the test in metrics_test.go forces a label so the
+	//   metric is registered at process start).
+	DeployJobFailedDetectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_job_failed_detected_total",
+		Help: "Kaniko build Jobs detected in Failed state by deploy_status_reconcile (silent-deploy-failure fix, 2026-05-30). Labelled by Job Failed-condition reason.",
+	}, []string{"reason"})
+
 	// ── orphan_sweep_reconciler — reap counters (2026-05-20) ──────────────────
 	//
 	// Every namespace / DB row the orphan-sweep reconciler reaps (or flips to

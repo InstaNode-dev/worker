@@ -94,6 +94,7 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	PropagationUnknownKindTotal.WithLabelValues("unknown").Add(0)
 	OrphanSweepReapedTotal.WithLabelValues("team_tombstoned").Add(0)
 	OrphanSweepReapFailedTotal.WithLabelValues("team_tombstoned").Add(0)
+	DeployJobFailedDetectedTotal.WithLabelValues("BackoffLimitExceeded").Add(0)
 
 	// Gauge vecs
 	ResourceDegradedGauge.WithLabelValues("postgres").Set(0)

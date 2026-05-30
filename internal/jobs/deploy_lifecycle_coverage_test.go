@@ -53,6 +53,7 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -66,16 +67,26 @@ import (
 // fakeDeployStatusK8s satisfies deployStatusK8sProvider for the Work
 // reconciler tests. The map's key is the namespace + "|" + name; missing
 // entries return apierrors.IsNotFound so the reconciler maps to "stopped".
+//
+// jobs / jobErrOn are the same shape for the build-Job override path: by
+// default GetBuildJob returns NotFound (the existing tests pre-date the
+// Job override and expect the legacy Deployment-only behaviour), so the
+// override only fires for tests that explicitly populate jobs.
 type fakeDeployStatusK8s struct {
-	objs    map[string]*appsv1.Deployment
-	errOn   map[string]error
-	callLog []string
+	objs     map[string]*appsv1.Deployment
+	errOn    map[string]error
+	jobs     map[string]*batchv1.Job
+	jobErrOn map[string]error
+	callLog  []string
+	jobCalls []string
 }
 
 func newFakeDeployStatusK8s() *fakeDeployStatusK8s {
 	return &fakeDeployStatusK8s{
-		objs:  map[string]*appsv1.Deployment{},
-		errOn: map[string]error{},
+		objs:     map[string]*appsv1.Deployment{},
+		errOn:    map[string]error{},
+		jobs:     map[string]*batchv1.Job{},
+		jobErrOn: map[string]error{},
 	}
 }
 
@@ -89,6 +100,18 @@ func (f *fakeDeployStatusK8s) GetDeployment(_ context.Context, ns, name string) 
 		return d, nil
 	}
 	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "deployments"}, name)
+}
+
+func (f *fakeDeployStatusK8s) GetBuildJob(_ context.Context, ns, name string) (*batchv1.Job, error) {
+	key := ns + "|" + name
+	f.jobCalls = append(f.jobCalls, key)
+	if err, ok := f.jobErrOn[key]; ok {
+		return nil, err
+	}
+	if j, ok := f.jobs[key]; ok {
+		return j, nil
+	}
+	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "jobs"}, name)
 }
 
 // fakeAutopsyK8sCov is a copy of fakeAutopsyK8s from deploy_failure_autopsy_test.go
