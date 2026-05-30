@@ -150,6 +150,22 @@ jobs:
             --push \
             .
 
+      - name: Smoke-check pg_dump is on PATH in the built image
+        # P0 regression gate (incident 2026-05-30): customer_backup_runner.go
+        # shells out to `pg_dump`. The previous distroless base had no
+        # pg_dump and every Pro+ scheduled backup failed silently with
+        # `executable file not found in $PATH`. Hard-fail the deploy if
+        # the binary regresses, and assert the major version is >= the
+        # customer-pg server major (currently postgres:16-alpine).
+        run: |
+          IMAGE="${IMAGE_REPO}:${{ steps.meta.outputs.version }}"
+          echo "Probing ${IMAGE} for pg_dump"
+          docker pull "${IMAGE}"
+          PG_VER=$(docker run --rm --entrypoint sh "${IMAGE}" -c 'pg_dump --version')
+          echo "pg_dump: ${PG_VER}"
+          echo "${PG_VER}" | grep -qE '^pg_dump \(PostgreSQL\) 1[6-9]' \
+            || { echo "::error::pg_dump missing or wrong major version (need >=16): ${PG_VER}"; exit 1; }
+
       - name: Set up kubectl
         uses: azure/setup-kubectl@v5
         with:
