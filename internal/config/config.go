@@ -128,6 +128,18 @@ type Config struct {
 	CustomerDatabaseURL string // CUSTOMER_DATABASE_URL
 	MongoAdminURI       string // MONGO_ADMIN_URI
 	CustomerRedisURL    string // CUSTOMER_REDIS_URL
+
+	// AUTH-004 synthetic prober — drives a real-browser-shaped login probe
+	// against the api every 5 minutes so the next regression in the
+	// /auth/exchange CORS chain pages immediately. All five fields are
+	// optional; AuthProbeBaseURL empty falls back to https://api.instanode.dev.
+	// AuthProbeBearerToken empty causes leg 3 (/auth/me) to be skipped with
+	// result="degraded" — operator hasn't wired a probe-account token.
+	AuthProbeBaseURL     string // AUTH_PROBE_BASE_URL — default https://api.instanode.dev
+	AuthProbeEmail       string // AUTH_PROBE_EMAIL — synthetic identity for /auth/email/start
+	AuthProbeReturnTo    string // AUTH_PROBE_RETURN_TO — must be on api's allow-list
+	AuthProbeOrigin      string // AUTH_PROBE_ORIGIN — must match api CORS allow-list
+	AuthProbeBearerToken string // AUTH_PROBE_BEARER_TOKEN — probe-account session JWT
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -213,6 +225,15 @@ func Load() *Config {
 		CustomerDatabaseURL: os.Getenv("CUSTOMER_DATABASE_URL"),
 		MongoAdminURI:       os.Getenv("MONGO_ADMIN_URI"),
 		CustomerRedisURL:    os.Getenv("CUSTOMER_REDIS_URL"),
+
+		// AUTH-004 synthetic prober. All optional — defaults applied
+		// inside jobs.AuthProbeConfig.Defaults() so a missing env var
+		// still runs the prober against prod.
+		AuthProbeBaseURL:     os.Getenv("AUTH_PROBE_BASE_URL"),
+		AuthProbeEmail:       os.Getenv("AUTH_PROBE_EMAIL"),
+		AuthProbeReturnTo:    os.Getenv("AUTH_PROBE_RETURN_TO"),
+		AuthProbeOrigin:      os.Getenv("AUTH_PROBE_ORIGIN"),
+		AuthProbeBearerToken: os.Getenv("AUTH_PROBE_BEARER_TOKEN"),
 	}
 
 	// Fall back to the shared object-store bucket when the operator hasn't

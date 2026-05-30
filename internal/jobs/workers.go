@@ -716,6 +716,22 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	river.AddWorker(workers, WithObservability(NewUptimeProberWorker(db), nrApp))
 	// Uptime retention sweep — daily prune of uptime_samples > 90d.
 	river.AddWorker(workers, WithObservability(NewUptimeRetentionWorker(db), nrApp))
+	// AUTH-004 synthetic prober. Every 5 minutes, drives the full
+	// browser-shaped login loop against prod (/auth/email/start +
+	// /auth/exchange CORS contract + /auth/me bearer). Pages on the
+	// regression class that hid prod login broken for ~24h (missing
+	// Access-Control-Allow-Credentials on /auth/exchange). See
+	// auth_probe.go for the per-leg fail-mode rationale.
+	river.AddWorker(workers, WithObservability(
+		NewAuthProbeWorker(db, nil, AuthProbePromMetrics{}, AuthProbeConfig{
+			BaseURL:     cfg.AuthProbeBaseURL,
+			Email:       cfg.AuthProbeEmail,
+			ReturnTo:    cfg.AuthProbeReturnTo,
+			Origin:      cfg.AuthProbeOrigin,
+			BearerToken: cfg.AuthProbeBearerToken,
+		}),
+		nrApp,
+	))
 	// Razorpay webhook-events prune — daily DELETE of razorpay_webhook_events
 	// rows > 30d. The api appends one dedup row per Razorpay webhook delivery;
 	// migration 033 envisioned a periodic prune but never shipped one, so the
@@ -1274,6 +1290,19 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return UptimeRetentionArgs{}, periodicInsertOpts(24 * time.Hour)
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// AUTH-004 synthetic prober — every 5 minutes. Routed to the
+		// reconcile queue so a default-queue weekly_digest fan-out can't
+		// starve the auth-loop probe. RunOnStart=true so a worker restart
+		// immediately writes a baseline pass/fail per leg rather than
+		// waiting a full cadence (5 min of silence on the auth-loop
+		// probe is a long gap given the 10-min alert window).
+		river.NewPeriodicJob(
+			river.PeriodicInterval(authProbeInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return AuthProbeArgs{}, reconcileInsertOpts(authProbeInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 		// Razorpay webhook-events prune — daily DELETE of dedup rows > 30d.
 		// RunOnStart=false: a restart shouldn't immediately scan; the table
