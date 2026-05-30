@@ -744,6 +744,30 @@ var (
 		Help:    "AUTH-004 synthetic prober per-leg latency. Buckets centred on the per-leg latency budgets (50ms…5s).",
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5},
 	}, []string{"leg"})
+
+	// DeployProbeOutcomeTotal — hourly synthetic deploy prober counters.
+	// Labelled by `leg` (submit | status | serve) and `result` (pass |
+	// fail | degraded). result="fail" is the alert-able signal — the
+	// 2026-05-30 morning truehomie-api stuck-build incident hid the
+	// /deploy/new pipeline being broken for ~30 minutes until the user
+	// reported it. NR alert: any fail in 30m → P0 (deploy-probe-fail.json).
+	// Prom rule: DeployProbeFail in prometheus-rules.yaml.
+	// Emit site: worker/internal/jobs/deploy_probe.go (DeployProbePromMetrics).
+	DeployProbeOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_probe_outcome_total",
+		Help: "Hourly synthetic deploy prober outcomes per leg (submit|status|serve) and result (pass|fail|degraded).",
+	}, []string{"leg", "result"})
+
+	// DeployProbeLatencySeconds — per-leg HTTP/poll latency histogram.
+	// Only observed on a real response (DNS / TCP errors omit the
+	// observation). Buckets span the per-leg budgets (submit 30s,
+	// status poll up to 90s wall-clock, serve 30s) — the wider 120s
+	// upper bucket captures the cold-cluster Kaniko build edge case.
+	DeployProbeLatencySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "instant_deploy_probe_latency_seconds",
+		Help:    "Hourly deploy prober per-leg wall-clock latency. Buckets cover the per-leg budgets up to the 120s cold-cluster Kaniko ceiling.",
+		Buckets: []float64{0.5, 1, 5, 10, 30, 60, 90, 120},
+	}, []string{"leg"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check on this service.

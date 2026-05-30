@@ -732,6 +732,24 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}),
 		nrApp,
 	))
+	// Hourly synthetic deploy prober. Drives a full end-to-end deploy
+	// (/deploy/new → Kaniko build → k8s pod → public-host GET) against
+	// prod every 60 minutes so the next regression in the deploy
+	// pipeline pages within the 30-minute alert window. Closes the gap
+	// that hid the 2026-05-30 morning truehomie-api stuck-build
+	// incident for ~30 min until the user reported it. Bearer empty
+	// keeps the prober configured-off (every leg returns degraded —
+	// no fail alerts) so the rollout of DEPLOY_PROBE_BEARER_TOKEN can
+	// land without paging on the secret-unset state. See
+	// deploy_probe.go for the per-leg fail-mode rationale.
+	river.AddWorker(workers, WithObservability(
+		NewDeployProbeWorker(db, nil, DeployProbePromMetrics{}, DeployProbeConfig{
+			BaseURL:     cfg.DeployProbeBaseURL,
+			DeployHost:  cfg.DeployProbeDeployHost,
+			BearerToken: cfg.DeployProbeBearerToken,
+		}),
+		nrApp,
+	))
 	// Razorpay webhook-events prune — daily DELETE of razorpay_webhook_events
 	// rows > 30d. The api appends one dedup row per Razorpay webhook delivery;
 	// migration 033 envisioned a periodic prune but never shipped one, so the
@@ -1303,6 +1321,22 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return AuthProbeArgs{}, reconcileInsertOpts(authProbeInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Hourly synthetic deploy prober — every 60 minutes drives
+		// /deploy/new + status-poll + serve-fetch against prod.
+		// RunOnStart=false because (a) the leg-1 submit is heavyweight
+		// (Kaniko build + k8s rollout — ~30s of cluster work per tick)
+		// and (b) a worker restart inside the hour doesn't add useful
+		// signal beyond the previous tick's metric. The 30-minute alert
+		// window comfortably tolerates the post-restart gap. Routed to
+		// the reconcile queue so a default-queue weekly_digest fan-out
+		// can't starve the deploy probe.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(deployProbeInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeployProbeArgs{}, reconcileInsertOpts(deployProbeInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
 		),
 		// Razorpay webhook-events prune — daily DELETE of dedup rows > 30d.
 		// RunOnStart=false: a restart shouldn't immediately scan; the table
