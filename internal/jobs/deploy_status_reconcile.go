@@ -82,12 +82,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/riverqueue/river"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"instant.dev/worker/internal/metrics"
 )
 
 // Reconciler tunables. The interval matches the periodic-job registration in
@@ -147,6 +150,31 @@ const (
 	// provider. The worker derives the namespace from provider_id rather than
 	// storing it on the deployments row.
 	deployNamespacePrefix = "instant-deploy-"
+
+	// buildJobNamePrefix mirrors the api's k8s.buildImage() jobName format:
+	//   jobName := "build-" + sanitizeName(appID)
+	// (api/internal/providers/compute/k8s/client.go ~L1390 / L1217).
+	//
+	// The build runs as a `batchv1.Job` named `build-<appID>` in the same
+	// per-deployment namespace (`instant-deploy-<appID>`) as the runtime
+	// `appsv1.Deployment`. A Job that hits its BackoffLimit (kaniko Dockerfile
+	// error) or its ActiveDeadlineSeconds (10 min wall-clock cap) marks itself
+	// `Failed` in its status BUT the runtime Deployment object is NEVER
+	// created — buildImage returns an error to runDeploy before the
+	// apply/rollout step runs. The pre-fix reconciler only queried the
+	// runtime Deployment, so a build-failed row reconciled to either
+	// `stopped` (Deployment NotFound — wrong, looks like a teardown) or stayed
+	// `building` forever (e.g. the api goroutine crashed mid-runDeploy and
+	// the row's terminal status write never landed). This was the silent-
+	// deploy-failure bug class (2026-05-30 user incident `truehomie-api-...`).
+	//
+	// The fix: after the Deployment query, ALWAYS query the build Job too. A
+	// Failed Job is authoritative — flip the row to `failed` regardless of
+	// what the runtime Deployment said. The Job's `TTLSecondsAfterFinished`
+	// (5 min in the api) keeps the Job object readable for a window even
+	// after k8s GCs the build pod, giving the reconciler a structured signal
+	// the pre-fix code missed.
+	buildJobNamePrefix = "build-"
 )
 
 // DeployStatusReconcileArgs is the periodic-job payload. Empty — every run is
@@ -165,6 +193,13 @@ type deployStatusK8sProvider interface {
 	// when the namespace or Deployment has been deleted. The caller maps NotFound
 	// to status="stopped".
 	GetDeployment(ctx context.Context, namespace, name string) (*appsv1.Deployment, error)
+
+	// GetBuildJob returns the live kaniko build Job, or apierrors.IsNotFound
+	// when the Job has been GC'd (past its TTLSecondsAfterFinished — 5 min in
+	// the api) or the namespace has been deleted. The caller inspects
+	// Status.Failed + JobConditions to detect a terminal build failure that
+	// the runtime-Deployment query alone cannot see.
+	GetBuildJob(ctx context.Context, namespace, name string) (*batchv1.Job, error)
 }
 
 // k8sDeployStatusClient is the concrete deployStatusK8sProvider implementation.
@@ -177,6 +212,11 @@ type k8sDeployStatusClient struct {
 // GetDeployment implements deployStatusK8sProvider.
 func (c *k8sDeployStatusClient) GetDeployment(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
 	return c.cs.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+// GetBuildJob implements deployStatusK8sProvider.
+func (c *k8sDeployStatusClient) GetBuildJob(ctx context.Context, namespace, name string) (*batchv1.Job, error) {
+	return c.cs.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
 // NewK8sDeployStatusClient builds a deployStatusK8sProvider from in-cluster
@@ -434,6 +474,36 @@ var errSkipForeignProviderID = errors.New("provider_id not in app-<appID> shape;
 // and maps the result into the canonical status string set. NotFound (the
 // namespace or Deployment has been deleted out from under us) maps to
 // "stopped" — same as the api's k8s.Status() helper.
+//
+// JOB-FAILED OVERRIDE (silent-deploy-failure fix, 2026-05-30 incident):
+//
+// After the Deployment query, ALWAYS consult the kaniko build Job too.
+// A Job in `Failed` phase (BackoffLimit exhausted, DeadlineExceeded, or any
+// `Failed`-type condition) is authoritative — flip the row to `failed`
+// regardless of what the runtime Deployment object reports.
+//
+// The pre-fix code only queried `appsv1.Deployments`; when the build Job
+// crashed it did one of two equally-wrong things:
+//
+//  1. The runtime Deployment was never created (typical: buildImage errored
+//     before applyDeployment ran) → GetDeployment returned NotFound → mapped
+//     to `stopped`, a TERMINAL status that looks to the user like the deploy
+//     was torn down on purpose, with no autopsy and no failure surface.
+//
+//  2. The api goroutine crashed mid-runDeploy (pod OOM, ctx kill, etc.) and
+//     the row's terminal `failed` write never landed → the Deployment query
+//     might return any in-flight state and the row sat at `building` forever.
+//
+// In both cases the build Job's `Status.Failed > 0` OR a `JobCondition` of
+// type `Failed` is the unambiguous evidence that a terminal build failure
+// occurred. The Job's `TTLSecondsAfterFinished` (5 min in the api) means we
+// can read the Job for a window even after the build pod is GC'd — exactly
+// the gap the pre-fix code missed.
+//
+// The Job's NotFound result is NOT treated as a build success: it just means
+// the Job has been reaped or never existed (Deployment-status path remains
+// authoritative). Only a `Failed` Job overrides — `Succeeded` and `Active`
+// states fall through to the Deployment-based mapping.
 func (w *DeployStatusReconciler) computeNewStatus(ctx context.Context, providerID string) (string, error) {
 	ns := deployNamespaceFromProviderID(providerID)
 	if ns == "" {
@@ -445,18 +515,101 @@ func (w *DeployStatusReconciler) computeNewStatus(ctx context.Context, providerI
 	getCtx, cancel := context.WithTimeout(ctx, k8sGetTimeout)
 	defer cancel()
 
-	deploy, err := w.k8s.GetDeployment(getCtx, ns, providerID)
-	if apierrors.IsNotFound(err) {
-		// Namespace or Deployment is gone (manual cleanup, expiry sweep,
-		// teardown). Mark stopped so the row leaves the active set on
-		// the next sweep.
-		return deployStatusStopped, nil
+	deploy, deployErr := w.k8s.GetDeployment(getCtx, ns, providerID)
+	if deployErr != nil && !apierrors.IsNotFound(deployErr) {
+		// Transport-level k8s error on the Deployment query. Returning the
+		// error skips the row this tick — the Job-failed override is not a
+		// substitute for the row's healthy/deploying transitions, so a
+		// brownout should bubble up.
+		return "", deployErr
 	}
-	if err != nil {
-		return "", err
+
+	// Job-failed override: query the build Job before deciding the row's
+	// new status. A terminal Job failure is authoritative over whatever
+	// the runtime Deployment reports.
+	jobCtx, jobCancel := context.WithTimeout(ctx, k8sGetTimeout)
+	defer jobCancel()
+	appID := strings.TrimPrefix(providerID, providerIDPrefix)
+	jobName := buildJobNamePrefix + appID
+	job, jobErr := w.k8s.GetBuildJob(jobCtx, ns, jobName)
+	if jobErr != nil && !apierrors.IsNotFound(jobErr) {
+		// Don't fail the whole row on a Job-query brownout — log and fall
+		// through to the Deployment-based mapping. The next tick retries.
+		slog.Warn("jobs.deploy_status_reconcile.job_query_failed",
+			"namespace", ns, "job", jobName, "error", jobErr,
+			"note", "falling through to Deployment-based status — silent build-failure detection skipped this tick")
+	} else if jobErr == nil && jobIsFailed(job) {
+		// Job-failed override — authoritative.
+		metrics.DeployJobFailedDetectedTotal.WithLabelValues(jobFailureReason(job)).Inc()
+		return deployStatusFailed, nil
+	}
+
+	if apierrors.IsNotFound(deployErr) {
+		// Deployment query: NotFound + Job-not-failed (Job missing, Active, or
+		// Succeeded). Two distinct cases:
+		//   - Job NotFound + Deployment NotFound → namespace torn down → stopped.
+		//   - Job Active + Deployment NotFound → build still running (pre-apply)
+		//     → keep as "building" — Job-failed override caught the failure case.
+		if apierrors.IsNotFound(jobErr) {
+			return deployStatusStopped, nil
+		}
+		// Job exists and is not Failed — the build is still in flight or just
+		// succeeded but the Deployment apply hasn't landed yet. Hold at the
+		// row's current "building" status (deploymentStatusFromK8s returns
+		// building for an all-zero status, which is what a missing Deployment
+		// effectively represents at this stage).
+		return deployStatusBuilding, nil
 	}
 
 	return deploymentStatusFromK8s(deploy), nil
+}
+
+// jobIsFailed reports whether a kaniko build Job has reached a terminal
+// failure: either `Status.Failed > 0` (k8s incremented the failed-pod count
+// past the BackoffLimit) OR a JobCondition of type `Failed` is present with
+// status=True. Either condition is authoritative — the Job will not recover.
+func jobIsFailed(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	// Only treat Failed>0 as terminal if BackoffLimit has been reached, since
+	// a transient pod failure during retries also bumps the counter. The
+	// JobFailed condition above is the primary signal; this is the backstop
+	// for cluster versions that surface Failed before stamping the condition.
+	backoffLimit := int32(0)
+	if job.Spec.BackoffLimit != nil {
+		backoffLimit = *job.Spec.BackoffLimit
+	}
+	return job.Status.Failed > backoffLimit
+}
+
+// jobFailureReason picks a short bounded label for the
+// instant_deploy_job_failed_detected_total counter from the Job's `Failed`
+// condition. Falls back to "backoff_limit_exceeded" when the condition is
+// absent but Status.Failed > BackoffLimit (the cluster-version backstop in
+// jobIsFailed).
+//
+// Cardinality: k8s uses a small, stable set of Reason strings for JobFailed
+// ("BackoffLimitExceeded", "DeadlineExceeded", "PodFailurePolicy"). We pass
+// them through verbatim plus the fallback bucket. Bounded — safe to label.
+func jobFailureReason(job *batchv1.Job) string {
+	if job == nil {
+		return "unknown"
+	}
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			if cond.Reason != "" {
+				return cond.Reason
+			}
+			return "failed_no_reason"
+		}
+	}
+	return "backoff_limit_exceeded"
 }
 
 // deploymentStatusFromK8s mirrors api/internal/providers/compute/k8s/client.go's
