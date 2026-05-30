@@ -607,11 +607,11 @@ func TestAuthProbe_EmailStart_BodyParseErr(t *testing.T) {
 func slowHandler(d time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(d)
-		switch {
-		case r.URL.Path == "/auth/email/start":
+		switch r.URL.Path {
+		case "/auth/email/start":
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"ok":true}`))
-		case r.URL.Path == "/auth/exchange":
+		case "/auth/exchange":
 			w.Header().Set("Access-Control-Allow-Origin", "https://instanode.dev")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			if r.Method == http.MethodOptions {
@@ -619,7 +619,7 @@ func slowHandler(d time.Duration) http.Handler {
 				return
 			}
 			w.WriteHeader(http.StatusBadRequest)
-		case r.URL.Path == "/auth/me":
+		case "/auth/me":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"email":"u@e.com"}`))
 		}
