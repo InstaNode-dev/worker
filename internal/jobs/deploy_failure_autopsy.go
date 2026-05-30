@@ -58,6 +58,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -69,7 +70,44 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"instant.dev/worker/internal/metrics"
 )
+
+// ── Autopsy metric outcome labels ─────────────────────────────────────────────
+//
+// Used as the `outcome` label on instant_deploy_autopsy_captured_total. Kept
+// in a small bounded set so dashboard panels render predictable series.
+
+const (
+	// autopsyOutcomeLogsCaptured: at least one log line was captured from
+	// either the app pod or the build pod — full autopsy succeeded.
+	autopsyOutcomeLogsCaptured = "logs_captured"
+
+	// autopsyOutcomeLogsUnavailable: the autopsy ran but the pod was already
+	// GC'd (or never existed — image-pull failure) and no log lines were
+	// captured. Reason and event fields are still populated from k8s state
+	// + Job event fallback; lastLines is empty.
+	autopsyOutcomeLogsUnavailable = "logs_unavailable"
+
+	// autopsyOutcomeAlreadyPresent: the deployment_events row already had a
+	// real (non-Unknown) reason from a prior autopsy and this tick added
+	// nothing new — pure idempotent re-capture. Distinguishes "the autopsy
+	// is doing useful work" from "the autopsy is just looping over old
+	// state every 30s".
+	autopsyOutcomeAlreadyPresent = "already_present"
+
+	// autopsyOutcomeAuditEmitFailed: the autopsy row upsert succeeded but
+	// the audit_log emit failed (Postgres brownout). Surfaces in the
+	// dashboard so a missing failure email has a corresponding metric.
+	autopsyOutcomeAuditEmitFailed = "audit_emit_failed"
+)
+
+// labelBuildJobName mirrors api/internal/providers/compute/k8s/client.go's
+// build-Job pod label `job-name=build-<appID>`. Used by the autopsy log
+// fallback path to fetch logs from the kaniko build pod when the runtime
+// app pod was never created (BuildFailed / DeadlineExceeded modal case).
+const labelBuildJobName = "job-name"
 
 // ── Failure reason constants ──────────────────────────────────────────────────
 //
@@ -248,6 +286,27 @@ type autopsyResult struct {
 // case the function writes an Unknown row with an empty last_lines so the
 // api can at least surface "failure" : { "reason": "Unknown" } rather than
 // omitting the field entirely.
+//
+// SILENT-DEPLOY-FAILURE FIX (2026-05-30, PR 2):
+//
+// In addition to writing the deployment_events row, the autopsy now ALSO:
+//
+//  1. UPDATEs deployments.error_message with "<reason>: <hint snippet>" so
+//     the api's GET /deploy/:id surfaces a one-line human-readable cause
+//     even when the caller doesn't pull the structured deployment_events.
+//
+//  2. Emits an audit_log row with kind='deploy.failed' so the
+//     event_email_forwarder dispatches the failure email (the api's runDeploy
+//     normally emits this, but the user incident showed that when the api
+//     goroutine crashes mid-build the audit row is never written — the
+//     worker fills the gap so the user still gets the email).
+//
+//  3. Increments instant_deploy_autopsy_captured_total{outcome} so the NR
+//     dashboard can chart logs_captured vs logs_unavailable vs already_present.
+//
+// The audit-emit is idempotent at the email layer (event_email_forwarder
+// dedupes by audit_log.id), so re-running the autopsy on every tick
+// re-emits the row but the user receives exactly one email.
 func captureDeploymentAutopsy(
 	ctx context.Context,
 	db *sql.DB,
@@ -261,6 +320,7 @@ func captureDeploymentAutopsy(
 		// Write an Unknown autopsy so the api still surfaces the failure field.
 		_ = upsertAutopsyRow(ctx, db, deploymentID, workerFailureReasonUnknown,
 			sql.NullInt32{}, "provider_id did not match app-<appID> shape", nil)
+		metrics.DeployAutopsyCapturedTotal.WithLabelValues(autopsyOutcomeLogsUnavailable).Inc()
 		return
 	}
 
@@ -275,6 +335,11 @@ func captureDeploymentAutopsy(
 
 	result.hint = workerHintForReason(result.reason)
 
+	// PR 2 — fail-soft: was the row already populated with a real reason
+	// from a prior autopsy? Used to label the metric "already_present" so
+	// operators can distinguish first-capture from idempotent re-capture.
+	preexisting := autopsyAlreadyPresentWithReason(ctx, db, deploymentID)
+
 	if err := upsertAutopsyRow(ctx, db, deploymentID, result.reason, result.exitCode, result.event, result.lastLines); err != nil {
 		slog.Warn("jobs.deploy_failure_autopsy.upsert_failed",
 			"deployment_id", deploymentID,
@@ -282,13 +347,58 @@ func captureDeploymentAutopsy(
 			"reason", result.reason,
 			"error", err,
 		)
-	} else {
-		slog.Info("jobs.deploy_failure_autopsy.captured",
+		// Emit the metric even on failure so the operator sees a non-zero
+		// "logs_unavailable" rate when the DB is brown — pair with NR
+		// alert on Postgres pool saturation.
+		metrics.DeployAutopsyCapturedTotal.WithLabelValues(autopsyOutcomeLogsUnavailable).Inc()
+		return
+	}
+
+	// PR 2 enhancement (rule 25 metric outcome label):
+	outcome := autopsyOutcomeLogsCaptured
+	if len(result.lastLines) == 0 {
+		outcome = autopsyOutcomeLogsUnavailable
+	}
+	if preexisting && result.reason == workerFailureReasonUnknown {
+		// Idempotent re-capture — the existing row had a real reason and
+		// this tick added nothing new. Keep the dashboard signal honest.
+		outcome = autopsyOutcomeAlreadyPresent
+	}
+	metrics.DeployAutopsyCapturedTotal.WithLabelValues(outcome).Inc()
+
+	// PR 2: update deployments.error_message with "<reason>: <hint>" so the
+	// api's row-only readers (CLI, dashboard list view) see a one-liner
+	// cause without having to pull the deployment_events row.
+	if err := updateDeploymentErrorMessage(ctx, db, deploymentID, result.reason, result.hint); err != nil {
+		slog.Warn("jobs.deploy_failure_autopsy.error_message_update_failed",
 			"deployment_id", deploymentID,
-			"provider_id", providerID,
 			"reason", result.reason,
+			"error", err,
 		)
 	}
+
+	// PR 2: emit audit_log kind='deploy.failed' so event_email_forwarder
+	// dispatches the user-visible failure email. The api's runDeploy
+	// normally emits this; the worker is the backstop for the
+	// goroutine-crashed-mid-build case (which IS the 2026-05-30 incident).
+	if err := emitDeployFailedAudit(ctx, db, deploymentID, result.reason, result.event); err != nil {
+		// audit-emit failure is fail-soft — surfaces in the
+		// instant_worker_fail_open_total counter but doesn't block the
+		// rest of the sweep.
+		slog.Warn("jobs.deploy_failure_autopsy.audit_emit_failed",
+			"deployment_id", deploymentID,
+			"reason", result.reason,
+			"error", err,
+		)
+	}
+
+	slog.Info("jobs.deploy_failure_autopsy.captured",
+		"deployment_id", deploymentID,
+		"provider_id", providerID,
+		"reason", result.reason,
+		"outcome", outcome,
+		"lines_captured", len(result.lastLines),
+	)
 }
 
 // collectAutopsyFromK8s gathers pod lastState, namespace events, and log tail
@@ -362,7 +472,202 @@ func collectAutopsyFromK8s(
 		}
 	}
 
+	// PR 2: fall back to the BUILD pod's logs when the runtime app pod yielded
+	// no log lines. The build pod runs as part of the kaniko Job
+	// (label "job-name=build-<appID>") and is the typical source of failure
+	// when the autopsy is triggered by a Job-failed state (PR 1) — the
+	// runtime Deployment was never created so an app-pod log fetch returns
+	// nothing useful. This call is best-effort; on success the kaniko
+	// stderr tail surfaces the actual Dockerfile error in the api response.
+	if len(result.lastLines) == 0 {
+		buildPodName := findBuildPodName(ctx, k8s, ns, appID)
+		if buildPodName != "" {
+			buildLogCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			lines, err := k8s.GetPodLogs(buildLogCtx, ns, buildPodName, maxAutopsyLogLines)
+			if err != nil {
+				slog.Warn("jobs.deploy_failure_autopsy.get_build_logs_failed",
+					"namespace", ns, "pod", buildPodName, "error", err)
+			}
+			if len(lines) > 0 {
+				result.lastLines = lines
+				if result.reason == workerFailureReasonUnknown {
+					// We have logs from a build pod — classify as BuildFailed
+					// unless something more specific was already set from
+					// pod-status or event extraction.
+					result.reason = workerFailureReasonBuildFailed
+				}
+			}
+		}
+	}
+
 	return result
+}
+
+// findBuildPodName lists pods in the deploy namespace matching the kaniko
+// Job's pod label (`job-name=build-<appID>`) and returns the first pod name,
+// or "" when no build pod is reachable (already GC'd past
+// TTLSecondsAfterFinished, or never created). Fail-soft: errors are logged
+// and treated as "no pod found".
+func findBuildPodName(ctx context.Context, k8s deployAutopsyK8sProvider, ns, appID string) string {
+	listCtx, cancel := context.WithTimeout(ctx, k8sGetTimeout)
+	defer cancel()
+	selector := labelBuildJobName + "=" + buildJobNamePrefix + appID
+	podList, err := k8s.ListPods(listCtx, ns, selector)
+	if err != nil && !apierrors.IsNotFound(err) {
+		slog.Warn("jobs.deploy_failure_autopsy.list_build_pods_failed",
+			"namespace", ns, "selector", selector, "error", err)
+		return ""
+	}
+	if podList == nil || len(podList.Items) == 0 {
+		return ""
+	}
+	return podList.Items[0].Name
+}
+
+// buildJobNamePrefix mirrors api/internal/providers/compute/k8s/client.go's
+// build Job naming convention: jobName = "build-" + sanitizeName(appID). Kept
+// duplicated (no shared import — same pattern the rest of this file uses).
+const buildJobNamePrefix = "build-"
+
+// updateDeploymentErrorMessage stamps the deployments.error_message column
+// with a "<reason>: <hint snippet>" one-liner so row-only readers see a
+// human-readable cause without having to pull deployment_events.
+//
+// The snippet is the first sentence of the hint (up to the first period or
+// 200 chars), keeping the column under the historical 2KB cap the api uses.
+// We deliberately DO NOT clear a pre-existing error_message that doesn't
+// match this format — the api may have already stamped a more specific
+// build error (e.g. the kaniko stderr) and we should not clobber it. The
+// UPDATE only runs when error_message IS NULL or empty.
+func updateDeploymentErrorMessage(ctx context.Context, db *sql.DB, id uuid.UUID, reason, hint string) error {
+	if reason == "" {
+		reason = workerFailureReasonUnknown
+	}
+	snippet := firstSentence(hint, 200)
+	combined := reason
+	if snippet != "" {
+		combined = reason + ": " + snippet
+	}
+	_, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET error_message = $1
+		WHERE id = $2
+		  AND (error_message IS NULL OR error_message = '')
+	`, combined, id)
+	if err != nil {
+		return fmt.Errorf("updateDeploymentErrorMessage: %w", err)
+	}
+	return nil
+}
+
+// firstSentence returns the leading portion of s up to the first period
+// (inclusive) or up to maxLen chars, whichever is shorter. Used to derive
+// a one-line snippet from the multi-sentence hint strings.
+func firstSentence(s string, maxLen int) string {
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, "."); i >= 0 && i+1 <= maxLen {
+		return s[:i+1]
+	}
+	if len(s) > maxLen {
+		return s[:maxLen]
+	}
+	return s
+}
+
+// emitDeployFailedAudit inserts an audit_log row with kind='deploy.failed'
+// so event_email_forwarder dispatches the user-visible failure email. The
+// api's runDeploy normally emits this synchronously; the worker is the
+// backstop for the case where the api goroutine crashed mid-build and
+// never wrote the row (the 2026-05-30 silent-deploy-failure incident).
+//
+// team_id is required by the schema (NOT NULL). We resolve it by joining
+// deployments → teams; on a missing deploy row (already deleted), the
+// helper logs and returns nil — no audit emit possible without a team_id.
+//
+// Metadata mirrors the api's emitDeployAudit shape:
+//
+//	{
+//	  "deploy_id":      "<uuid>",
+//	  "team_id":        "<uuid>",
+//	  "failure_stage":  "build",
+//	  "error_summary":  "<reason>: <event truncated to 256 chars>",
+//	  "source":         "worker_autopsy"
+//	}
+//
+// The `source` field distinguishes the worker-emitted backstop from the
+// api's synchronous emit so an operator triaging duplicate failure emails
+// can see which path fired.
+func emitDeployFailedAudit(ctx context.Context, db *sql.DB, deploymentID uuid.UUID, reason, event string) error {
+	var teamID uuid.UUID
+	err := db.QueryRowContext(ctx, `
+		SELECT team_id FROM deployments WHERE id = $1
+	`, deploymentID).Scan(&teamID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Row was already deleted between the autopsy capture and now.
+			// Nothing to email — silently skip.
+			return nil
+		}
+		return fmt.Errorf("emitDeployFailedAudit: lookup team_id: %w", err)
+	}
+	if teamID == uuid.Nil {
+		// Deployment without a team_id should be impossible (schema NOT NULL)
+		// but defend anyway — audit_log INSERT would itself fail.
+		return nil
+	}
+	const maxErrorSummary = 256
+	summary := reason
+	if event != "" {
+		summary = reason + ": " + event
+	}
+	if len(summary) > maxErrorSummary {
+		summary = summary[:maxErrorSummary]
+	}
+	meta := map[string]any{
+		"deploy_id":     deploymentID.String(),
+		"team_id":       teamID.String(),
+		"failure_stage": "build",
+		"error_summary": summary,
+		"source":        "worker_autopsy",
+	}
+	metaBytes, mErr := json.Marshal(meta)
+	if mErr != nil {
+		return fmt.Errorf("emitDeployFailedAudit: marshal metadata: %w", mErr)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO audit_log (team_id, actor, kind, summary, metadata)
+		VALUES ($1, $2, $3, $4, $5)
+	`, teamID, "worker.deploy_failure_autopsy", auditKindDeployFailed, summary, metaBytes); err != nil {
+		return fmt.Errorf("emitDeployFailedAudit: insert: %w", err)
+	}
+	return nil
+}
+
+// (auditKindDeployFailed is declared in deploy_notify_webhook.go — re-used
+// here to keep a single source of truth for the kind string. Changes to
+// the kind value should land in that file.)
+
+// autopsyAlreadyPresentWithReason returns true when the deployment_events
+// row for this deployment already has a real (non-Unknown) reason captured.
+// Used to label the metric outcome as "already_present" when an autopsy
+// re-runs on the same row without adding new information.
+//
+// Fail-open: any error (including ErrNoRows) returns false so the metric
+// labels the run as a real capture. The label-correctness is a
+// dashboard-quality concern, not a safety concern.
+func autopsyAlreadyPresentWithReason(ctx context.Context, db *sql.DB, deploymentID uuid.UUID) bool {
+	var reason string
+	err := db.QueryRowContext(ctx, `
+		SELECT reason FROM deployment_events
+		WHERE deployment_id = $1 AND kind = $2
+	`, deploymentID, deploymentEventKindFailureAutopsy).Scan(&reason)
+	if err != nil {
+		return false
+	}
+	return reason != "" && reason != workerFailureReasonUnknown
 }
 
 // extractPodFailure reads the container status of a pod and populates reason

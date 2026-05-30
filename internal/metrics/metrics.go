@@ -574,6 +574,46 @@ var (
 		Help: "Kaniko build Jobs detected in Failed state by deploy_status_reconcile (silent-deploy-failure fix, 2026-05-30). Labelled by Job Failed-condition reason.",
 	}, []string{"reason"})
 
+	// ── deploy_failure_autopsy — capture outcome counter (PR 2, 2026-05-30) ──
+	//
+	// Increments once per captureDeploymentAutopsy call, labelled by outcome.
+	// Outcomes:
+	//
+	//   logs_captured       — at least one log line was captured from the app
+	//                         pod OR the build pod fallback (the modal success
+	//                         path for the silent-deploy-failure fix).
+	//   logs_unavailable    — autopsy ran but no log lines could be captured
+	//                         (pod already GC'd, image-pull failure, or DB
+	//                         write failed). Reason + event fields are still
+	//                         populated from k8s state + Job event fallback.
+	//   already_present     — pure idempotent re-capture: the deployment_events
+	//                         row already had a real (non-Unknown) reason and
+	//                         this tick added nothing new. Distinguishes
+	//                         "doing useful work" from "looping over old state".
+	//   audit_emit_failed   — autopsy row upsert succeeded but the audit_log
+	//                         emit (kind=deploy.failed → email forwarder)
+	//                         failed. A non-zero rate means failure emails
+	//                         are silently dropped.
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_deploy_autopsy_captured_total{outcome="logs_unavailable"}[15m])) > 1
+	//     for 30+ minutes → P2 page. A sustained rate means autopsies are
+	//     consistently running too late (pods GC'd before capture). Action:
+	//     check if the Job's TTLSecondsAfterFinished was reduced or if the
+	//     reconciler tick interval drifted up.
+	//   sum(rate(instant_deploy_autopsy_captured_total{outcome="audit_emit_failed"}[5m])) > 0
+	//     → P1 page. Customers are not getting deploy.failed emails for at
+	//     least one tenant; check platform-DB pool saturation.
+	//
+	// Catalog row (infra/observability/METRICS-CATALOG.md):
+	//   instant_deploy_autopsy_captured_total | counter | outcome | lazy
+	//   (label families primed in metrics_test.go so /metrics exposes the
+	//   four outcomes from process start).
+	DeployAutopsyCapturedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_autopsy_captured_total",
+		Help: "deploy_failure_autopsy capture outcomes (PR 2, silent-deploy-failure fix). Labelled by outcome (logs_captured | logs_unavailable | already_present | audit_emit_failed).",
+	}, []string{"outcome"})
+
 	// ── orphan_sweep_reconciler — reap counters (2026-05-20) ──────────────────
 	//
 	// Every namespace / DB row the orphan-sweep reconciler reaps (or flips to
