@@ -129,18 +129,37 @@ const (
 // deployProbeResult* are the outcome enum values emitted as the `result`
 // label.
 //
-//	pass     — leg met all assertions inside its latency budget.
-//	fail     — leg failed an assertion (wrong status, build timeout,
-//	           5xx from the serving URL). Triggers audit_log row +
-//	           ERROR slog line + NR alert.
-//	degraded — leg passed assertions but crossed a soft threshold OR
-//	           is configured-off (e.g. probe bearer missing). Tracked
-//	           separately so a slow-but-working leg doesn't page.
+//	pass      — leg met all assertions inside its latency budget.
+//	fail      — leg failed an assertion (wrong status, build timeout,
+//	            5xx from the serving URL). Triggers audit_log row +
+//	            ERROR slog line + NR alert.
+//	degraded  — leg passed assertions but crossed a soft threshold OR
+//	            is configured-off (e.g. probe bearer missing). Tracked
+//	            separately so a slow-but-working leg doesn't page.
+//	bootstrap — leg-1-only: the first tick of a probe's lifetime saw a
+//	            canonical 404 `no_existing_deployment_to_redeploy` from
+//	            /deploy/new (the probe-app row doesn't exist yet), then
+//	            transparently retried without `redeploy=true` and that
+//	            second call succeeded. Distinct from `pass` so the
+//	            dashboard surfaces "we self-healed once" as its own
+//	            event. Subsequent ticks should report `pass`, not
+//	            `bootstrap`. A `bootstrap` outcome does NOT page (it
+//	            is the prober working as designed).
 const (
-	deployProbeResultPass     = "pass"
-	deployProbeResultFail     = "fail"
-	deployProbeResultDegraded = "degraded"
+	deployProbeResultPass      = "pass"
+	deployProbeResultFail      = "fail"
+	deployProbeResultDegraded  = "degraded"
+	deployProbeResultBootstrap = "bootstrap"
 )
+
+// deployProbeRedeployMissingCode is the api's canonical error_code
+// (api/internal/handlers/deploy.go) returned with HTTP 404 when
+// /deploy/new is called with redeploy=true and no matching app row
+// exists for (team, env, name). The probe relies on this EXACT string
+// to distinguish "first tick, need to bootstrap" from any other 404
+// (auth, routing). Locked in by api#206 as the typed-error contract;
+// changing it on the api side must change this constant in lockstep.
+const deployProbeRedeployMissingCode = "no_existing_deployment_to_redeploy"
 
 // deployProbeStatusBudget is the leg-2 budget — wall-clock time the api
 // has to flip the row from `building` to `healthy`. 90s comfortably
@@ -370,11 +389,14 @@ func (w *DeployProbeWorker) Work(ctx context.Context, job *river.Job[DeployProbe
 	w.recordLeg(ctx, deployProbeLegSubmit, submitRes)
 
 	var statusRes, serveRes deployProbeLegResult
-	if submitRes.result != deployProbeResultPass {
+	// Both `pass` and `bootstrap` mean leg-1 produced a usable app_id —
+	// downstream legs must run on the freshly-bootstrapped row so the
+	// next tick has somewhere to redeploy into.
+	if submitRes.result != deployProbeResultPass && submitRes.result != deployProbeResultBootstrap {
 		// Leg-1 didn't produce a usable app_id — short-circuit the
-		// downstream legs. result=skipped is its own enum value so the
-		// dashboard distinguishes "we didn't try" from "we tried and
-		// failed".
+		// downstream legs. result=degraded with a "skipped" reason so
+		// the dashboard distinguishes "we didn't try" from "we tried
+		// and failed".
 		statusRes = deployProbeLegResult{
 			result: deployProbeResultDegraded,
 			reason: "submit_leg_failed — status leg skipped",
@@ -443,6 +465,19 @@ func (w *DeployProbeWorker) recordLeg(ctx context.Context, leg string, r deployP
 		)
 		return
 	}
+	if r.result == deployProbeResultBootstrap {
+		// Self-heal success — log at INFO (not WARN; bootstrap is not
+		// a degradation) and skip audit_log. The metric counter at
+		// result=bootstrap is the operator-facing surface; this log
+		// line is the human-readable confirmation in the worker stream.
+		slog.Info("deploy_probe_bootstrap",
+			"leg", leg,
+			"reason", r.reason,
+			"latency_ms", r.latency.Milliseconds(),
+			"http_status", r.httpStatus,
+		)
+		return
+	}
 	slog.Debug("deploy_probe_pass",
 		"leg", leg,
 		"latency_ms", r.latency.Milliseconds(),
@@ -491,10 +526,55 @@ func (w *DeployProbeWorker) emitDeployProbeFailed(ctx context.Context, leg strin
 // api expects (tarball + name + port + env + redeploy=true). Returns the
 // result plus the app_id pulled from the response envelope. The app_id
 // is the key the next two legs depend on.
+//
+// Bootstrap retry: the persistent probe-app row doesn't exist on the
+// FIRST tick of a probe's lifetime, so the redeploy=true POST hits
+// /deploy/new's "no_existing_deployment_to_redeploy" 404. legSubmit
+// detects that exact canonical error code (NOT any 404 — see api#206
+// for the typed-error contract) and transparently retries once with
+// redeploy omitted (create semantics). The retry's outcome is reported
+// as `result=bootstrap` rather than `pass` so the dashboard can
+// distinguish "we self-healed once" from "steady-state working". Every
+// tick thereafter sees the row, gets a 2xx on the first call, and
+// reports `pass`.
 func (w *DeployProbeWorker) legSubmit(ctx context.Context) (deployProbeLegResult, string) {
+	r, appID, errCode := w.legSubmitOnce(ctx, true /* redeploy */)
+	if r.result != deployProbeResultFail || r.httpStatus != http.StatusNotFound || errCode != deployProbeRedeployMissingCode {
+		return r, appID
+	}
+	// Canonical "first tick, app doesn't exist yet" → retry as a create.
+	// The second call carries the same tarball + name + env, just without
+	// redeploy=true. Anti-design: this is the ONLY 404 we retry on — a
+	// non-canonical 404 (auth, routing, an api-side regression that
+	// dropped the error_code field) still fails the leg, so we never
+	// mask a real outage as a bootstrap.
+	slog.Info("jobs.deploy_probe.bootstrap_retry",
+		"reason", "first_tick: api returned "+deployProbeRedeployMissingCode+" on redeploy=true",
+		"app_name", w.cfg.AppName,
+		"env", w.cfg.Env,
+	)
+	r2, appID2, _ := w.legSubmitOnce(ctx, false /* redeploy */)
+	if r2.result == deployProbeResultPass {
+		// Successful self-heal: relabel as `bootstrap` so a steady-state
+		// dashboard tile shows the one-time bootstrap event distinctly
+		// from the per-tick pass.
+		r2.result = deployProbeResultBootstrap
+		r2.reason = "first-tick bootstrap: api returned " + deployProbeRedeployMissingCode + " on redeploy=true; retried without redeploy"
+	}
+	return r2, appID2
+}
+
+// legSubmitOnce performs a single POST /deploy/new. `redeploy` controls
+// whether the request body carries `redeploy=true` (steady-state) or
+// omits the field (first-tick bootstrap). Returns the leg result, the
+// app_id (empty unless result=pass), and the api's canonical `error`
+// string when the response was a non-2xx with a parseable JSON envelope
+// (empty otherwise). The error_code is what the caller uses to decide
+// whether a 404 is the bootstrap path or a real outage.
+func (w *DeployProbeWorker) legSubmitOnce(ctx context.Context, redeploy bool) (deployProbeLegResult, string, string) {
 	// buildDeployProbeMultipart writes to an in-memory bytes.Buffer and
 	// cannot fail — see the helper's docstring. No err to check here.
-	body, contentType := buildDeployProbeMultipart(w.cfg.AppName, w.cfg.Env)
+	body, contentType := buildDeployProbeMultipart(w.cfg.AppName, w.cfg.Env, redeploy)
 
 	target := w.cfg.BaseURL + "/deploy/new"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, body)
@@ -502,7 +582,7 @@ func (w *DeployProbeWorker) legSubmit(ctx context.Context) (deployProbeLegResult
 		return deployProbeLegResult{
 			result: deployProbeResultFail,
 			reason: "build_request: " + err.Error(),
-		}, ""
+		}, "", ""
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+w.cfg.BearerToken)
@@ -516,7 +596,7 @@ func (w *DeployProbeWorker) legSubmit(ctx context.Context) (deployProbeLegResult
 			result:  deployProbeResultFail,
 			reason:  "http_error: " + err.Error(),
 			latency: latency,
-		}, ""
+		}, "", ""
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -533,7 +613,15 @@ func (w *DeployProbeWorker) legSubmit(ctx context.Context) (deployProbeLegResult
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		r.result = deployProbeResultFail
 		r.reason = fmt.Sprintf("status=%d (want 2xx); body=%s", resp.StatusCode, truncateForLog(string(respBody), 256))
-		return r, ""
+		// Best-effort parse of the api's typed error envelope so the
+		// caller can branch on the canonical error code. A parse failure
+		// here is non-fatal — the leg still fails, the caller just sees
+		// an empty errCode and will not take the bootstrap retry path.
+		var errEnv struct {
+			ErrorCode string `json:"error"`
+		}
+		_ = json.Unmarshal(respBody, &errEnv)
+		return r, "", errEnv.ErrorCode
 	}
 	var parsed struct {
 		OK   bool `json:"ok"`
@@ -544,26 +632,26 @@ func (w *DeployProbeWorker) legSubmit(ctx context.Context) (deployProbeLegResult
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		r.result = deployProbeResultFail
 		r.reason = "body_parse: " + err.Error() + "; raw=" + truncateForLog(string(respBody), 256)
-		return r, ""
+		return r, "", ""
 	}
 	if !parsed.OK {
 		r.result = deployProbeResultFail
 		r.reason = "body ok=false; raw=" + truncateForLog(string(respBody), 256)
-		return r, ""
+		return r, "", ""
 	}
 	if parsed.Item.AppID == "" {
 		r.result = deployProbeResultFail
 		r.reason = "body missing item.app_id; raw=" + truncateForLog(string(respBody), 256)
-		return r, ""
+		return r, "", ""
 	}
 	submitBudget := w.effectiveSubmitBudget()
 	if latency > submitBudget {
 		r.result = deployProbeResultDegraded
 		r.reason = fmt.Sprintf("latency=%dms over budget=%dms", latency.Milliseconds(), submitBudget.Milliseconds())
-		return r, parsed.Item.AppID
+		return r, parsed.Item.AppID, ""
 	}
 	r.result = deployProbeResultPass
-	return r, parsed.Item.AppID
+	return r, parsed.Item.AppID, ""
 }
 
 // legStatus drives leg 2: poll GET /deploy/<appID> until status is
@@ -736,16 +824,17 @@ func (w *DeployProbeWorker) legServe(ctx context.Context, appID string) deployPr
 
 // buildDeployProbeMultipart constructs the multipart body POSTed to
 // /deploy/new. The api requires `tarball` + `name` + `port` + `env`;
-// `redeploy=true` is what makes the probe-app row reusable across
-// ticks. Extracted so tests can re-use the exact same shape the prober
-// puts on the wire.
+// `redeploy` is sent as `"true"` when reusing an existing app row
+// (steady-state ticks), or omitted entirely on the first-tick
+// bootstrap retry so the api takes the create path. Extracted so
+// tests can re-use the exact same shape the prober puts on the wire.
 //
 // Returns the buffer + Content-Type. No error path: every underlying
 // operation writes to an in-memory bytes.Buffer (CreateFormFile,
 // WriteField, part.Write, mw.Close) which cannot fail — same pattern
 // as auth_probe.legEmailStart's `_ = json.Marshal(...)`. Removing the
 // defensive branches keeps the patch-coverage gate at 100%.
-func buildDeployProbeMultipart(name, env string) (*bytes.Buffer, string) {
+func buildDeployProbeMultipart(name, env string, redeploy bool) (*bytes.Buffer, string) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 
@@ -758,13 +847,18 @@ func buildDeployProbeMultipart(name, env string) (*bytes.Buffer, string) {
 	part, _ := mw.CreateFormFile("tarball", "app.tar.gz")
 	_, _ = part.Write(tarball)
 
-	// Required + optional scalar fields. Loop rather than four duplicated
+	// Required + optional scalar fields. Loop rather than three+ duplicated
 	// WriteField calls — keeps the field ordering matrix visible at a glance.
+	// `redeploy=true` is OMITTED on the bootstrap retry — the api treats
+	// the absence of the field as create-semantics, which is the only way
+	// to mint the probe-app row on the first-ever tick.
 	fields := [][2]string{
 		{"name", name},
 		{"port", "80"},
 		{"env", env},
-		{"redeploy", "true"},
+	}
+	if redeploy {
+		fields = append(fields, [2]string{"redeploy", "true"})
 	}
 	for _, f := range fields {
 		_ = mw.WriteField(f[0], f[1])
