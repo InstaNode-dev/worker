@@ -94,23 +94,9 @@ func srvHost(t *testing.T, srv *httptest.Server) string {
 	return u
 }
 
-// deployProbeTestClient is an http client that ignores TLS (so the
-// leg-3 https://<appID>.<host>/ call lands on the http httptest server)
-// and refuses redirects (matching the production default).
-func deployProbeTestClient() *http.Client {
-	return &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			// Tests run against an http httptest server but the leg-3 URL
-			// uses https://; rewrite the scheme in DialContext via a custom
-			// RoundTripper so the connection still lands on the test server.
-			// Simpler: re-target the request URL to http on egress.
-		},
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-}
+// (deployProbeTestClient — removed; superseded by httpClientRetargetingHTTPSToServer
+// below, which actually rewrites the https URL onto the test server. Kept this
+// comment as a breadcrumb for the next reader.)
 
 // httpClientRetargetingHTTPSToServer returns an http.Client whose
 // RoundTripper rewrites every https://<host> request to the test
