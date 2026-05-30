@@ -37,6 +37,9 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -589,4 +592,123 @@ func keysOf(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// installFakePgDumpBin writes a fake pg_dump script and points PG_DUMP_BIN
+// at its absolute path. Unlike installFakePgDump (PATH-prepend), this targets
+// the defaultPgDumpExec.Dump path which honors PG_DUMP_BIN env override.
+// The script records argv + PGPASSWORD env for the test to inspect.
+func installFakePgDumpBin(t *testing.T) (dir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake pg_dump script is shell-based; worker runs on linux/darwin only")
+	}
+	dir = t.TempDir()
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > \"" + dir + "/argv.txt\"\n" +
+		"printf '%s' \"${PGPASSWORD:-}\" > \"" + dir + "/pgpassword.txt\"\n" +
+		"printf 'fakedump'\n" +
+		"exit 0\n"
+	path := filepath.Join(dir, "pg_dump_fake")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pg_dump: %v", err)
+	}
+	t.Setenv("PG_DUMP_BIN", path)
+	return dir
+}
+
+func readBinRecord(t *testing.T, dir string) (argv []string, pgpassword string) {
+	t.Helper()
+	argvBytes, err := os.ReadFile(filepath.Join(dir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read argv.txt: %v", err)
+	}
+	pwBytes, err := os.ReadFile(filepath.Join(dir, "pgpassword.txt"))
+	if err != nil {
+		t.Fatalf("read pgpassword.txt: %v", err)
+	}
+	pgpassword = string(pwBytes)
+	argvStr := string(bytes.TrimRight(argvBytes, "\n"))
+	if argvStr == "" {
+		return nil, pgpassword
+	}
+	parts := strings.Split(argvStr, "\n")
+	return parts, pgpassword
+}
+
+// TestDefaultPgDumpExec_Dump_PasswordMovesToEnv pins SEC-WORKER FINDING-1:
+// defaultPgDumpExec must strip the platform-DB doadmin password from the URL
+// and pass it via PGPASSWORD env, NOT inside argv. Covers
+// platform_db_backup.go lines 655-658 (the `if pw != ""` env-setting branch).
+func TestDefaultPgDumpExec_Dump_PasswordMovesToEnv(t *testing.T) {
+	dir := installFakePgDumpBin(t)
+
+	const secret = "doadmin-platform-pw-XYZ"
+	databaseURL := "postgres://doadmin:" + secret + "@platform.example.com:25060/instant_platform?sslmode=require"
+
+	var out bytes.Buffer
+	n, err := (defaultPgDumpExec{}).Dump(context.Background(), databaseURL, &out)
+	if err != nil {
+		t.Fatalf("Dump: %v", err)
+	}
+	if n == 0 {
+		t.Errorf("Dump returned 0 bytes written; want >0")
+	}
+	if out.String() != "fakedump" {
+		t.Errorf("stdout payload: got %q, want %q", out.String(), "fakedump")
+	}
+
+	argv, pgpassword := readBinRecord(t, dir)
+
+	if pgpassword != secret {
+		t.Errorf("PGPASSWORD env: got %q, want %q", pgpassword, secret)
+	}
+	// The literal password must not appear anywhere in argv.
+	for _, a := range argv {
+		if strings.Contains(a, secret) {
+			t.Errorf("argv leaks password: %q (full argv: %q)", a, argv)
+		}
+	}
+	// And the stripped DSN must be present.
+	stripped := "postgres://doadmin@platform.example.com:25060/instant_platform?sslmode=require"
+	found := false
+	for _, a := range argv {
+		if a == stripped {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("argv missing stripped DSN %q; got: %q", stripped, argv)
+	}
+}
+
+// TestDefaultPgDumpExec_Dump_MalformedURLFailOpen pins the fail-open branch:
+// if splitPGPassword errors, Dump falls back to the original URL on argv
+// with no PGPASSWORD env (no regression vs pre-fix behavior). Covers
+// platform_db_backup.go lines 643-647.
+func TestDefaultPgDumpExec_Dump_MalformedURLFailOpen(t *testing.T) {
+	dir := installFakePgDumpBin(t)
+
+	// Matches pgpw_test.go's malformed_url_fail_open case — url.Parse errors.
+	const malformed = "::::not a url"
+
+	var out bytes.Buffer
+	if _, err := (defaultPgDumpExec{}).Dump(context.Background(), malformed, &out); err != nil {
+		t.Fatalf("Dump on malformed URL: %v", err)
+	}
+
+	argv, pgpassword := readBinRecord(t, dir)
+
+	if pgpassword != "" {
+		t.Errorf("PGPASSWORD on fail-open: got %q, want empty", pgpassword)
+	}
+	found := false
+	for _, a := range argv {
+		if a == malformed {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("argv missing fail-open passthrough URL %q; got: %q", malformed, argv)
+	}
 }

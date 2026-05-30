@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -548,5 +551,152 @@ func TestRetentionCutoff_PositiveDaysIsBackInTime(t *testing.T) {
 	got := retentionCutoff(reg, "pro", now)
 	if !got.Equal(want) {
 		t.Errorf("pro 30d: cutoff = %v, want %v", got, want)
+	}
+}
+
+// installFakePgDump writes a shell-script "pg_dump" into a TempDir, prepends
+// it to PATH for the test's lifetime, and returns the script path so the
+// test can read back the recorded argv + env after invocation. The fake
+// prints argv to <dir>/argv.txt and env's PGPASSWORD value to
+// <dir>/pgpassword.txt, then exits 0 (success path) or 1 if the caller
+// passes failExitCode=true.
+//
+// Used by TestRealPgDumpRunner_* and TestDefaultPgDumpExec_*: those tests
+// exercise the SEC-WORKER FINDING-1 + FINDING-2 PGPASSWORD-env branches
+// in customer_backup_runner.go + platform_db_backup.go which require
+// actually spawning a pg_dump-named process.
+func installFakePgDump(t *testing.T, failExitCode bool) (dir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake pg_dump script is shell-based; worker runs on linux/darwin only")
+	}
+	dir = t.TempDir()
+	exitCode := "0"
+	if failExitCode {
+		exitCode = "1"
+	}
+	// The script:
+	//   1. Writes every argv element (one per line) to argv.txt
+	//   2. Writes PGPASSWORD (or empty string) to pgpassword.txt
+	//   3. Writes a tiny stdout payload so callers that pipe stdout see bytes
+	//   4. Exits 0 (success) or 1 (caller-controlled failure)
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > \"" + dir + "/argv.txt\"\n" +
+		"printf '%s' \"${PGPASSWORD:-}\" > \"" + dir + "/pgpassword.txt\"\n" +
+		"printf 'fakepgdumpbody'\n" +
+		"exit " + exitCode + "\n"
+	path := filepath.Join(dir, "pg_dump")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake pg_dump: %v", err)
+	}
+	oldPATH := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPATH)
+	return dir
+}
+
+func readFakePgDumpRecord(t *testing.T, dir string) (argv []string, pgpassword string) {
+	t.Helper()
+	argvBytes, err := os.ReadFile(filepath.Join(dir, "argv.txt"))
+	if err != nil {
+		t.Fatalf("read argv.txt: %v", err)
+	}
+	// Strip the trailing newline before splitting so the last entry isn't "".
+	argvStr := string(bytes.TrimRight(argvBytes, "\n"))
+	pgpassword = mustReadString(t, filepath.Join(dir, "pgpassword.txt"))
+	if argvStr == "" {
+		return nil, pgpassword
+	}
+	parts := bytes.Split([]byte(argvStr), []byte("\n"))
+	argv = make([]string, len(parts))
+	for i, b := range parts {
+		argv[i] = string(b)
+	}
+	return argv, pgpassword
+}
+
+func mustReadString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+// TestRealPgDumpRunner_Run_PasswordMovesToEnv pins SEC-WORKER FINDING-2:
+// realPgDumpRunner must strip the password out of connURL and pass it via
+// PGPASSWORD env, NOT inside argv. This covers customer_backup_runner.go
+// lines 125-127 (the `if pw != ""` env-setting branch).
+func TestRealPgDumpRunner_Run_PasswordMovesToEnv(t *testing.T) {
+	dir := installFakePgDump(t, false)
+
+	const secret = "super-secret-pw-ZZZ"
+	connURL := "postgres://doadmin:" + secret + "@db.example.com:25060/app?sslmode=require"
+
+	var out bytes.Buffer
+	if err := (realPgDumpRunner{}).Run(context.Background(), connURL, &out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.String() != "fakepgdumpbody" {
+		t.Errorf("stdout payload: got %q, want %q", out.String(), "fakepgdumpbody")
+	}
+
+	argv, pgpassword := readFakePgDumpRecord(t, dir)
+
+	// PGPASSWORD env must carry the secret.
+	if pgpassword != secret {
+		t.Errorf("PGPASSWORD env: got %q, want %q", pgpassword, secret)
+	}
+	// argv must NOT contain the literal password anywhere — this is THE
+	// security promise the PR is shipping.
+	for _, a := range argv {
+		if bytes.Contains([]byte(a), []byte(secret)) {
+			t.Errorf("argv leaks password: %q (full argv: %q)", a, argv)
+		}
+	}
+	// argv MUST still carry the stripped DSN (with userinfo password removed).
+	found := false
+	for _, a := range argv {
+		if a == "postgres://doadmin@db.example.com:25060/app?sslmode=require" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("argv missing stripped DSN; got: %q", argv)
+	}
+}
+
+// TestRealPgDumpRunner_Run_MalformedURLFailOpen pins the fail-open branch:
+// if splitPGPassword returns an error, the runner falls back to the original
+// connURL with no PGPASSWORD env. Covers customer_backup_runner.go lines
+// 116-119 (the `if splitErr != nil { dsn = connURL; pw = "" }` branch).
+func TestRealPgDumpRunner_Run_MalformedURLFailOpen(t *testing.T) {
+	dir := installFakePgDump(t, false)
+
+	// Same shape that splitPGPassword's TestSplitPGPassword malformed_url_fail_open
+	// case proves returns an error from url.Parse.
+	const malformed = "::::not a url"
+
+	var out bytes.Buffer
+	if err := (realPgDumpRunner{}).Run(context.Background(), malformed, &out); err != nil {
+		t.Fatalf("Run on malformed URL: %v", err)
+	}
+
+	argv, pgpassword := readFakePgDumpRecord(t, dir)
+
+	// Fail-open: no PGPASSWORD env is set because pw == "".
+	if pgpassword != "" {
+		t.Errorf("PGPASSWORD on fail-open: got %q, want empty", pgpassword)
+	}
+	// The original malformed URL is passed through to pg_dump argv unchanged
+	// (this is the "no regression" promise — same code path it has always run).
+	found := false
+	for _, a := range argv {
+		if a == malformed {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("argv missing fail-open passthrough URL %q; got: %q", malformed, argv)
 	}
 }

@@ -50,6 +50,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -105,11 +106,25 @@ type pgDumpRunner interface {
 type realPgDumpRunner struct{}
 
 func (realPgDumpRunner) Run(ctx context.Context, connURL string, w io.Writer) error {
+	// SEC-WORKER FINDING-2 (2026-05-29): split the customer's DB password
+	// out of the URL into PGPASSWORD env so it does NOT sit in argv (and
+	// therefore /proc/<pid>/cmdline + `ps aux` + kubectl describe crash
+	// archive) for the entire hourly backup window. Fail-open on parse
+	// error to avoid a single malformed connection_url stalling every
+	// customer's backup ladder.
+	dsn, pw, splitErr := splitPGPassword(connURL)
+	if splitErr != nil {
+		dsn = connURL
+		pw = ""
+	}
 	cmd := exec.CommandContext(ctx, "pg_dump",
 		"--no-owner", "--no-acl",
 		"--format=custom",
-		"-d", connURL,
+		"-d", dsn,
 	)
+	if pw != "" {
+		cmd.Env = append(os.Environ(), "PGPASSWORD="+pw)
+	}
 	cmd.Stdout = w
 	// Stderr goes to slog at the call site by buffering — we don't want a
 	// noisy pg_dump banner ("dumping contents of table ...") to flood
