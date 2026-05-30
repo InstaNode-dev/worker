@@ -534,6 +534,86 @@ var (
 		Help: "Per-component readiness status (1=ok, 0.5=degraded, 0=failed). Set by /readyz on every probe.",
 	}, []string{"service", "check"})
 
+	// ── DeployStatusReconciler — Job-failed override (silent-deploy-failure fix) ─
+	//
+	// Increments every time the reconciler detects a kaniko build Job in the
+	// `Failed` state (BackoffLimit exhausted, ActiveDeadlineSeconds exceeded,
+	// or any JobCondition of type Failed). The pre-fix reconciler only
+	// queried the runtime appsv1.Deployment and missed this whole class of
+	// failure (2026-05-30 incident: a user's deploy sat at `building` forever
+	// because the build pod was GC'd and there was no Deployment object to
+	// query). This counter is the leading indicator that the Job-query
+	// override is doing its job; pair with `instant_deploy_autopsy_captured_total`
+	// to see the autopsy follow-through.
+	//
+	// Labels:
+	//   reason — the Job's `Failed` condition reason verbatim. k8s uses a
+	//            small, stable set: "BackoffLimitExceeded", "DeadlineExceeded",
+	//            "PodFailurePolicy". Plus two bounded fallbacks set in
+	//            jobFailureReason: "failed_no_reason" (condition present but
+	//            no reason string) and "backoff_limit_exceeded" (cluster-
+	//            version backstop — JobFailed condition not stamped but
+	//            Status.Failed > BackoffLimit).
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_deploy_job_failed_detected_total[15m])) by (reason) > 0.5
+	//     for 30+ minutes → P2 page. A sustained rate of
+	//     reason="DeadlineExceeded" means the platform's kaniko build slot is
+	//     timing out for many tenants (image bloat or a degraded GHCR push
+	//     path); reason="BackoffLimitExceeded" is the modal Dockerfile-error
+	//     bucket — alert at a higher threshold or visualize on the dashboard
+	//     only.
+	//
+	// Catalog row (infra/observability/METRICS-CATALOG.md):
+	//   instant_deploy_job_failed_detected_total | counter | reason | lazy
+	//   (first observation is a real Job-failed detection — does not appear at
+	//   /metrics until then; the test in metrics_test.go forces a label so the
+	//   metric is registered at process start).
+	DeployJobFailedDetectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_job_failed_detected_total",
+		Help: "Kaniko build Jobs detected in Failed state by deploy_status_reconcile (silent-deploy-failure fix, 2026-05-30). Labelled by Job Failed-condition reason.",
+	}, []string{"reason"})
+
+	// ── deploy_failure_autopsy — capture outcome counter (PR 2, 2026-05-30) ──
+	//
+	// Increments once per captureDeploymentAutopsy call, labelled by outcome.
+	// Outcomes:
+	//
+	//   logs_captured       — at least one log line was captured from the app
+	//                         pod OR the build pod fallback (the modal success
+	//                         path for the silent-deploy-failure fix).
+	//   logs_unavailable    — autopsy ran but no log lines could be captured
+	//                         (pod already GC'd, image-pull failure, or DB
+	//                         write failed). Reason + event fields are still
+	//                         populated from k8s state + Job event fallback.
+	//   already_present     — pure idempotent re-capture: the deployment_events
+	//                         row already had a real (non-Unknown) reason and
+	//                         this tick added nothing new. Distinguishes
+	//                         "doing useful work" from "looping over old state".
+	//   audit_emit_failed   — autopsy row upsert succeeded but the audit_log
+	//                         emit (kind=deploy.failed → email forwarder)
+	//                         failed. A non-zero rate means failure emails
+	//                         are silently dropped.
+	//
+	// NR alert (suggested):
+	//   sum(rate(instant_deploy_autopsy_captured_total{outcome="logs_unavailable"}[15m])) > 1
+	//     for 30+ minutes → P2 page. A sustained rate means autopsies are
+	//     consistently running too late (pods GC'd before capture). Action:
+	//     check if the Job's TTLSecondsAfterFinished was reduced or if the
+	//     reconciler tick interval drifted up.
+	//   sum(rate(instant_deploy_autopsy_captured_total{outcome="audit_emit_failed"}[5m])) > 0
+	//     → P1 page. Customers are not getting deploy.failed emails for at
+	//     least one tenant; check platform-DB pool saturation.
+	//
+	// Catalog row (infra/observability/METRICS-CATALOG.md):
+	//   instant_deploy_autopsy_captured_total | counter | outcome | lazy
+	//   (label families primed in metrics_test.go so /metrics exposes the
+	//   four outcomes from process start).
+	DeployAutopsyCapturedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_autopsy_captured_total",
+		Help: "deploy_failure_autopsy capture outcomes (PR 2, silent-deploy-failure fix). Labelled by outcome (logs_captured | logs_unavailable | already_present | audit_emit_failed).",
+	}, []string{"outcome"})
+
 	// ── orphan_sweep_reconciler — reap counters (2026-05-20) ──────────────────
 	//
 	// Every namespace / DB row the orphan-sweep reconciler reaps (or flips to
@@ -642,6 +722,28 @@ var (
 		Name: "instant_pg_pool_wait_duration_seconds",
 		Help: "Cumulative time spent waiting for a connection since process start, in seconds (sql.DBStats.WaitDuration). Pairs with instant_pg_pool_wait_count.",
 	}, []string{"pool"})
+
+	// AuthProbeOutcomeTotal — AUTH-004 synthetic prober counters. Labelled by
+	// `leg` (email_start | exchange_headers | me) and `result` (pass | fail
+	// | degraded). result="fail" is the alert-able signal — the AUTH-004
+	// chain (broken /auth/exchange + missing ACAC header) was undetectable
+	// for ~24h because nothing drove a real browser-shaped probe against
+	// prod. NR alert: any fail in 10m → P0 (auth-probe-fail.json).
+	// Prom rule: AuthProbeFail in prometheus-rules.yaml.
+	// Emit site: worker/internal/jobs/auth_probe.go (AuthProbePromMetrics).
+	AuthProbeOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_auth_probe_outcome_total",
+		Help: "AUTH-004 synthetic prober outcomes per leg (email_start|exchange_headers|me) and result (pass|fail|degraded).",
+	}, []string{"leg", "result"})
+
+	// AuthProbeLatencySeconds — per-leg HTTP latency histogram. Only
+	// observed on a real response (DNS / TCP errors omit the observation
+	// so a sustained outage doesn't pile zeros into the bucket).
+	AuthProbeLatencySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "instant_auth_probe_latency_seconds",
+		Help:    "AUTH-004 synthetic prober per-leg latency. Buckets centred on the per-leg latency budgets (50ms…5s).",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+	}, []string{"leg"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check on this service.
