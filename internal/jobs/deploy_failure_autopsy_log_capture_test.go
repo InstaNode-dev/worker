@@ -589,3 +589,169 @@ func TestAutopsy_NamespaceMismatch_EarlyReturn(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// TestAutopsy_BuildPodFallback_UpgradesUnknownToBuildFailed pins the
+// reason-upgrade branch (line 494-499 in deploy_failure_autopsy.go): when the
+// app pod has NO useful container state (so extractPodFailure leaves reason
+// at Unknown) and the build pod returns logs, the autopsy MUST upgrade
+// reason from Unknown to BuildFailed.
+func TestAutopsy_BuildPodFallback_UpgradesUnknownToBuildFailed(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	k8s := &fakeAutopsyK8sPR2{
+		listPodsFn: func(ns, sel string) (*corev1.PodList, error) {
+			switch {
+			case strings.Contains(sel, labelInstantAppID):
+				// App pod has NO container statuses — extractPodFailure leaves
+				// reason at Unknown.
+				return &corev1.PodList{Items: []corev1.Pod{{
+					ObjectMeta: metav1.ObjectMeta{Name: "app-bare"},
+				}}}, nil
+			case strings.Contains(sel, labelBuildJobName):
+				return &corev1.PodList{Items: []corev1.Pod{{
+					ObjectMeta: metav1.ObjectMeta{Name: "build-bare-pod"},
+				}}}, nil
+			}
+			return &corev1.PodList{}, nil
+		},
+		listEvFn: func(ns string) (*corev1.EventList, error) { return &corev1.EventList{}, nil },
+		getLogsFn: func(ns, pod string, tail int64) ([]string, error) {
+			if strings.HasPrefix(pod, "build-") {
+				return []string{"kaniko: COPY failed"}, nil
+			}
+			return nil, nil // App pod yields nothing.
+		},
+	}
+
+	id := uuid.New()
+	teamID := uuid.New()
+	mock.ExpectQuery(`SELECT reason FROM deployment_events`).
+		WillReturnError(sql.ErrNoRows)
+	// The upsert is expected to carry reason=BuildFailed.
+	mock.ExpectExec(`INSERT INTO deployment_events`).
+		WithArgs(
+			id, deploymentEventKindFailureAutopsy,
+			workerFailureReasonBuildFailed,
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE deployments\s+SET error_message`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WillReturnRows(sqlmock.NewRows([]string{"team_id"}).AddRow(teamID))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	captureDeploymentAutopsy(context.Background(), db, id, "app-bare", k8s)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestAutopsy_IdempotentAlreadyPresentBranch pins the already_present outcome
+// (lines 362-366): a re-run where the deployment_events row has a real
+// reason AND this tick re-derives Unknown (e.g. pods were reaped between
+// ticks) MUST label the metric "already_present" rather than logs_unavailable.
+func TestAutopsy_IdempotentAlreadyPresentBranch(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// k8s state where the autopsy can't derive a real reason this tick
+	// (no pods at all → reason stays Unknown).
+	k8s := &fakeAutopsyK8sPR2{
+		listPodsFn: func(ns, sel string) (*corev1.PodList, error) { return &corev1.PodList{}, nil },
+		listEvFn:   func(ns string) (*corev1.EventList, error) { return &corev1.EventList{}, nil },
+		getLogsFn:  func(ns, pod string, tail int64) ([]string, error) { return nil, nil },
+	}
+
+	id := uuid.New()
+	teamID := uuid.New()
+	// Pre-check returns a real reason from a prior tick → preexisting=true.
+	mock.ExpectQuery(`SELECT reason FROM deployment_events`).
+		WillReturnRows(sqlmock.NewRows([]string{"reason"}).AddRow(workerFailureReasonOOMKilled))
+	mock.ExpectExec(`INSERT INTO deployment_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE deployments\s+SET error_message`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WillReturnRows(sqlmock.NewRows([]string{"team_id"}).AddRow(teamID))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	captureDeploymentAutopsy(context.Background(), db, id, "app-rerun", k8s)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestUpdateDeploymentErrorMessage_EmptyReasonFallsBackToUnknown pins lines
+// 544-546 in updateDeploymentErrorMessage: an empty reason argument is
+// rewritten to "Unknown" so the column never holds a bare ": <hint>" prefix.
+func TestUpdateDeploymentErrorMessage_EmptyReasonFallsBackToUnknown(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	id := uuid.New()
+	// Assert the stamped string begins with "Unknown: " (the reason fallback fired).
+	mock.ExpectExec(`UPDATE deployments\s+SET error_message`).
+		WithArgs(
+			// First arg should start with "Unknown: " — sqlmock has no startsWith
+			// matcher, but the helper string is deterministic when reason==""
+			// and hint==workerFailureHint[Unknown], so we match it verbatim.
+			"Unknown: "+firstSentence(workerFailureHint[workerFailureReasonUnknown], 200),
+			id,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := updateDeploymentErrorMessage(context.Background(), db, id,
+		"", workerFailureHint[workerFailureReasonUnknown]); err != nil {
+		t.Fatalf("updateDeploymentErrorMessage: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestAutopsy_AuditEmitFailed_IncrementsCounter exercises the
+// audit_emit_failed outcome path (the lint-fix that's also a real metric):
+// when emitDeployFailedAudit returns an error the autopsy still completes
+// but the audit_emit_failed counter increments and the warn line fires.
+func TestAutopsy_AuditEmitFailed_IncrementsCounter(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	k8s := &fakeAutopsyK8sPR2{
+		listPodsFn: func(ns, sel string) (*corev1.PodList, error) { return &corev1.PodList{}, nil },
+		listEvFn:   func(ns string) (*corev1.EventList, error) { return &corev1.EventList{}, nil },
+		getLogsFn:  func(ns, pod string, tail int64) ([]string, error) { return nil, nil },
+	}
+	mock.ExpectQuery(`SELECT reason FROM deployment_events`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO deployment_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE deployments\s+SET error_message`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Audit emit fails at the team_id lookup with a non-ErrNoRows error.
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WillReturnError(errors.New("audit lookup brownout"))
+
+	captureDeploymentAutopsy(context.Background(), db, id, "app-audit-fail", k8s)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}

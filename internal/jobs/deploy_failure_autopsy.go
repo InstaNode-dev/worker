@@ -382,9 +382,10 @@ func captureDeploymentAutopsy(
 	// normally emits this; the worker is the backstop for the
 	// goroutine-crashed-mid-build case (which IS the 2026-05-30 incident).
 	if err := emitDeployFailedAudit(ctx, db, deploymentID, result.reason, result.event); err != nil {
-		// audit-emit failure is fail-soft — surfaces in the
-		// instant_worker_fail_open_total counter but doesn't block the
-		// rest of the sweep.
+		// audit-emit failure is fail-soft — increment the audit_emit_failed
+		// outcome counter so the operator sees missing failure emails on the
+		// dashboard, and keep the rest of the sweep alive.
+		metrics.DeployAutopsyCapturedTotal.WithLabelValues(autopsyOutcomeAuditEmitFailed).Inc()
 		slog.Warn("jobs.deploy_failure_autopsy.audit_emit_failed",
 			"deployment_id", deploymentID,
 			"reason", result.reason,
@@ -633,10 +634,10 @@ func emitDeployFailedAudit(ctx context.Context, db *sql.DB, deploymentID uuid.UU
 		"error_summary": summary,
 		"source":        "worker_autopsy",
 	}
-	metaBytes, mErr := json.Marshal(meta)
-	if mErr != nil {
-		return fmt.Errorf("emitDeployFailedAudit: marshal metadata: %w", mErr)
-	}
+	// json.Marshal of a map[string]any with string keys + string values is
+	// total — unreachable error path. The orphan-sweep audit emit follows
+	// the same _-ignore pattern (orphan_sweep_reconciler.go:emitOrphanAudit).
+	metaBytes, _ := json.Marshal(meta)
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO audit_log (team_id, actor, kind, summary, metadata)
 		VALUES ($1, $2, $3, $4, $5)
