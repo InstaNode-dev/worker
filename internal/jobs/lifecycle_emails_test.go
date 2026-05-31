@@ -353,6 +353,16 @@ func TestRenderDeployMadePermanent_UnknownSourceDropsClause(t *testing.T) {
 	}
 }
 
+// TestFriendlyExperimentName_UnknownReturnsEmpty asserts the default arm
+// of friendlyExperimentName — an unmapped experiment id resolves to empty
+// so the template's "Experiment: X" clause disappears. Covers the
+// `return ""` line that the registry-only test naturally skips.
+func TestFriendlyExperimentName_UnknownReturnsEmpty(t *testing.T) {
+	if got := friendlyExperimentName("some_unmapped_experiment_id"); got != "" {
+		t.Errorf("expected empty for unmapped experiment, got %q", got)
+	}
+}
+
 // TestRenderExperimentConversion_UnknownActionDropsClause asserts the safety
 // net mirroring TestRenderDeployMadePermanent_UnknownSourceDropsClause: a
 // brand-new action value the worker doesn't know about renders with the
@@ -380,6 +390,7 @@ func TestRenderExperimentConversion_UnknownActionDropsClause(t *testing.T) {
 func TestRenderExperimentConversion_ExperimentNameIsFriendly(t *testing.T) {
 	emittedExperiments := []string{
 		"upgrade_button", // dashboard + instanode-web UpgradeButton
+		"onboarding_v2",  // registered in friendlyExperimentName for the next experiment rollout
 	}
 	for _, exp := range emittedExperiments {
 		_, html, _ := renderExperimentConversion(map[string]string{
