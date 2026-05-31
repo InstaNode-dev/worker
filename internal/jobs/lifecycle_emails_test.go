@@ -258,3 +258,50 @@ func TestDeployExpiringSoon_EscalatingCadence(t *testing.T) {
 		t.Errorf("missing reminder_index subject = %q; want the gentle \"Heads up\" default", dflt)
 	}
 }
+
+// TestRenderDeployMadePermanent_SourceIsFriendly is the 2026-05-31 regression
+// guard for the raw-enum-leaking-into-email bug class. mastermanas805 received
+// the literal string "(changed via make_permanent_endpoint)" in their email —
+// the worker template was printing the api's machine-readable `source` enum
+// straight into the HTML body. Every enum value emitted by the api MUST resolve
+// to a friendly string here OR drop the clause entirely (empty string).
+func TestRenderDeployMadePermanent_SourceIsFriendly(t *testing.T) {
+	// The complete set of source values currently emitted by the api. If a new
+	// emit site lands without an entry here, the test will fail when the team
+	// pairs it with renderDeployMadePermanent.
+	emittedSources := []string{
+		"make_permanent_endpoint",      // api/internal/handlers/deploy_ttl.go
+		"deploy_new",                   // api/internal/handlers/deploy.go (initial-permanent path)
+		"team_setting",                 // hypothetical future setter
+		"default_deployment_ttl_policy",
+		"tier_upgrade",                 // pending api PR — Pro-upgrade auto-promote
+	}
+	for _, src := range emittedSources {
+		_, html, _ := renderDeployMadePermanent(map[string]string{"source": src})
+		if strings.Contains(html, src) {
+			t.Errorf("rendered email leaked the raw enum %q into the body (must map to friendly text or drop):\n%s",
+				src, html)
+		}
+		mapped := friendlyMakePermanentSource(src)
+		if mapped == "" {
+			t.Errorf("emit site %q has no friendly mapping — add one in friendlyMakePermanentSource", src)
+		}
+		if !strings.Contains(html, mapped) {
+			t.Errorf("friendly text %q for source %q didn't appear in rendered body:\n%s", mapped, src, html)
+		}
+	}
+}
+
+// TestRenderDeployMadePermanent_UnknownSourceDropsClause asserts the safety
+// net: a brand-new source value the worker doesn't know about (e.g., a future
+// emit site) renders with the clause OMITTED entirely. Better to drop than
+// leak the raw enum.
+func TestRenderDeployMadePermanent_UnknownSourceDropsClause(t *testing.T) {
+	_, html, _ := renderDeployMadePermanent(map[string]string{"source": "some_brand_new_unmapped_source_v99"})
+	if strings.Contains(html, "some_brand_new_unmapped_source_v99") {
+		t.Errorf("unknown source leaked into rendered body:\n%s", html)
+	}
+	if strings.Contains(html, "changed via") {
+		t.Errorf("unknown source should drop the 'changed via X' clause entirely, got:\n%s", html)
+	}
+}
