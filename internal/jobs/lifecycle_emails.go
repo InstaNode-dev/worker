@@ -621,13 +621,37 @@ func renderDeployExpired(params map[string]string) (string, string, string) {
 	return subject, html, text
 }
 
+// friendlyMakePermanentSource maps the audit-log machine-readable `source`
+// enum (set by the api emitters in deploy.go and deploy_ttl.go) to a user-
+// facing description for the email body. Unknown values render as empty
+// (which makes the surrounding template clause "(changed via X)" disappear
+// entirely — better than leaking the raw enum to the user).
+//
+// Before this map, a Pro upgrade that auto-promoted a deploy's TTL caused
+// the email to render "(changed via make_permanent_endpoint)" — exposing
+// the api's internal endpoint identifier as if it were a sentence (2026-05-31
+// incident reported by mastermanas805).
+func friendlyMakePermanentSource(raw string) string {
+	switch raw {
+	case "make_permanent_endpoint":
+		return "the API"
+	case "deploy_new":
+		return "your initial deploy request"
+	case "team_setting", "default_deployment_ttl_policy":
+		return "your team default-TTL setting"
+	case "tier_upgrade":
+		return "your plan upgrade"
+	}
+	return "" // unknown/empty source → template clause disappears
+}
+
 // renderDeployMadePermanent — pairs with buildDeployMadePermanent
 // (deploy.made_permanent).
 func renderDeployMadePermanent(params map[string]string) (string, string, string) {
 	subject := "Your instanode deployment is now permanent"
 	heading := "Your deployment is now permanent"
 	body := renderBody(bodyDeployMadePermanent, viewDeployMadePermanent{
-		Source: params["source"],
+		Source: friendlyMakePermanentSource(params["source"]),
 	})
 	html := renderShell(emailShellView{
 		Title: subject, Heading: heading, Body: body,
