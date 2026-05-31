@@ -77,7 +77,7 @@ func representativeParams(kind string) map[string]string {
 		auditKindSubscriptionDowngraded: {"from_tier": "pro", "to_tier": "hobby", "reason": "payment_failed"},
 		auditKindSubscriptionCanceled:   {"last_tier": "pro", "canceled_at": "2026-05-15T00:00:00Z"},
 		auditKindNearQuotaWall:          {"axis": "storage", "percent_used": "92", "tier": "hobby"},
-		auditKindExperimentConversion:   {"experiment": "onboarding_v2", "variant": "B", "action_taken": "claimed a token"},
+		auditKindExperimentConversion:   {"experiment": "upgrade_button", "variant": "B", "action_taken": "checkout_started"},
 		auditKindAdminTierChanged:       {"from_tier": "hobby", "to_tier": "team", "by_admin": "ops@instanode.dev"},
 		auditKindAdminPromoIssued:       {"code": "LAUNCH20", "kind": "percent", "value": "20", "expires_at": "2026-06-15"},
 		auditKindChurnRiskFlagged:       {"tier": "pro", "last_activity_days_ago": "21", "active_resource_count": "3"},
@@ -292,6 +292,53 @@ func TestRenderDeployMadePermanent_SourceIsFriendly(t *testing.T) {
 	}
 }
 
+// TestRenderExperimentConversion_ActionIsFriendly is the registry-iterating
+// regression guard for the raw-enum-leaking-into-email bug class — the same
+// class as the 2026-05-31 make_permanent_endpoint incident, repeated here in
+// renderExperimentConversion. The dashboard fires
+// POST /api/v1/experiments/converted with snake_case action identifiers
+// ("checkout_started", "overview_upgrade_clicked") and the worker template
+// inlined them verbatim — users would receive "We noticed you
+// checkout_started — nice." in their inbox.
+//
+// This test enumerates EVERY action value the dashboard + instanode-web
+// emit today. If a new emit site lands without an entry in
+// friendlyExperimentAction, the test fails before the broken copy reaches
+// a real inbox. Source-of-truth call sites:
+//
+//   dashboard/src/components/UpgradeButton.tsx        → checkout_started
+//   dashboard/src/pages/OverviewPage.tsx              → overview_upgrade_clicked
+//   instanode-web/src/components/UpgradeButton.tsx    → checkout_started
+//   instanode-web/src/pages/OverviewPage.tsx          → overview_upgrade_clicked
+//
+// If a future emitter adds a new action value, add it to both
+// friendlyExperimentAction (with a human phrase) and to
+// emittedExperimentActions below. The test fails loudly otherwise.
+func TestRenderExperimentConversion_ActionIsFriendly(t *testing.T) {
+	emittedExperimentActions := []string{
+		"checkout_started",         // UpgradeButton (dashboard + instanode-web)
+		"overview_upgrade_clicked", // OverviewPage upsell (dashboard + instanode-web)
+	}
+	for _, action := range emittedExperimentActions {
+		_, html, _ := renderExperimentConversion(map[string]string{
+			"experiment":   "upgrade_button",
+			"variant":      "B",
+			"action_taken": action,
+		})
+		if strings.Contains(html, action) {
+			t.Errorf("rendered email leaked the raw action enum %q into the body (must map to friendly text or drop):\n%s",
+				action, html)
+		}
+		mapped := friendlyExperimentAction(action)
+		if mapped == "" {
+			t.Errorf("emit site %q has no friendly mapping — add one in friendlyExperimentAction", action)
+		}
+		if !strings.Contains(html, mapped) {
+			t.Errorf("friendly text %q for action %q didn't appear in rendered body:\n%s", mapped, action, html)
+		}
+	}
+}
+
 // TestRenderDeployMadePermanent_UnknownSourceDropsClause asserts the safety
 // net: a brand-new source value the worker doesn't know about (e.g., a future
 // emit site) renders with the clause OMITTED entirely. Better to drop than
@@ -303,5 +350,53 @@ func TestRenderDeployMadePermanent_UnknownSourceDropsClause(t *testing.T) {
 	}
 	if strings.Contains(html, "changed via") {
 		t.Errorf("unknown source should drop the 'changed via X' clause entirely, got:\n%s", html)
+	}
+}
+
+// TestRenderExperimentConversion_UnknownActionDropsClause asserts the safety
+// net mirroring TestRenderDeployMadePermanent_UnknownSourceDropsClause: a
+// brand-new action value the worker doesn't know about renders with the
+// "We noticed you X — nice." clause OMITTED entirely. Better to drop the
+// clause than leak the raw enum.
+func TestRenderExperimentConversion_UnknownActionDropsClause(t *testing.T) {
+	_, html, _ := renderExperimentConversion(map[string]string{
+		"experiment":   "upgrade_button",
+		"variant":      "B",
+		"action_taken": "some_brand_new_unmapped_action_v99",
+	})
+	if strings.Contains(html, "some_brand_new_unmapped_action_v99") {
+		t.Errorf("unknown action leaked into rendered body:\n%s", html)
+	}
+	if strings.Contains(html, "We noticed you") {
+		t.Errorf("unknown action should drop the 'We noticed you X — nice.' clause entirely, got:\n%s", html)
+	}
+}
+
+// TestRenderExperimentConversion_ExperimentNameIsFriendly is the sibling
+// guard for the experiment-id field (line 155 of lifecycle_emails.go inlines
+// {{ .Experiment }} into "Experiment: <name> (variant)"). The dashboard /
+// instanode-web fires only one experiment today — "upgrade_button" — but the
+// same enum-as-English risk applies.
+func TestRenderExperimentConversion_ExperimentNameIsFriendly(t *testing.T) {
+	emittedExperiments := []string{
+		"upgrade_button", // dashboard + instanode-web UpgradeButton
+	}
+	for _, exp := range emittedExperiments {
+		_, html, _ := renderExperimentConversion(map[string]string{
+			"experiment":   exp,
+			"variant":      "B",
+			"action_taken": "checkout_started",
+		})
+		if strings.Contains(html, exp) {
+			t.Errorf("rendered email leaked the raw experiment id %q into the body (must map to friendly text or drop):\n%s",
+				exp, html)
+		}
+		mapped := friendlyExperimentName(exp)
+		if mapped == "" {
+			t.Errorf("emit site %q has no friendly mapping — add one in friendlyExperimentName", exp)
+		}
+		if !strings.Contains(html, mapped) {
+			t.Errorf("friendly text %q for experiment %q didn't appear in rendered body:\n%s", mapped, exp, html)
+		}
 	}
 }

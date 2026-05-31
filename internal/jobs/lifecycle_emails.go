@@ -473,13 +473,52 @@ func renderSubscriptionCanceled(params map[string]string) (string, string, strin
 	return subject, html, text
 }
 
+// friendlyExperimentAction maps the dashboard's machine-readable `action`
+// identifier (set by UpgradeButton + sibling experiment emitters in the
+// dashboard / instanode-web) to a user-facing description for the email
+// body. Unknown values render as empty (which makes the surrounding
+// template clause "We noticed you X — nice." disappear entirely — better
+// than leaking the raw enum to the user).
+//
+// Before this map, an /experiments/converted call from the UpgradeButton
+// caused the email to render "We noticed you checkout_started — nice."
+// — exposing the dashboard's internal action identifier as if it were a
+// past-tense English verb (same bug class as the 2026-05-31
+// make_permanent_endpoint incident: a worker email reading a snake_case
+// enum from params and inlining it as user-facing copy).
+func friendlyExperimentAction(raw string) string {
+	switch raw {
+	case "checkout_started":
+		return "started the checkout flow"
+	case "overview_upgrade_clicked":
+		return "clicked Upgrade on the dashboard"
+	}
+	return "" // unknown/empty action → template clause disappears
+}
+
+// friendlyExperimentName maps the experiments registry's machine-readable
+// experiment id (api/internal/experiments) to a user-facing label for the
+// email body. Unknown values render as empty (clause drops). Same rule as
+// friendlyExperimentAction — never leak a snake_case identifier into copy.
+func friendlyExperimentName(raw string) string {
+	switch raw {
+	case "upgrade_button":
+		return "the Upgrade button rollout"
+	case "onboarding_v2":
+		return "the new onboarding flow"
+	}
+	return "" // unknown/empty experiment → template clause disappears
+}
+
 // renderExperimentConversion — pairs with buildExperimentClicked
 // (experiment.conversion).
 func renderExperimentConversion(params map[string]string) (string, string, string) {
 	subject := "Thanks for trying instanode"
 	heading := "Thanks for the feedback"
 	body := renderBody(bodyExperimentConversion, viewExperimentConversion{
-		Experiment: params["experiment"], Variant: params["variant"], ActionTaken: params["action_taken"],
+		Experiment:  friendlyExperimentName(params["experiment"]),
+		Variant:     params["variant"],
+		ActionTaken: friendlyExperimentAction(params["action_taken"]),
 	})
 	html := renderShell(emailShellView{
 		Title: subject, Heading: heading, Body: body,
