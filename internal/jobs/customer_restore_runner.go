@@ -419,8 +419,16 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 		return false
 	}
 
-	// Finalize.
-	if _, updErr := w.db.ExecContext(parentCtx, `
+	// Finalize on a FRESH bounded context, not parentCtx — mirrors the
+	// customer_backup_runner fix (P2-W4, BugBash 2026-05-18). pg_restore has
+	// already succeeded above, so the data is durably in place; if parentCtx
+	// were cancelled by a worker shutdown (rolling deploy / node drain), the
+	// UPDATE would fail, markRestoreFailed would run, and a SUCCESSFUL restore
+	// would be recorded as 'failed'. A detached context lets the row reach
+	// 'ok' even mid-shutdown.
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer finalizeCancel()
+	if _, updErr := w.db.ExecContext(finalizeCtx, `
 		UPDATE resource_restores
 		   SET status = 'ok', finished_at = now()
 		 WHERE id = $1

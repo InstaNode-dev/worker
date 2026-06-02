@@ -658,10 +658,18 @@ batchLoop:
 				"audit_id", row.ID,
 				"kind", row.Kind,
 				"error", supErr,
-				"note", "fail-closed: skipping send, cursor NOT advanced — retries when DB recovers",
+				"note", "fail-closed: halting batch, cursor NOT advanced — this row + remainder retried when DB recovers",
 			)
-			skipped++
-			continue
+			// MUST halt the whole batch, not `continue`. The cursor is
+			// advanced per-row inline (and redisEventCursorStore.write is an
+			// unconditional Set, not a max), so a `continue` would let a LATER
+			// sendable row in this same batch advance the watermark past this
+			// held row — stranding it behind the cursor forever and silently
+			// dropping a legitimate transactional email. `break batchLoop`
+			// leaves the cursor at the last successfully-advanced row so this
+			// row is re-fetched next tick — mirrors the SendClassTransient halt.
+			transient++
+			break batchLoop
 		}
 		if supErr != nil {
 			// Bounce/spam lookup failure — fail-OPEN: treat as "not
