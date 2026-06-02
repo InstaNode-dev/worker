@@ -111,16 +111,22 @@ func TestEventEmail_BuildDeploySuccess_NoEmailReturnsFalse(t *testing.T) {
 func TestLifecycle_RenderDeployHealthy_SurfacesURL(t *testing.T) {
 	const url = "https://my-app.deployment.instanode.dev"
 	subject, html, text := renderDeployHealthy(map[string]string{
-		"app_name":                "my-app",
+		"app_name":                "6fffcc21",
 		"env":                     "production",
 		"app_url":                 url,
 		"time_to_healthy_seconds": "31",
 	})
-	if !strings.Contains(subject, "my-app") {
-		t.Errorf("subject %q should name the app", subject)
+	// app_name is an opaque hex slug, so it must NOT appear in the subject as
+	// a prose name (bug #23) — the subject is generic and the URL identifies
+	// the app. The slug appears in the body only as a labeled identifier.
+	if strings.Contains(subject, "6fffcc21") {
+		t.Errorf("subject %q must not render the opaque app_id slug as a name", subject)
 	}
 	if !strings.Contains(html, url) {
 		t.Errorf("html body should contain the live URL %q", url)
+	}
+	if !strings.Contains(html, "6fffcc21") {
+		t.Errorf("html body should show the app_id as an identifier")
 	}
 	if !strings.Contains(text, url) {
 		t.Errorf("text body should contain the live URL %q", url)
@@ -145,11 +151,15 @@ func TestLifecycle_RenderDeployHealthy_NoURLFallsBackToDashboard(t *testing.T) {
 // and links to the dashboard.
 func TestLifecycle_RenderDeployCreated_NoURLPromise(t *testing.T) {
 	subject, html, _ := renderDeployCreated(map[string]string{
-		"app_name": "my-app",
+		"app_name": "6fffcc21",
 		"env":      "production",
 	})
-	if !strings.Contains(subject, "my-app") {
-		t.Errorf("subject %q should name the app", subject)
+	// Opaque slug must not appear as a prose name in the subject (bug #23).
+	if strings.Contains(subject, "6fffcc21") {
+		t.Errorf("subject %q must not render the opaque app_id slug as a name", subject)
+	}
+	if !strings.Contains(html, "6fffcc21") {
+		t.Errorf("started email should still show the app_id as an identifier in the body")
 	}
 	if !strings.Contains(html, dashboardURL) {
 		t.Errorf("started email should link to the dashboard")

@@ -704,6 +704,53 @@ func TestEventForwarder_UnsubscribeCheckError_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestEventForwarder_UnsubscribeFailClosed_HaltsBatch is the multi-row
+// regression for bug #23 (bug bash 2026-06-02): a fail-CLOSED row followed by
+// a sendable row in the SAME batch must NOT let the sendable row advance the
+// cursor past the held row. The pre-fix code used `continue` (not `break
+// batchLoop`); because the cursor is advanced per-row inline via an
+// unconditional Set, the second row's send moved the watermark past row 1,
+// stranding it forever — silently dropping a legitimate transactional email
+// during a transient unsubscribe-lookup DB blip. The single-row test above
+// can't catch this (continue and break are indistinguishable with one row).
+func TestEventForwarder_UnsubscribeFailClosed_HaltsBatch(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	held := time.Date(2026, 5, 13, 19, 0, 0, 0, time.UTC)
+	sendable := held.Add(time.Minute) // sorts AFTER the held row (ASC order)
+	mock.ExpectQuery(`SELECT[\s\S]+FROM audit_log`).
+		WillReturnRows(sqlmock.NewRows(auditRowsCols).
+			AddRow("held-row", "team-h", auditKindOnboardingClaimed, "", "x", []byte(`{}`), held, "blip@example.com").
+			AddRow("sendable-row", "team-s", auditKindOnboardingClaimed, "", "y", []byte(`{}`), sendable, "ok@example.com"))
+
+	provider := &fakeProvider{sendFn: func(_ context.Context, _ email.EventEmail) error { return nil }}
+	cursor := &memCursor{}
+	w := newEventEmailForwarderWorkerForTest(db, cursor, provider)
+	// failNext fails ONLY the first hasSuppression call — i.e. the held row.
+	w.suppression = &memSuppression{
+		suppressedEmails: map[string]bool{},
+		failNext:         fmt.Errorf("simulated unsubscribe DB blip: %w", errUnsubscribeLookupFailed),
+	}
+
+	if err := w.Work(context.Background(), fakeJobLocal[EventEmailForwarderArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	// The batch must HALT on the held row: the sendable row is never reached,
+	// so the provider is not called and the cursor never advances past (or to)
+	// either row. Next tick re-fetches from the un-advanced cursor.
+	if got := provider.callCount(); got != 0 {
+		t.Errorf("expected 0 SendEvent calls (batch halts on fail-closed row), got %d — a later row advanced past the held row", got)
+	}
+	if cursor.c.ID != "" {
+		t.Errorf("cursor.ID = %q; want \"\" — fail-closed must halt the batch, never let a later row advance the cursor past the held row", cursor.c.ID)
+	}
+}
+
 // TestEventForwarder_NoopProvider_AdvancesCursor — wiring a real
 // email.NoopProvider through the forwarder is the integration check that
 // the SendClassSkippedNoTemplate path advances cursors. If this regresses,

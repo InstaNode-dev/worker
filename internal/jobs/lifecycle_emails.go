@@ -183,15 +183,25 @@ var (
 		`<p style="margin:0 0 14px;">Your deployment is now <strong>permanent</strong> — it will no longer expire automatically{{ if .Source }} (changed via {{ .Source }}){{ end }}.</p>
 <p style="margin:0 0 4px;color:#555;font-size:14px;">It'll keep serving traffic until you delete it explicitly.</p>`))
 
+	// NOTE: AppName here is the app_id — an opaque 8-char hex slug
+	// (generateAppID), NOT a human-readable name. So it is rendered ONLY as a
+	// labeled `App` identifier in a <code> cell, never interpolated into prose
+	// as if it were a name ("Your deployment 6fffcc21 is live" reads as
+	// gibberish). This mirrors the deploy-TTL builders, which deliberately do
+	// NOT copy app_id → deploy_name for the same reason.
 	bodyDeployCreated = template.Must(template.New("b_dcreated").Parse(
-		`<p style="margin:0 0 14px;">Your deployment{{ if .AppName }} <strong>{{ .AppName }}</strong>{{ end }} has started building{{ if .Env }} in the <strong>{{ .Env }}</strong> environment{{ end }}.</p>
+		`<p style="margin:0 0 14px;">Your deployment has started building{{ if .Env }} in the <strong>{{ .Env }}</strong> environment{{ end }}.</p>
+{{ if .AppName }}<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  <tr><td style="color:#666;width:120px;">App</td><td><code>{{ .AppName }}</code></td></tr>
+</table>{{ end }}
 <p style="margin:0 0 4px;">We're building the image and rolling it out now — this usually takes under a minute. You'll get a second email with the live URL the moment it's serving traffic.</p>
 <p style="margin:0 0 4px;color:#555;font-size:14px;">Watch the build live from your dashboard.</p>`))
 
 	bodyDeployHealthy = template.Must(template.New("b_dhealthy").Parse(
-		`<p style="margin:0 0 14px;">Your deployment{{ if .AppName }} <strong>{{ .AppName }}</strong>{{ end }} is <strong>live</strong>{{ if .Env }} in the <strong>{{ .Env }}</strong> environment{{ end }} and serving traffic.</p>
-{{ if .AppURL }}<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
-  <tr><td style="color:#666;width:120px;">URL</td><td><a href="{{ .AppURL }}" style="color:#2563eb;"><strong>{{ .AppURL }}</strong></a></td></tr>
+		`<p style="margin:0 0 14px;">Your deployment is <strong>live</strong>{{ if .Env }} in the <strong>{{ .Env }}</strong> environment{{ end }} and serving traffic.</p>
+{{ if or .AppURL .AppName }}<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  {{ if .AppURL }}<tr><td style="color:#666;width:120px;">URL</td><td><a href="{{ .AppURL }}" style="color:#2563eb;"><strong>{{ .AppURL }}</strong></a></td></tr>{{ end }}
+  {{ if .AppName }}<tr><td style="color:#666;">App</td><td><code>{{ .AppName }}</code></td></tr>{{ end }}
   {{ if .TimeToHealthy }}<tr><td style="color:#666;">Build time</td><td>{{ .TimeToHealthy }}s</td></tr>{{ end }}
 </table>{{ end }}
 <p style="margin:0 0 4px;color:#555;font-size:14px;">Manage, redeploy, or set a custom domain from your dashboard.</p>`))
@@ -724,8 +734,9 @@ func renderDeployMadePermanent(params map[string]string) (string, string, string
 // live URL yet. The "started" email links to the dashboard; the live URL
 // arrives in the separate deploy.healthy email.
 func renderDeployCreated(params map[string]string) (string, string, string) {
-	name := orDefault(params["app_name"], "your app")
-	subject := "Deploying " + name + " on instanode"
+	// app_name is the opaque app_id slug — used as an identifier, never as a
+	// prose name in the subject (see bodyDeployCreated NOTE).
+	subject := "Your instanode deployment has started"
 	heading := "Your deployment has started"
 	body := renderBody(bodyDeployCreated, viewDeployCreated{
 		AppName: params["app_name"], Env: params["env"],
@@ -734,9 +745,14 @@ func renderDeployCreated(params map[string]string) (string, string, string) {
 		Title: subject, Heading: heading, Body: body,
 		CTALabel: "Watch the build", CTAURL: dashboardURL,
 	})
+	textBody := "Your deployment has started building."
+	if id := params["app_name"]; id != "" {
+		textBody += " App: " + id + "."
+	}
+	textBody += " This usually takes under a minute — you'll get a follow-up email with the live URL once it's serving traffic."
 	text := lifecycleText(lifecycleTextView{
-		Heading: heading,
-		Body:    "Your deployment " + name + " has started building. This usually takes under a minute — you'll get a follow-up email with the live URL once it's serving traffic.",
+		Heading:  heading,
+		Body:     textBody,
 		CTALabel: "Watch the build", CTAURL: dashboardURL,
 	})
 	return subject, html, text
@@ -746,8 +762,10 @@ func renderDeployCreated(params map[string]string) (string, string, string) {
 // success counterpart to renderDeployFailed: the app is live, so the email
 // leads with the URL and the CTA opens the running app.
 func renderDeployHealthy(params map[string]string) (string, string, string) {
-	name := orDefault(params["app_name"], "your app")
-	subject := name + " is live on instanode"
+	// app_name is the opaque app_id slug — shown as an identifier in the body,
+	// never as a prose name in the subject (see bodyDeployHealthy NOTE). The
+	// live URL identifies the app for the reader.
+	subject := "Your instanode deployment is live"
 	heading := "Your app is live 🚀"
 	body := renderBody(bodyDeployHealthy, viewDeployHealthy{
 		AppName:       params["app_name"],
@@ -765,9 +783,12 @@ func renderDeployHealthy(params map[string]string) (string, string, string) {
 		Title: subject, Heading: heading, Body: body,
 		CTALabel: ctaLabel, CTAURL: cta,
 	})
-	textBody := "Your deployment " + name + " is live and serving traffic."
+	textBody := "Your deployment is live and serving traffic."
 	if url := params["app_url"]; url != "" {
 		textBody += " It's available at " + url + "."
+	}
+	if id := params["app_name"]; id != "" {
+		textBody += " App: " + id + "."
 	}
 	text := lifecycleText(lifecycleTextView{
 		Heading: heading,
