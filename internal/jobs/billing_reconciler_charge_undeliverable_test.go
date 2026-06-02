@@ -9,6 +9,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -89,8 +90,12 @@ func TestScanChargeUndeliverable_NoNewRows(t *testing.T) {
 	}
 	w.chargeUndeliverableMu.Lock()
 	defer w.chargeUndeliverableMu.Unlock()
-	if !w.chargeUndeliverableCursor.After(prev) {
-		t.Fatalf("cursor should advance to now() even on zero rows: prev=%v cur=%v", prev, w.chargeUndeliverableCursor)
+	// bug bash #18: the cursor must NOT advance on an empty window. Jumping it
+	// to now() would let the strict `>` predicate skip a row that becomes
+	// visible a moment later (clock skew / late-committing INSERT). Re-scanning
+	// the same small window next tick is cheap, so the cursor stays put.
+	if !w.chargeUndeliverableCursor.Equal(prev) {
+		t.Fatalf("cursor must NOT advance on zero-row scan (bug #18): prev=%v cur=%v", prev, w.chargeUndeliverableCursor)
 	}
 }
 
@@ -123,9 +128,12 @@ func TestScanChargeUndeliverable_DBErrorFailsOpen(t *testing.T) {
 	}
 }
 
-// TestScanChargeUndeliverable_FirstTickUsesLookback — zero-value cursor
-// causes the scanner to seed at now()-1h on the first tick after pod
-// boot.
+// TestScanChargeUndeliverable_FirstTickUsesLookback — a zero-value cursor
+// makes the scanner QUERY from now()-1h on every tick after pod boot, until a
+// row is actually seen. bug bash #18: on an empty result the persisted cursor
+// is NOT advanced (it stays zero), so the 1h look-back keeps re-applying — a
+// row landing in that window is always caught, never skipped. The query arg is
+// asserted to be ~now()-1h to prove the look-back is applied.
 func TestScanChargeUndeliverable_FirstTickUsesLookback(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -134,17 +142,39 @@ func TestScanChargeUndeliverable_FirstTickUsesLookback(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectQuery(`SELECT created_at FROM audit_log`).
-		WithArgs(chargeUndeliverableAuditKind, sqlmock.AnyArg()).
+		WithArgs(chargeUndeliverableAuditKind, lookbackArg{around: time.Now().UTC().Add(-1 * time.Hour), tol: 2 * time.Minute}).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at"}))
 
 	w := &BillingReconcilerWorker{db: db}
-	before := time.Now().UTC()
 	_ = w.scanChargeUndeliverable(context.Background())
 
 	w.chargeUndeliverableMu.Lock()
 	cursor := w.chargeUndeliverableCursor
 	w.chargeUndeliverableMu.Unlock()
-	if cursor.Before(before) {
-		t.Fatalf("first-tick cursor should advance to ~now: cursor=%v before=%v", cursor, before)
+	// Empty result → cursor stays zero so the look-back re-applies next tick.
+	if !cursor.IsZero() {
+		t.Fatalf("empty first-tick must leave the cursor unadvanced (zero) so the look-back re-applies (bug #18); got %v", cursor)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("query did not use the now()-1h look-back arg: %v", err)
+	}
+}
+
+// lookbackArg is a sqlmock matcher asserting a time.Time arg is within tol of
+// the expected look-back instant.
+type lookbackArg struct {
+	around time.Time
+	tol    time.Duration
+}
+
+func (m lookbackArg) Match(v driver.Value) bool {
+	t, ok := v.(time.Time)
+	if !ok {
+		return false
+	}
+	d := t.Sub(m.around)
+	if d < 0 {
+		d = -d
+	}
+	return d <= m.tol
 }

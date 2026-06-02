@@ -60,10 +60,12 @@ func (s *stubFetcher) FetchSubscriptionForReconciler(_ context.Context, _ string
 
 // stubGrace implements gracePeriodOpener for tests.
 type stubGrace struct {
-	hasActive     bool
-	hasTerminated bool // P1-F(b): a prior grace period reached a terminal status
-	openCalls     int
-	openErr       error
+	hasActive      bool
+	hasTerminated  bool // P1-F(b): a prior grace period reached a terminal status
+	openCalls      int
+	openErr        error
+	terminateCalls int // #5: grace closed on terminal downgrade
+	terminateErr   error
 }
 
 func (g *stubGrace) GetActiveGracePeriod(_ context.Context, _ uuid.UUID) (bool, error) {
@@ -77,6 +79,11 @@ func (g *stubGrace) OpenGracePeriod(_ context.Context, _ uuid.UUID, _ string) er
 
 func (g *stubGrace) HasTerminatedGracePeriod(_ context.Context, _ uuid.UUID, _ string) (bool, error) {
 	return g.hasTerminated, nil
+}
+
+func (g *stubGrace) TerminateActiveGracePeriod(_ context.Context, _ uuid.UUID) error {
+	g.terminateCalls++
+	return g.terminateErr
 }
 
 // teamRowCols are the columns the billing reconciler SELECT returns.

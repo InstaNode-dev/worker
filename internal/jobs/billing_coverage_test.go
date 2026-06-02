@@ -405,6 +405,10 @@ func (g *stubGraceLocal) HasTerminatedGracePeriod(_ context.Context, _ uuid.UUID
 	return g.hasTerminated, g.termErr
 }
 
+func (g *stubGraceLocal) TerminateActiveGracePeriod(_ context.Context, _ uuid.UUID) error {
+	return nil
+}
+
 // TestBillingReconciler_Work_NotConfigured_AbortsBatch covers the
 // errSubFetcherNotConfigured branch inside Work.
 func TestBillingReconciler_Work_NotConfigured_AbortsBatch(t *testing.T) {

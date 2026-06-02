@@ -610,7 +610,7 @@ func TestOrphanSweep_Pass4_ReclaimsOrphanedCustomerNamespace(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 	// PASS 4: the live-resource-tokens query returns ONLY liveToken — so
 	// orphanNS (whose token has no active/paused/suspended row) is the orphan.
-	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources\s+WHERE status IN \('active', 'paused', 'suspended'\)`).
+	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources\s+WHERE status IN \('pending', 'active', 'paused', 'suspended'\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"token"}).AddRow(liveToken))
 	// The reclaimed customer namespace gets a cluster-scoped orphan_reclaimed
 	// event — emitted as a structured log (teamID is uuid.Nil), no audit row.
