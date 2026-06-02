@@ -60,6 +60,24 @@ const (
 	auditKindDeployExpired       = "deploy.expired"
 	auditKindTeamSettingsChanged = "team.settings_changed"
 
+	// Deploy success lifecycle (2026-06-02). The api emits deploy.created /
+	// deploy.healthy on every deploy via emitDeployAudit, but they had NO
+	// EMAIL path — the audit row landed, the deploy-notify *webhook* dispatcher
+	// (deploy_notify_webhook.go) consumed it, but the email forwarder silently
+	// dropped it (same omission class as 49639e7 / W2). A user who deployed got
+	// zero email confirmation. Registering these two kinds (declared in
+	// deploy_notify_webhook.go as auditKindDeployCreated/auditKindDeployHealthy,
+	// matching the api producer literals byte-for-byte — CLAUDE rule 16) in the
+	// email pipeline below closes that gap.
+	//
+	//   deploy.created — fires the instant POST /deploy/new is accepted, BEFORE
+	//                    the build runs. Metadata: deploy_id, team_id, env,
+	//                    app_name, ttl_policy. No URL yet ("deployment started").
+	//   deploy.healthy — fires once the async build + rollout succeed.
+	//                    Metadata: deploy_id, team_id, time_to_healthy_seconds,
+	//                    app_url, app_name, env ("your app is live at <url>").
+	//                    Fires on both fresh deploys and in-place redeploys.
+
 	// Weekly digest + anonymous-expiry warning (FOLLOWUP-5, 2026-05-14).
 	// Producer:
 	//   digest.weekly        — WeeklyDigestWorker (email.go), Mon 08:00 UTC
@@ -235,6 +253,11 @@ var supportedAuditKinds = []string{
 	auditKindDeployExpiringSoon,
 	auditKindDeployExpired,
 	auditKindDeployMadePermanent,
+	// Deploy success lifecycle (2026-06-02) — created + healthy. Same
+	// omission class as the kinds above: the api wrote the rows, the
+	// forwarder never had them in its filter, so no confirmation email.
+	auditKindDeployCreated,
+	auditKindDeployHealthy,
 	// Wave FIX-I email-confirmed deletion lifecycle (migrated from inline
 	// api Resend send → audit-driven Brevo 2026-05-14).
 	//
@@ -345,6 +368,9 @@ var eventEmailBodyRenderers = map[string]eventEmailBodyRenderer{
 	auditKindDeployExpiringSoon:  renderDeployExpiringSoon,
 	auditKindDeployExpired:       renderDeployExpired,
 	auditKindDeployMadePermanent: renderDeployMadePermanent,
+	// Deploy success lifecycle (2026-06-02).
+	auditKindDeployCreated: renderDeployCreated,
+	auditKindDeployHealthy: renderDeployHealthy,
 	// Deploy deletion lifecycle.
 	auditKindDeployDeletionConfirmed: renderDeployDeletionConfirmed,
 	auditKindDeployDeletionCancelled: renderDeployDeletionCancelled,
@@ -387,6 +413,9 @@ var eventEmailBuilders = map[string]eventEmailBuilder{
 	auditKindDeployExpiringSoon:  buildDeployExpiringSoon,
 	auditKindDeployExpired:       buildDeployExpired,
 	auditKindDeployMadePermanent: buildDeployMadePermanent,
+	// Deploy success lifecycle (2026-06-02).
+	auditKindDeployCreated: buildDeployCreated,
+	auditKindDeployHealthy: buildDeployHealthy,
 	// Wave FIX-I email-confirmed deletion (migrated 2026-05-14).
 	// _requested intentionally absent — sent synchronously by the api;
 	// see supportedAuditKinds comment.
@@ -704,6 +733,44 @@ func buildDeployMadePermanent(row auditRow) (map[string]string, bool) {
 	copyMetaStr(params, meta, "deploy_id", "deploy_id")
 	copyMetaStr(params, meta, "source", "source")
 	copyMetaStr(params, meta, "previous_ttl_policy", "previous_ttl_policy")
+	return params, true
+}
+
+// ── Deploy success builders (2026-06-02) ──────────────────────────────────
+//
+// Metadata shapes (set by api/internal/handlers/deploy.go::emitDeployAudit):
+//
+//   deploy.created — {deploy_id, team_id, env, app_name, ttl_policy}
+//   deploy.healthy — {deploy_id, team_id, time_to_healthy_seconds, app_url,
+//                     app_name, env}
+//
+// deploy.created carries no app_url (it fires before the build, so the URL
+// isn't assigned yet) — the "started" email links to the dashboard instead.
+
+func buildDeployCreated(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "deploy_id", "deploy_id")
+	copyMetaStr(params, meta, "app_name", "app_name")
+	copyMetaStr(params, meta, "env", "env")
+	copyMetaStr(params, meta, "ttl_policy", "ttl_policy")
+	return params, true
+}
+
+func buildDeployHealthy(row auditRow) (map[string]string, bool) {
+	if !requireEmail(row) {
+		return nil, false
+	}
+	meta := decodeMeta(row.Metadata)
+	params := baseParams(row)
+	copyMetaStr(params, meta, "deploy_id", "deploy_id")
+	copyMetaStr(params, meta, "app_name", "app_name")
+	copyMetaStr(params, meta, "env", "env")
+	copyMetaStr(params, meta, "app_url", "app_url")
+	copyMetaStr(params, meta, "time_to_healthy_seconds", "time_to_healthy_seconds")
 	return params, true
 }
 

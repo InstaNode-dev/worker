@@ -73,6 +73,36 @@ func TestWeeklyDigest_WritesAuditWithFullMetadata(t *testing.T) {
 	}
 }
 
+// TestWeeklyDigest_CandidateQueryCarriesOncePerWeekGuard pins the regression
+// fix for the daily-digest bug (verified in prod: digest.weekly audit rows on
+// 2026-05-25/26/27/28 — every team got the "weekly summary" four days in a
+// row). The candidate query MUST pass the dedupe kind + window so its NOT
+// EXISTS clause excludes a team that already received a digest inside the
+// window. sqlmock can't execute the NOT EXISTS itself, so this asserts the
+// guard args are wired (a future edit that drops them fails here).
+func TestWeeklyDigest_CandidateQueryCarriesOncePerWeekGuard(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// The query must (a) contain the NOT EXISTS guard against audit_log and
+	// (b) be called with the digest.weekly kind + the dedupe window interval.
+	rows := sqlmock.NewRows([]string{"email", "id", "name"})
+	mock.ExpectQuery(`(?s)FROM users u\s+JOIN teams t.*NOT EXISTS.*FROM audit_log`).
+		WithArgs("digest.weekly", "6 days").
+		WillReturnRows(rows)
+
+	w := jobs.NewWeeklyDigestWorker(db)
+	if err := w.Work(context.Background(), fakeJob[jobs.WeeklyDigestArgs]()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("guard args not wired into candidate query: %v", err)
+	}
+}
+
 // TestWeeklyDigest_SkipsRowOnBreakdownError validates per-row fail-open:
 // a per-team breakdown query failure logs + skips, but doesn't propagate.
 func TestWeeklyDigest_SkipsRowOnBreakdownError(t *testing.T) {
