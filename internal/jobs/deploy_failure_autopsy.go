@@ -633,6 +633,32 @@ func emitDeployFailedAudit(ctx context.Context, db *sql.DB, deploymentID uuid.UU
 		"error_summary": summary,
 		"source":        "worker_autopsy",
 	}
+	// Idempotency guard (bug bash 2026-06-02 #15): this runs every time the
+	// status reconciler observes the deployment in a failed state, and the
+	// reconciler re-lists the row whenever the subsequent status UPDATE fails
+	// (it only excludes terminal rows once the flip succeeds). Without this
+	// guard each retry — and the api's own deploy.failed emit — inserts a
+	// fresh audit_log row with a NEW id, and the email forwarder (which dedups
+	// by audit_id, not by deployment) sends a duplicate failure email per
+	// retry. Skip the INSERT when a deploy.failed row already exists for this
+	// deployment.
+	var alreadyEmitted bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM audit_log
+			WHERE kind = $1 AND metadata->>'deploy_id' = $2
+		)
+	`, auditKindDeployFailed, deploymentID.String()).Scan(&alreadyEmitted); err != nil {
+		// Fail-open: if the dedup probe errors, fall through and insert — a
+		// possible duplicate email is better than dropping the failure
+		// notification entirely.
+		slog.Warn("jobs.deploy_failure_autopsy.dedup_probe_failed",
+			"deploy_id", deploymentID, "error", err,
+			"note", "inserting deploy.failed anyway (fail-open)")
+	} else if alreadyEmitted {
+		return nil // a deploy.failed audit row already exists for this deployment
+	}
+
 	// json.Marshal of a map[string]any with string keys + string values is
 	// total — unreachable error path. The orphan-sweep audit emit follows
 	// the same _-ignore pattern (orphan_sweep_reconciler.go:emitOrphanAudit).

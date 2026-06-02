@@ -610,7 +610,7 @@ func TestOrphanSweep_Pass4_ReclaimsOrphanedCustomerNamespace(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 	// PASS 4: the live-resource-tokens query returns ONLY liveToken — so
 	// orphanNS (whose token has no active/paused/suspended row) is the orphan.
-	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources\s+WHERE status IN \('active', 'paused', 'suspended'\)`).
+	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources\s+WHERE status IN \('pending', 'active', 'paused', 'suspended'\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"token"}).AddRow(liveToken))
 	// The reclaimed customer namespace gets a cluster-scoped orphan_reclaimed
 	// event — emitted as a structured log (teamID is uuid.Nil), no audit row.
@@ -1059,3 +1059,53 @@ func TestOrphanSweep_StuckBuildWaitingReasons_Registry(t *testing.T) {
 		t.Error("isStuckBuildState with one '' (Running) reason must be false")
 	}
 }
+
+// bug bash #8: PASS 4 must NOT reap a customer namespace younger than the
+// provisioning grace (mid-provision), nor when the age lookup fails.
+func TestOrphanSweep_Pass4_YoungNamespace_NotReaped(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	orphanNS := customerNamespacePrefix + "tok-young"
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
+	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"token"})) // no live tokens → orphan candidate
+
+	lister := newFakeNamespaceLister().withCustomerNamespaces(orphanNS).
+		withNamespaceAge(orphanNS, 10*time.Minute) // < orphanNoDBRowGrace (1h)
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if len(lister.deleted) != 0 {
+		t.Errorf("young namespace (within provisioning grace) must NOT be reaped; deleted=%v", lister.deleted)
+	}
+}
+
+func TestOrphanSweep_Pass4_AgeLookupError_NotReaped(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	orphanNS := customerNamespacePrefix + "tok-ageerr"
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
+	mock.ExpectQuery(`SELECT DISTINCT token::text\s+FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"token"}))
+
+	lister := newFakeNamespaceLister().withCustomerNamespaces(orphanNS)
+	lister.ageErr = errABoom
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if len(lister.deleted) != 0 {
+		t.Errorf("age-lookup error must skip the reap this sweep; deleted=%v", lister.deleted)
+	}
+}
+
+var errABoom = errors.New("age lookup boom")

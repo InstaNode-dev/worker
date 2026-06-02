@@ -330,6 +330,14 @@ type gracePeriodOpener interface {
 	// would see "no ACTIVE grace" and open a FRESH 7-day grace period,
 	// restarting the dunning-email cycle indefinitely.
 	HasTerminatedGracePeriod(ctx context.Context, teamID uuid.UUID, subscriptionID string) (bool, error)
+	// TerminateActiveGracePeriod closes any 'active' grace row for the team
+	// (status→'terminated', terminated_at=now()). Called when the subscription
+	// reaches a TERMINAL Razorpay status: without it the reconciler downgrades
+	// the team but leaves the grace row 'active', so payment_grace_reminder
+	// keeps emitting dunning emails forever and payment_grace_terminator later
+	// re-acts on an already-cancelled subscription (bug bash 2026-06-02 #5).
+	// Mirrors the terminate UPDATE in api models/payment_grace_periods.go.
+	TerminateActiveGracePeriod(ctx context.Context, teamID uuid.UUID) error
 }
 
 // gracePeriodTerminalStatuses are the payment_grace_periods.status values that
@@ -426,6 +434,23 @@ func (d *dbGracePeriodOpener) OpenGracePeriod(ctx context.Context, teamID uuid.U
 			auditErr,
 			"team_id", teamID,
 		)
+	}
+	return nil
+}
+
+// TerminateActiveGracePeriod closes any 'active' grace row for the team —
+// status→'terminated', terminated_at=now(). Idempotent: a team with no active
+// grace row updates zero rows and returns nil. Mirrors the terminate UPDATE in
+// api/internal/models/payment_grace_periods.go so the worker and api converge
+// on the same terminal state.
+func (d *dbGracePeriodOpener) TerminateActiveGracePeriod(ctx context.Context, teamID uuid.UUID) error {
+	_, err := d.db.ExecContext(ctx, `
+		UPDATE payment_grace_periods
+		   SET status = 'terminated', terminated_at = now()
+		 WHERE team_id = $1 AND status = 'active'
+	`, teamID)
+	if err != nil {
+		return fmt.Errorf("dbGracePeriodOpener.TerminateActiveGracePeriod: %w", err)
 	}
 	return nil
 }
@@ -1001,6 +1026,14 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 				}
 				correctedDowngrade++
 				metrics.BillingReconcilerGapCorrected.WithLabelValues("downgrade").Inc()
+				// Close any active grace period so the dunning reminder stops and
+				// the terminator doesn't re-act on this now-cancelled
+				// subscription (bug bash #5). Fail-open: the downgrade is already
+				// committed; a stuck grace row only costs extra dunning emails.
+				if gErr := w.grace.TerminateActiveGracePeriod(ctx, team.id); gErr != nil {
+					slog.Warn("billing.reconciler.grace_terminate_failed",
+						"team_id", team.id, "subscription_id", team.subscriptionID, "error", gErr)
+				}
 				// Emit audit for the event-email forwarder. Fail-open.
 				w.emitCancelAudit(ctx, team.id, team.planTier, targetTier, team.subscriptionID)
 
@@ -1107,11 +1140,17 @@ func (w *BillingReconcilerWorker) scanChargeUndeliverable(ctx context.Context) i
 		)
 	}
 
-	// Advance the cursor to the latest seen row. If count==0 we still
-	// advance to now() — saves re-scanning the same empty window next
-	// tick, and there's nothing in the window to lose.
+	// Advance the cursor ONLY when we actually saw rows — to the latest seen
+	// created_at. On an EMPTY window we must NOT jump the cursor to now():
+	// the strict `>` predicate combined with a now() that is ahead of a row's
+	// created_at — clock skew between this worker and the platform DB, or a
+	// transaction that committed late but stamped created_at with an earlier
+	// DB now() — would push the watermark past a row that becomes visible a
+	// moment later, permanently skipping it. Re-scanning the same small,
+	// (kind, created_at)-indexed window next tick is cheap, so leave the
+	// cursor unchanged when count==0 (bug bash 2026-06-02 #18).
 	if maxCreated.IsZero() {
-		maxCreated = time.Now().UTC()
+		return count // count == 0 — nothing seen, cursor stays put
 	}
 	w.chargeUndeliverableMu.Lock()
 	w.chargeUndeliverableCursor = maxCreated
