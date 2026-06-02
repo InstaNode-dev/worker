@@ -183,6 +183,19 @@ var (
 		`<p style="margin:0 0 14px;">Your deployment is now <strong>permanent</strong> — it will no longer expire automatically{{ if .Source }} (changed via {{ .Source }}){{ end }}.</p>
 <p style="margin:0 0 4px;color:#555;font-size:14px;">It'll keep serving traffic until you delete it explicitly.</p>`))
 
+	bodyDeployCreated = template.Must(template.New("b_dcreated").Parse(
+		`<p style="margin:0 0 14px;">Your deployment{{ if .AppName }} <strong>{{ .AppName }}</strong>{{ end }} has started building{{ if .Env }} in the <strong>{{ .Env }}</strong> environment{{ end }}.</p>
+<p style="margin:0 0 4px;">We're building the image and rolling it out now — this usually takes under a minute. You'll get a second email with the live URL the moment it's serving traffic.</p>
+<p style="margin:0 0 4px;color:#555;font-size:14px;">Watch the build live from your dashboard.</p>`))
+
+	bodyDeployHealthy = template.Must(template.New("b_dhealthy").Parse(
+		`<p style="margin:0 0 14px;">Your deployment{{ if .AppName }} <strong>{{ .AppName }}</strong>{{ end }} is <strong>live</strong>{{ if .Env }} in the <strong>{{ .Env }}</strong> environment{{ end }} and serving traffic.</p>
+{{ if .AppURL }}<table cellpadding="6" cellspacing="0" style="background:#f7f7f8;border-radius:6px;font-size:14px;margin:4px 0 14px;width:100%;">
+  <tr><td style="color:#666;width:120px;">URL</td><td><a href="{{ .AppURL }}" style="color:#2563eb;"><strong>{{ .AppURL }}</strong></a></td></tr>
+  {{ if .TimeToHealthy }}<tr><td style="color:#666;">Build time</td><td>{{ .TimeToHealthy }}s</td></tr>{{ end }}
+</table>{{ end }}
+<p style="margin:0 0 4px;color:#555;font-size:14px;">Manage, redeploy, or set a custom domain from your dashboard.</p>`))
+
 	bodyDeployDeletionConfirmed = template.Must(template.New("b_ddc").Parse(
 		`<p style="margin:0 0 14px;">The deletion of your deployment has been confirmed and the resource has been torn down{{ if .FreedAt }} at {{ .FreedAt }}{{ end }}.</p>
 <p style="margin:0 0 4px;color:#555;font-size:14px;">This action is complete. If this wasn't you, reply to this email right away.</p>`))
@@ -297,6 +310,8 @@ type viewChurnRiskFlagged struct {
 type viewDeployExpiring struct{ DeployName, HoursRemaining, ExpiresAt string }
 type viewDeployExpired struct{ DeployName, ExpiresAt string }
 type viewDeployMadePermanent struct{ Source string }
+type viewDeployCreated struct{ AppName, Env string }
+type viewDeployHealthy struct{ AppName, Env, AppURL, TimeToHealthy string }
 type viewDeployDeletionConfirmed struct{ FreedAt string }
 type viewDigestWeekly struct{ TeamName, TotalActiveResources string }
 type viewResourceQuota struct{ ResourceType, Name string }
@@ -700,6 +715,64 @@ func renderDeployMadePermanent(params map[string]string) (string, string, string
 		Heading: heading,
 		Body:    "Your deployment is now permanent — it will no longer expire automatically and keeps serving traffic until you delete it.",
 		CTALabel: "View your deployments", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderDeployCreated — pairs with buildDeployCreated (deploy.created). Fires
+// the instant a deploy is accepted, before the build runs — so there is no
+// live URL yet. The "started" email links to the dashboard; the live URL
+// arrives in the separate deploy.healthy email.
+func renderDeployCreated(params map[string]string) (string, string, string) {
+	name := orDefault(params["app_name"], "your app")
+	subject := "Deploying " + name + " on instanode"
+	heading := "Your deployment has started"
+	body := renderBody(bodyDeployCreated, viewDeployCreated{
+		AppName: params["app_name"], Env: params["env"],
+	})
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: "Watch the build", CTAURL: dashboardURL,
+	})
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    "Your deployment " + name + " has started building. This usually takes under a minute — you'll get a follow-up email with the live URL once it's serving traffic.",
+		CTALabel: "Watch the build", CTAURL: dashboardURL,
+	})
+	return subject, html, text
+}
+
+// renderDeployHealthy — pairs with buildDeployHealthy (deploy.healthy). The
+// success counterpart to renderDeployFailed: the app is live, so the email
+// leads with the URL and the CTA opens the running app.
+func renderDeployHealthy(params map[string]string) (string, string, string) {
+	name := orDefault(params["app_name"], "your app")
+	subject := name + " is live on instanode"
+	heading := "Your app is live 🚀"
+	body := renderBody(bodyDeployHealthy, viewDeployHealthy{
+		AppName:       params["app_name"],
+		Env:           params["env"],
+		AppURL:        params["app_url"],
+		TimeToHealthy: params["time_to_healthy_seconds"],
+	})
+	// CTA opens the running app when we have a URL; otherwise the dashboard.
+	cta := orDefault(params["app_url"], dashboardURL)
+	ctaLabel := "Open your app"
+	if params["app_url"] == "" {
+		ctaLabel = "View your deployments"
+	}
+	html := renderShell(emailShellView{
+		Title: subject, Heading: heading, Body: body,
+		CTALabel: ctaLabel, CTAURL: cta,
+	})
+	textBody := "Your deployment " + name + " is live and serving traffic."
+	if url := params["app_url"]; url != "" {
+		textBody += " It's available at " + url + "."
+	}
+	text := lifecycleText(lifecycleTextView{
+		Heading: heading,
+		Body:    textBody,
+		CTALabel: ctaLabel, CTAURL: cta,
 	})
 	return subject, html, text
 }

@@ -60,6 +60,13 @@ func htmlEscape(s string) string {
 // WeeklyDigestWorker — runs every Monday at 08:00 UTC
 // ---------------------------------------------------------------------------
 
+// weeklyDigestDedupeWindow is the once-per-week guard window, expressed as a
+// Postgres interval literal (passed as $2::interval). It must be < 7 days so
+// the next legitimate Monday tick (7 days after the last) is NOT suppressed,
+// and > 1 day so a daily re-run (the bug this guards against) is. 6 days sits
+// safely between those bounds.
+const weeklyDigestDedupeWindow = "6 days"
+
 // WeeklyDigestArgs is the River job payload (empty — runs as a sweep).
 type WeeklyDigestArgs struct{}
 
@@ -96,13 +103,31 @@ func (w *WeeklyDigestWorker) Work(ctx context.Context, job *river.Job[WeeklyDige
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.weekly_digest")
 	defer span.End()
 
+	// The NOT EXISTS guard is the once-per-week invariant. River's periodic
+	// schedule (Mon 08:00 UTC) + UniqueOpts(7d) is supposed to make this job
+	// fire weekly, but that guarantee does NOT survive the worker's frequent
+	// restarts (it auto-deploys on every push to master): catch-up enqueues on
+	// startup re-ran the sweep on consecutive days, so every team got the
+	// "weekly summary" daily (verified in prod: digest.weekly audit rows on
+	// 2026-05-25/26/27/28). This DB-level guard — mirroring the "dedupe lives
+	// in the DB" pattern in expiry_reminder.go / quota_wall_nudge.go — makes
+	// the cadence correct regardless of how often River fires: a team that
+	// already received a digest.weekly row inside the window is excluded, so a
+	// daily re-run is a no-op while the next legitimate weekly tick (7 days
+	// later) passes the window.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT u.email, t.id, COALESCE(t.name, '')
 		FROM users u
 		JOIN teams t ON t.id = u.team_id
 		WHERE t.plan_tier != 'anonymous'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM audit_log a
+		    WHERE a.team_id = t.id
+		      AND a.kind = $1
+		      AND a.created_at > now() - $2::interval
+		  )
 		ORDER BY u.email
-	`)
+	`, auditKindDigestWeekly, weeklyDigestDedupeWindow)
 	if err != nil {
 		return fmt.Errorf("weekly_digest.Work query users: %w", err)
 	}
