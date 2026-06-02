@@ -1083,3 +1083,38 @@ func TestBillingReconciler_OrphanSweep_QueryFailure_FailOpen(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// bug bash #5: a terminal downgrade closes the active grace period; if the
+// close itself errors the downgrade still succeeds (fail-open) — exercises the
+// grace_terminate_failed warn branch.
+func TestBillingReconciler_CancelledSubscription_GraceTerminateError_StillDowngrades(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	teamID := uuid.New()
+	mock.ExpectQuery(`SELECT id, stripe_customer_id, plan_tier`).
+		WillReturnRows(sqlmock.NewRows(teamRowCols).AddRow(teamID, "sub_grace_err", "pro"))
+	mock.ExpectExec(`UPDATE teams SET plan_tier`).
+		WithArgs("hobby", teamID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	expectEmptyOrphanSweep(mock)
+
+	fetcher := &stubFetcher{details: &jobs.ReconcilerSubDetails{Status: "cancelled", PlanID: "", PaidCount: 3}}
+	grace := &stubGrace{terminateErr: errors.New("grace close failed")}
+
+	w := jobs.NewBillingReconcilerWorker(db, fetcher, grace)
+	if err := w.Work(context.Background(), fakeJob[jobs.BillingReconcilerArgs]()); err != nil {
+		t.Fatalf("downgrade must succeed despite grace-close error (fail-open): %v", err)
+	}
+	if grace.terminateCalls != 1 {
+		t.Errorf("TerminateActiveGracePeriod calls = %d; want 1", grace.terminateCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
