@@ -778,7 +778,29 @@ func (w *OrphanSweepReconciler) sweepOrphanedCustomerNamespaces(ctx context.Cont
 		if liveTokens[token] {
 			continue // a live resource still backs this namespace — leave it
 		}
-		// Orphan: no active/paused/suspended resources row for this token.
+		// Creation-grace (bug bash 2026-06-02 #8). Two-phase provisioning
+		// creates the namespace and only then commits/finalises the resources
+		// row; a sweep landing inside that window — or before the 'pending'
+		// INSERT is visible to this query's snapshot — would see "no live row"
+		// and reap a namespace that is actively mid-provision. Never reap a
+		// namespace younger than the provisioning grace, mirroring PASS 3's
+		// no_db_row grace. On an age-lookup error, skip this sweep rather than
+		// reap without grace.
+		age, ageErr := w.k8s.GetNamespaceAge(ctx, ns)
+		if ageErr != nil {
+			slog.Warn("jobs.orphan_sweep.pass4_namespace_age_lookup_failed",
+				"namespace", ns, "error", ageErr.Error(),
+				"detail", "skipping customer-namespace reap this sweep; will retry next interval")
+			continue
+		}
+		if age < orphanNoDBRowGrace {
+			slog.Debug("jobs.orphan_sweep.pass4_within_grace",
+				"namespace", ns, "age", age.String(), "grace", orphanNoDBRowGrace.String(),
+				"detail", "namespace younger than provisioning grace — not reaping (may be mid-provision)")
+			continue
+		}
+		// Orphan: no live (pending/active/paused/suspended) resources row for
+		// this token and the namespace is past the provisioning grace.
 		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
 			failed++
 			metrics.OrphanSweepReapFailedTotal.WithLabelValues(orphanReapReasonCustomerNoRow).Inc()
@@ -799,8 +821,14 @@ func (w *OrphanSweepReconciler) sweepOrphanedCustomerNamespaces(ctx context.Cont
 }
 
 // fetchLiveResourceTokens returns the set of resource tokens that still have
-// a non-terminal (active / paused / suspended) row in the resources table —
-// i.e. every token PASS 4 must NOT reclaim the namespace for.
+// a non-terminal (pending / active / paused / suspended) row in the resources
+// table — i.e. every token PASS 4 must NOT reclaim the namespace for.
+//
+// 'pending' is included (bug bash 2026-06-02 #8): two-phase provisioning
+// inserts the resources row as 'pending' BEFORE the backend RPC creates the
+// namespace, and flips it to 'active' only on RPC success. Omitting 'pending'
+// meant a sweep during provisioning saw "no live row" and could delete the
+// live, mid-provision namespace.
 //
 // Crucially this does NOT include 'deleted' or 'expired' (terminal) rows: a
 // terminal row's backend is expected to be torn down, so its namespace, if
@@ -810,7 +838,7 @@ func (w *OrphanSweepReconciler) fetchLiveResourceTokens(ctx context.Context) (ma
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT DISTINCT token::text
 		  FROM resources
-		 WHERE status IN ('active', 'paused', 'suspended')
+		 WHERE status IN ('pending', 'active', 'paused', 'suspended')
 		   AND token IS NOT NULL
 	`)
 	if err != nil {
