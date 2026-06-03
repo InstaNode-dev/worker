@@ -38,6 +38,24 @@ var reapableStatusSQLList = func() string {
 	return strings.Join(quoted, ", ")
 }()
 
+// expireScanBatchLimit caps how many candidate rows the reaper's batch SELECT
+// pulls per round-trip. The reaper still inspects the WHOLE expired set every
+// tick — the candidates are streamed in keyset-paginated batches (WHERE
+// r.id::text > $cursor ORDER BY r.id::text ASC LIMIT expireScanBatchLimit)
+// rather than one unbounded SELECT, so a backlog of expired resources cannot
+// pin a multi-MB result set in one allocation.
+//
+// 100 (smaller than the quota scans' 1000) because each candidate triggers a
+// real provisioner DeprovisionResource RPC (DROP DATABASE / DROP USER / NATS
+// pod teardown) inside reapOne — a tight batch keeps each tick's burst of
+// backend teardown calls bounded (no thundering herd against the provisioner).
+//
+// Keyset over OFFSET: the (r.id::text > $cursor) predicate rides the primary
+// key, is restart-safe, and never re-scans skipped rows or drifts under the
+// concurrent status flips reapOne performs (a just-reaped row drops out of the
+// expired predicate, so the next page's cursor never revisits it).
+const expireScanBatchLimit = 100
+
 // toExpire is one candidate row carried from the batch SELECT to the per-row
 // reapOne tx. Package-level (rather than function-local) so reapOne can take
 // it as a parameter — the per-row tx wrapper lives outside Work() so a
@@ -182,34 +200,53 @@ func (w *ExpireAnonymousWorker) Work(ctx context.Context, job *river.Job[ExpireA
 	// but has zero non-test callers (dead code) and only flips the DB row — it
 	// never calls the provisioner. It should be removed from the api repo
 	// (out of scope here); this worker is the sole live reaper.
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT r.id::text, r.token::text, r.resource_type, COALESCE(r.provider_resource_id, '')
-		FROM resources r
-		LEFT JOIN teams t ON t.id = r.team_id
-		WHERE ((r.team_id IS NULL AND r.tier = 'anonymous') OR r.tier = 'free')
-		  AND r.status IN (`+reapableStatusSQLList+`)
-		  AND r.expires_at IS NOT NULL
-		  AND r.expires_at < now()
-		  AND (r.team_id IS NULL OR t.status = 'active')
-	`)
-	if err != nil {
-		return fmt.Errorf("ExpireAnonymousWorker: query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
+	// Keyset-paginate the expired-candidate scan: page through the WHOLE
+	// expired set in bounded batches, advancing the cursor by the last
+	// r.id::text seen and stopping on a short page. The complete candidate
+	// list is still assembled (and every candidate is reaped below) — only the
+	// per-fetch result set is bounded so a large backlog cannot pin one big
+	// allocation.
 	var candidates []toExpire
-	for rows.Next() {
-		var r toExpire
-		if err := rows.Scan(&r.id, &r.token, &r.resourceType, &r.providerResourceID); err != nil {
-			slog.Warn("jobs.expire_anonymous.scan_failed", "error", err)
-			continue
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT r.id::text, r.token::text, r.resource_type, COALESCE(r.provider_resource_id, '')
+			FROM resources r
+			LEFT JOIN teams t ON t.id = r.team_id
+			WHERE ((r.team_id IS NULL AND r.tier = 'anonymous') OR r.tier = 'free')
+			  AND r.status IN (`+reapableStatusSQLList+`)
+			  AND r.expires_at IS NOT NULL
+			  AND r.expires_at < now()
+			  AND (r.team_id IS NULL OR t.status = 'active')
+			  AND r.id::text > $1
+			ORDER BY r.id::text ASC
+			LIMIT $2
+		`, lastID, expireScanBatchLimit)
+		if err != nil {
+			return fmt.Errorf("ExpireAnonymousWorker: query failed: %w", err)
 		}
-		candidates = append(candidates, r)
+
+		batchCount := 0
+		for rows.Next() {
+			var r toExpire
+			if err := rows.Scan(&r.id, &r.token, &r.resourceType, &r.providerResourceID); err != nil {
+				slog.Warn("jobs.expire_anonymous.scan_failed", "error", err)
+				continue
+			}
+			batchCount++
+			lastID = r.id
+			candidates = append(candidates, r)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("ExpireAnonymousWorker: rows error: %w", err)
+		}
+		_ = rows.Close()
+		// Short page → the expired-candidate set is drained; stop.
+		if batchCount < expireScanBatchLimit {
+			break
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("ExpireAnonymousWorker: rows error: %w", err)
-	}
-	_ = rows.Close()
 
 	if len(candidates) == 0 {
 		return nil
