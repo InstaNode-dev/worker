@@ -83,6 +83,24 @@ const (
 // (resourceHeartbeatActor) and churn_predictor.go.
 const quotaAuditActor = "system"
 
+// quotaScanBatchLimit caps how many resource rows each suspend / unsuspend /
+// redis-eviction loop pulls per round-trip. The loops still process the FULL
+// eligible set every tick — the rows are streamed in keyset-paginated batches
+// (WHERE id::text > $cursor ORDER BY id::text ASC LIMIT quotaScanBatchLimit)
+// rather than one unbounded SELECT, so the server-side cursor + per-fetch
+// memory stay bounded regardless of how many active/suspended resources
+// exist. 1000 is sized for a cheap scan: each row is a small projection and
+// the per-row work (a storage re-check + optional provider revoke/grant) is
+// gated independently, so a 1000-row page is a comfortable batch that drains a
+// large table in a few round-trips without pinning a multi-MB result set.
+//
+// Keyset over OFFSET: the (id::text > $cursor) predicate rides the primary key,
+// is restart-safe, and never re-scans skipped rows or drifts under concurrent
+// insert/delete the way OFFSET does. A row inserted mid-sweep either sorts
+// after the cursor (seen this tick) or before it (already seen) — never
+// silently dropped.
+const quotaScanBatchLimit = 1000
+
 // quotaUnsuspendHysteresisFactor is the hysteresis band on the unsuspend
 // threshold. A resource is SUSPENDED at bytesUsed >= limitBytes but only
 // UNSUSPENDED once bytesUsed drops below limitBytes * factor (i.e. below 90%
@@ -212,93 +230,111 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 		return 0, nil
 	}
 
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, token, tier, storage_bytes
-		FROM resources
-		WHERE status = $1
-		  AND resource_type = 'redis'
-		ORDER BY created_at
-	`, resourceStatusActive)
-	if err != nil {
-		return 0, fmt.Errorf("EnforceStorageQuotaWorker.redisEvictionLoop: query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
 	checked, enforced := 0, 0
 
-	for rows.Next() {
-		var (
-			id           string
-			token        string
-			tier         string
-			storageBytes int64
-		)
-		if scanErr := rows.Scan(&id, &token, &tier, &storageBytes); scanErr != nil {
-			slog.Error("jobs.enforce_storage_quota.redis_eviction_scan_error", "error", scanErr)
-			continue
+	// Keyset-paginate the active-redis scan: page through the WHOLE eligible
+	// set in bounded batches, advancing the cursor by the last id::text seen
+	// and stopping when a short page (fewer rows than the limit) drains the
+	// table. The full set is still processed every tick — only the per-fetch
+	// footprint is bounded.
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id, token, tier, storage_bytes
+			FROM resources
+			WHERE status = $1
+			  AND resource_type = 'redis'
+			  AND id::text > $2
+			ORDER BY id::text ASC
+			LIMIT $3
+		`, resourceStatusActive, lastID, quotaScanBatchLimit)
+		if err != nil {
+			return enforced, fmt.Errorf("EnforceStorageQuotaWorker.redisEvictionLoop: query failed: %w", err)
 		}
 
-		// Only SHARED-backend Redis tenants are evicted. Paid tiers get
-		// dedicated k8s pods (real maxmemory, reconciler-managed) — skip them.
-		if !isSharedRedisTier(tier) {
-			continue
-		}
-		checked++
+		batchCount := 0
+		for rows.Next() {
+			var (
+				id           string
+				token        string
+				tier         string
+				storageBytes int64
+			)
+			if scanErr := rows.Scan(&id, &token, &tier, &storageBytes); scanErr != nil {
+				slog.Error("jobs.enforce_storage_quota.redis_eviction_scan_error", "error", scanErr)
+				continue
+			}
+			batchCount++
+			lastID = id
 
-		// All limits come from plans.Registry — never hardcoded (CLAUDE.md #3).
-		// StorageLimitMB(tier, "redis") resolves redis_memory_mb from plans.yaml.
-		limitMB := w.plans.StorageLimitMB(tier, redisServiceName)
-		if limitMB == -1 {
-			// Unlimited tier — never evict. (A shared-tier with unlimited Redis
-			// would be a plans.yaml misconfiguration, but guard defensively.)
-			continue
-		}
-		limitBytes := int64(limitMB) * 1024 * 1024
+			// Only SHARED-backend Redis tenants are evicted. Paid tiers get
+			// dedicated k8s pods (real maxmemory, reconciler-managed) — skip them.
+			if !isSharedRedisTier(tier) {
+				continue
+			}
+			checked++
 
-		// Cheap pre-filter: the stored storage_bytes (refreshed every 6h by
-		// UpdateStorageBytesWorker) lets us skip the SCAN for tenants that are
-		// obviously under cap. The evictor re-measures authoritatively before
-		// deleting anything, so a stale storage_bytes only ever costs a wasted
-		// scan — it can never cause an incorrect deletion.
-		if storageBytes < limitBytes {
-			continue
-		}
+			// All limits come from plans.Registry — never hardcoded (CLAUDE.md #3).
+			// StorageLimitMB(tier, "redis") resolves redis_memory_mb from plans.yaml.
+			limitMB := w.plans.StorageLimitMB(tier, redisServiceName)
+			if limitMB == -1 {
+				// Unlimited tier — never evict. (A shared-tier with unlimited Redis
+				// would be a plans.yaml misconfiguration, but guard defensively.)
+				continue
+			}
+			limitBytes := int64(limitMB) * 1024 * 1024
 
-		keysDeleted, bytesReclaimed, evErr := w.evictor.EvictTenantToCap(ctx, token, limitBytes)
-		if evErr != nil {
-			metrics.RedisEvictionFailedTotal.Inc()
-			slog.Error("jobs.enforce_storage_quota.redis_eviction_failed",
+			// Cheap pre-filter: the stored storage_bytes (refreshed every 6h by
+			// UpdateStorageBytesWorker) lets us skip the SCAN for tenants that are
+			// obviously under cap. The evictor re-measures authoritatively before
+			// deleting anything, so a stale storage_bytes only ever costs a wasted
+			// scan — it can never cause an incorrect deletion.
+			if storageBytes < limitBytes {
+				continue
+			}
+
+			keysDeleted, bytesReclaimed, evErr := w.evictor.EvictTenantToCap(ctx, token, limitBytes)
+			if evErr != nil {
+				metrics.RedisEvictionFailedTotal.Inc()
+				slog.Error("jobs.enforce_storage_quota.redis_eviction_failed",
+					"resource_id", id,
+					"token", logsafe.Token(token),
+					"tier", tier,
+					"limit_mb", limitMB,
+					"error", evErr,
+				)
+				continue // fail-soft — leave the tenant for the next sweep
+			}
+
+			if keysDeleted == 0 {
+				// Tenant was at/under cap when re-measured (stale storage_bytes) —
+				// idempotent no-op.
+				continue
+			}
+
+			metrics.RedisEvictedKeysTotal.Add(float64(keysDeleted))
+			metrics.RedisEvictedBytesTotal.Add(float64(bytesReclaimed))
+			metrics.RedisEvictedTenantsTotal.Inc()
+			enforced++
+
+			slog.Warn("jobs.enforce_storage_quota.redis_evicted",
 				"resource_id", id,
 				"token", logsafe.Token(token),
 				"tier", tier,
 				"limit_mb", limitMB,
-				"error", evErr,
+				"keys_deleted", keysDeleted,
+				"bytes_reclaimed", bytesReclaimed,
 			)
-			continue // fail-soft — leave the tenant for the next sweep
 		}
-
-		if keysDeleted == 0 {
-			// Tenant was at/under cap when re-measured (stale storage_bytes) —
-			// idempotent no-op.
-			continue
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return enforced, fmt.Errorf("EnforceStorageQuotaWorker.redisEvictionLoop: rows error: %w", rowsErr)
 		}
-
-		metrics.RedisEvictedKeysTotal.Add(float64(keysDeleted))
-		metrics.RedisEvictedBytesTotal.Add(float64(bytesReclaimed))
-		metrics.RedisEvictedTenantsTotal.Inc()
-		enforced++
-
-		slog.Warn("jobs.enforce_storage_quota.redis_evicted",
-			"resource_id", id,
-			"token", logsafe.Token(token),
-			"tier", tier,
-			"limit_mb", limitMB,
-			"keys_deleted", keysDeleted,
-			"bytes_reclaimed", bytesReclaimed,
-		)
-	}
-	if err := rows.Err(); err != nil {
-		return enforced, fmt.Errorf("EnforceStorageQuotaWorker.redisEvictionLoop: rows error: %w", err)
+		_ = rows.Close()
+		// Short page → the table is drained; stop.
+		if batchCount < quotaScanBatchLimit {
+			break
+		}
 	}
 
 	slog.Info("jobs.enforce_storage_quota.redis_eviction_loop_done",
@@ -313,133 +349,150 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 // those IDs to runUnsuspendLoop as a skip-set so a resource cannot be
 // suspended and unsuspended within the same Work() tick.
 func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]string, error) {
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, token, resource_type, tier, storage_bytes,
-		       COALESCE(provider_resource_id, ''),
-		       team_id, COALESCE(name, '')
-		FROM resources
-		WHERE status = $1
-		  AND resource_type IN ('postgres', 'redis', 'mongodb')
-		ORDER BY created_at
-	`, resourceStatusActive)
-	if err != nil {
-		return nil, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
 	checked := 0
 	suspendedIDs := make([]string, 0)
 
-	for rows.Next() {
-		var (
-			id                 string
-			token              string
-			resourceType       string
-			tier               string
-			storageBytes       int64
-			providerResourceID string
-			teamID             sql.NullString
-			name               string
-		)
-		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID, &teamID, &name); scanErr != nil {
-			slog.Error("jobs.enforce_storage_quota.scan_error", "error", scanErr)
-			continue
-		}
-		checked++
-
-		limitMB := w.plans.StorageLimitMB(tier, resourceType)
-		if limitMB == -1 {
-			continue // unlimited tier — never suspend
-		}
-
-		uid, parseErr := uuid.Parse(id)
-		if parseErr != nil {
-			slog.Error("jobs.enforce_storage_quota.invalid_uuid", "id", id, "error", parseErr)
-			continue
+	// Keyset-paginate the active-resource scan: page through the WHOLE eligible
+	// set in bounded batches, advancing the cursor by the last id::text and
+	// stopping on a short page. Every over-quota row is still suspended this
+	// tick — only the per-fetch result set is bounded.
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id, token, resource_type, tier, storage_bytes,
+			       COALESCE(provider_resource_id, ''),
+			       team_id, COALESCE(name, '')
+			FROM resources
+			WHERE status = $1
+			  AND resource_type IN ('postgres', 'redis', 'mongodb')
+			  AND id::text > $2
+			ORDER BY id::text ASC
+			LIMIT $3
+		`, resourceStatusActive, lastID, quotaScanBatchLimit)
+		if err != nil {
+			return suspendedIDs, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: query failed: %w", err)
 		}
 
-		_, exceeded, checkErr := checkStorageQuota(ctx, w.db, uid, limitMB)
-		if checkErr != nil {
-			slog.Error("jobs.enforce_storage_quota.check_error",
-				"resource_id", id,
-				"error", checkErr,
+		batchCount := 0
+		for rows.Next() {
+			var (
+				id                 string
+				token              string
+				resourceType       string
+				tier               string
+				storageBytes       int64
+				providerResourceID string
+				teamID             sql.NullString
+				name               string
 			)
-			continue // fail open — don't suspend on check error
-		}
-
-		if !exceeded {
-			continue
-		}
-
-		// Infra revoke FIRST, then status flip — matches the iron-rule order
-		// from api/internal/handlers/resource.go Pause(): "provider-side FIRST
-		// so the row stays active if infra fails; row flip is the commit."
-		// Here we invert slightly: infra revoke is fail-open (logged warning,
-		// not a hard error) so we always proceed to the status flip. This is
-		// intentional: a row marked 'suspended' blocks new provisions from the
-		// API even when the infra revoke is not available (customer DB down).
-		if w.revoker != nil {
-			// tier + provider_resource_id are passed so the revoker resolves
-			// the EXACT Redis ACL username: the stored provider_resource_id
-			// when present (canonical, never re-derived), else a tier-driven
-			// derivation (shared usr_<full-token> / legacy dedicated
-			// ded_<token[:8]>). See redisUsernameForToken.
-			if revokeErr := w.revoker.RevokeAccess(ctx, resourceType, token, tier, providerResourceID); revokeErr != nil {
-				// revoker implementations are fail-open (return nil on infra
-				// error, log a WARN). A non-nil error here is unexpected —
-				// log it but don't abort the row update.
-				slog.Error("jobs.enforce_storage_quota.revoke_error",
-					"resource_id", id, "token", logsafe.Token(token), "resource_type", resourceType,
-					"error", revokeErr,
-				)
+			if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID, &teamID, &name); scanErr != nil {
+				slog.Error("jobs.enforce_storage_quota.scan_error", "error", scanErr)
+				continue
 			}
-		}
+			batchCount++
+			lastID = id
+			checked++
 
-		suspendRes, updateErr := w.db.ExecContext(ctx, `
-			UPDATE resources SET status = $1
-			WHERE id = $2 AND status = $3
-		`, resourceStatusSuspended, id, resourceStatusActive)
-		if updateErr != nil {
-			slog.Error("jobs.enforce_storage_quota.suspend_failed",
+			limitMB := w.plans.StorageLimitMB(tier, resourceType)
+			if limitMB == -1 {
+				continue // unlimited tier — never suspend
+			}
+
+			uid, parseErr := uuid.Parse(id)
+			if parseErr != nil {
+				slog.Error("jobs.enforce_storage_quota.invalid_uuid", "id", id, "error", parseErr)
+				continue
+			}
+
+			_, exceeded, checkErr := checkStorageQuota(ctx, w.db, uid, limitMB)
+			if checkErr != nil {
+				slog.Error("jobs.enforce_storage_quota.check_error",
+					"resource_id", id,
+					"error", checkErr,
+				)
+				continue // fail open — don't suspend on check error
+			}
+
+			if !exceeded {
+				continue
+			}
+
+			// Infra revoke FIRST, then status flip — matches the iron-rule order
+			// from api/internal/handlers/resource.go Pause(): "provider-side FIRST
+			// so the row stays active if infra fails; row flip is the commit."
+			// Here we invert slightly: infra revoke is fail-open (logged warning,
+			// not a hard error) so we always proceed to the status flip. This is
+			// intentional: a row marked 'suspended' blocks new provisions from the
+			// API even when the infra revoke is not available (customer DB down).
+			if w.revoker != nil {
+				// tier + provider_resource_id are passed so the revoker resolves
+				// the EXACT Redis ACL username: the stored provider_resource_id
+				// when present (canonical, never re-derived), else a tier-driven
+				// derivation (shared usr_<full-token> / legacy dedicated
+				// ded_<token[:8]>). See redisUsernameForToken.
+				if revokeErr := w.revoker.RevokeAccess(ctx, resourceType, token, tier, providerResourceID); revokeErr != nil {
+					// revoker implementations are fail-open (return nil on infra
+					// error, log a WARN). A non-nil error here is unexpected —
+					// log it but don't abort the row update.
+					slog.Error("jobs.enforce_storage_quota.revoke_error",
+						"resource_id", id, "token", logsafe.Token(token), "resource_type", resourceType,
+						"error", revokeErr,
+					)
+				}
+			}
+
+			suspendRes, updateErr := w.db.ExecContext(ctx, `
+				UPDATE resources SET status = $1
+				WHERE id = $2 AND status = $3
+			`, resourceStatusSuspended, id, resourceStatusActive)
+			if updateErr != nil {
+				slog.Error("jobs.enforce_storage_quota.suspend_failed",
+					"resource_id", id,
+					"error", updateErr,
+				)
+				continue
+			}
+			// W6 (P1-W3-08): the UPDATE is a CAS (status='active' → 'suspended').
+			// Under replicas:2 both pods' enforce_storage_quota ticks can race on
+			// the same over-quota row; only one wins the CAS. The loser matched
+			// 0 rows — emitting the audit row + appending to suspendedIDs anyway
+			// would produce a duplicate "your resource was suspended" audit_log
+			// row and a duplicate customer email. Skip the emit when this tick
+			// didn't actually flip the row.
+			if n, raErr := suspendRes.RowsAffected(); raErr == nil && n == 0 {
+				slog.Info("jobs.enforce_storage_quota.suspend_noop",
+					"resource_id", id,
+					"note", "row already suspended by a concurrent tick — skipping audit/email emit",
+				)
+				continue
+			}
+
+			slog.Warn("jobs.enforce_storage_quota.suspended",
 				"resource_id", id,
-				"error", updateErr,
+				"token", logsafe.Token(token),
+				"resource_type", resourceType,
+				"tier", tier,
+				"storage_bytes", storageBytes,
+				"limit_mb", limitMB,
 			)
-			continue
+
+			// Emit the customer-visible audit_log row ONLY after the status flip
+			// actually landed — a suspend that never updated the row must not
+			// produce a "your resource was suspended" artifact. Best-effort: an
+			// audit insert failure is logged but does not unwind the suspend.
+			emitQuotaAuditRow(ctx, w.db, quotaSuspendedKind, teamID, id, resourceType, name)
+
+			suspendedIDs = append(suspendedIDs, id)
 		}
-		// W6 (P1-W3-08): the UPDATE is a CAS (status='active' → 'suspended').
-		// Under replicas:2 both pods' enforce_storage_quota ticks can race on
-		// the same over-quota row; only one wins the CAS. The loser matched
-		// 0 rows — emitting the audit row + appending to suspendedIDs anyway
-		// would produce a duplicate "your resource was suspended" audit_log
-		// row and a duplicate customer email. Skip the emit when this tick
-		// didn't actually flip the row.
-		if n, raErr := suspendRes.RowsAffected(); raErr == nil && n == 0 {
-			slog.Info("jobs.enforce_storage_quota.suspend_noop",
-				"resource_id", id,
-				"note", "row already suspended by a concurrent tick — skipping audit/email emit",
-			)
-			continue
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return suspendedIDs, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: rows error: %w", rowsErr)
 		}
-
-		slog.Warn("jobs.enforce_storage_quota.suspended",
-			"resource_id", id,
-			"token", logsafe.Token(token),
-			"resource_type", resourceType,
-			"tier", tier,
-			"storage_bytes", storageBytes,
-			"limit_mb", limitMB,
-		)
-
-		// Emit the customer-visible audit_log row ONLY after the status flip
-		// actually landed — a suspend that never updated the row must not
-		// produce a "your resource was suspended" artifact. Best-effort: an
-		// audit insert failure is logged but does not unwind the suspend.
-		emitQuotaAuditRow(ctx, w.db, quotaSuspendedKind, teamID, id, resourceType, name)
-
-		suspendedIDs = append(suspendedIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		return suspendedIDs, fmt.Errorf("EnforceStorageQuotaWorker.suspendLoop: rows error: %w", err)
+		_ = rows.Close()
+		// Short page → the active-resource set is drained; stop.
+		if batchCount < quotaScanBatchLimit {
+			break
+		}
 	}
 
 	slog.Info("jobs.enforce_storage_quota.suspend_loop_done",
@@ -463,122 +516,139 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 		skip[id] = struct{}{}
 	}
 
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, token, resource_type, tier, storage_bytes,
-		       COALESCE(provider_resource_id, ''),
-		       team_id, COALESCE(name, '')
-		FROM resources
-		WHERE status = $1
-		  AND resource_type IN ('postgres', 'redis', 'mongodb')
-		ORDER BY created_at
-	`, resourceStatusSuspended)
-	if err != nil {
-		return 0, fmt.Errorf("EnforceStorageQuotaWorker.unsuspendLoop: query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
 	unsuspended := 0
 
-	for rows.Next() {
-		var (
-			id                 string
-			token              string
-			resourceType       string
-			tier               string
-			storageBytes       int64
-			providerResourceID string
-			teamID             sql.NullString
-			name               string
-		)
-		if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID, &teamID, &name); scanErr != nil {
-			slog.Error("jobs.enforce_storage_quota.unsuspend_scan_error", "error", scanErr)
-			continue
+	// Keyset-paginate the suspended-resource scan: page through the WHOLE
+	// suspended set in bounded batches, advancing the cursor by the last
+	// id::text and stopping on a short page. Every now-under-threshold row is
+	// still unsuspended this tick — only the per-fetch result set is bounded.
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id, token, resource_type, tier, storage_bytes,
+			       COALESCE(provider_resource_id, ''),
+			       team_id, COALESCE(name, '')
+			FROM resources
+			WHERE status = $1
+			  AND resource_type IN ('postgres', 'redis', 'mongodb')
+			  AND id::text > $2
+			ORDER BY id::text ASC
+			LIMIT $3
+		`, resourceStatusSuspended, lastID, quotaScanBatchLimit)
+		if err != nil {
+			return unsuspended, fmt.Errorf("EnforceStorageQuotaWorker.unsuspendLoop: query failed: %w", err)
 		}
 
-		// Skip any resource the suspend loop flipped this tick — it must not
-		// be unsuspended in the same Work() (intra-tick flap guard).
-		if _, justSuspended := skip[id]; justSuspended {
-			continue
-		}
-
-		limitMB := w.plans.StorageLimitMB(tier, resourceType)
-		if limitMB == -1 {
-			// Unlimited tier shouldn't have been suspended, but unsuspend
-			// eagerly to self-heal any historical bad state.
-			limitMB = 0 // treat as belowThreshold=true below
-		}
-
-		uid, parseErr := uuid.Parse(id)
-		if parseErr != nil {
-			slog.Error("jobs.enforce_storage_quota.unsuspend_invalid_uuid", "id", id, "error", parseErr)
-			continue
-		}
-
-		// Hysteresis: a suspend fires at bytesUsed >= limitBytes, but an
-		// unsuspend fires only once bytesUsed drops below the hysteresis
-		// threshold (90% of the limit). The dead-band between the two
-		// thresholds stops a resource sitting at the limit from flip-flopping
-		// every tick. limitMB == 0 means unlimited → always below threshold.
-		belowThreshold := true
-		if limitMB > 0 {
-			bytesUsed, checkErr := readStorageBytes(ctx, w.db, uid)
-			if checkErr != nil {
-				slog.Error("jobs.enforce_storage_quota.unsuspend_check_error",
-					"resource_id", id, "error", checkErr)
-				continue // fail open — don't unsuspend on check error
+		batchCount := 0
+		for rows.Next() {
+			var (
+				id                 string
+				token              string
+				resourceType       string
+				tier               string
+				storageBytes       int64
+				providerResourceID string
+				teamID             sql.NullString
+				name               string
+			)
+			if scanErr := rows.Scan(&id, &token, &resourceType, &tier, &storageBytes, &providerResourceID, &teamID, &name); scanErr != nil {
+				slog.Error("jobs.enforce_storage_quota.unsuspend_scan_error", "error", scanErr)
+				continue
 			}
-			unsuspendThreshold := int64(float64(int64(limitMB)*1024*1024) * quotaUnsuspendHysteresisFactor)
-			belowThreshold = bytesUsed < unsuspendThreshold
-		}
+			batchCount++
+			lastID = id
 
-		if !belowThreshold {
-			continue // not yet far enough below the limit — remain suspended
-		}
-
-		// Re-grant infra access before flipping the status row.
-		if w.revoker != nil {
-			// tier + provider_resource_id are passed so the revoker resolves
-			// the EXACT Redis ACL username: the stored provider_resource_id
-			// when present (canonical, never re-derived), else a tier-driven
-			// derivation (shared usr_<full-token> / legacy dedicated
-			// ded_<token[:8]>). See redisUsernameForToken.
-			if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, tier, providerResourceID); grantErr != nil {
-				slog.Error("jobs.enforce_storage_quota.grant_error",
-					"resource_id", id, "token", logsafe.Token(token), "resource_type", resourceType,
-					"error", grantErr,
-				)
-				// Non-nil means unexpected path — still proceed with row flip.
+			// Skip any resource the suspend loop flipped this tick — it must not
+			// be unsuspended in the same Work() (intra-tick flap guard).
+			if _, justSuspended := skip[id]; justSuspended {
+				continue
 			}
+
+			limitMB := w.plans.StorageLimitMB(tier, resourceType)
+			if limitMB == -1 {
+				// Unlimited tier shouldn't have been suspended, but unsuspend
+				// eagerly to self-heal any historical bad state.
+				limitMB = 0 // treat as belowThreshold=true below
+			}
+
+			uid, parseErr := uuid.Parse(id)
+			if parseErr != nil {
+				slog.Error("jobs.enforce_storage_quota.unsuspend_invalid_uuid", "id", id, "error", parseErr)
+				continue
+			}
+
+			// Hysteresis: a suspend fires at bytesUsed >= limitBytes, but an
+			// unsuspend fires only once bytesUsed drops below the hysteresis
+			// threshold (90% of the limit). The dead-band between the two
+			// thresholds stops a resource sitting at the limit from flip-flopping
+			// every tick. limitMB == 0 means unlimited → always below threshold.
+			belowThreshold := true
+			if limitMB > 0 {
+				bytesUsed, checkErr := readStorageBytes(ctx, w.db, uid)
+				if checkErr != nil {
+					slog.Error("jobs.enforce_storage_quota.unsuspend_check_error",
+						"resource_id", id, "error", checkErr)
+					continue // fail open — don't unsuspend on check error
+				}
+				unsuspendThreshold := int64(float64(int64(limitMB)*1024*1024) * quotaUnsuspendHysteresisFactor)
+				belowThreshold = bytesUsed < unsuspendThreshold
+			}
+
+			if !belowThreshold {
+				continue // not yet far enough below the limit — remain suspended
+			}
+
+			// Re-grant infra access before flipping the status row.
+			if w.revoker != nil {
+				// tier + provider_resource_id are passed so the revoker resolves
+				// the EXACT Redis ACL username: the stored provider_resource_id
+				// when present (canonical, never re-derived), else a tier-driven
+				// derivation (shared usr_<full-token> / legacy dedicated
+				// ded_<token[:8]>). See redisUsernameForToken.
+				if grantErr := w.revoker.GrantAccess(ctx, resourceType, token, tier, providerResourceID); grantErr != nil {
+					slog.Error("jobs.enforce_storage_quota.grant_error",
+						"resource_id", id, "token", logsafe.Token(token), "resource_type", resourceType,
+						"error", grantErr,
+					)
+					// Non-nil means unexpected path — still proceed with row flip.
+				}
+			}
+
+			_, updateErr := w.db.ExecContext(ctx, `
+				UPDATE resources SET status = $1
+				WHERE id = $2 AND status = $3
+			`, resourceStatusActive, id, resourceStatusSuspended)
+			if updateErr != nil {
+				slog.Error("jobs.enforce_storage_quota.unsuspend_failed",
+					"resource_id", id, "error", updateErr)
+				continue
+			}
+
+			slog.Info("jobs.enforce_storage_quota.unsuspended",
+				"resource_id", id,
+				"token", logsafe.Token(token),
+				"resource_type", resourceType,
+				"tier", tier,
+				"storage_bytes", storageBytes,
+				"limit_mb", limitMB,
+			)
+
+			// Emit the customer-visible audit_log row ONLY after the status flip
+			// back to 'active' actually landed. Best-effort: an audit insert
+			// failure is logged but does not unwind the unsuspend.
+			emitQuotaAuditRow(ctx, w.db, quotaUnsuspendedKind, teamID, id, resourceType, name)
+
+			unsuspended++
 		}
-
-		_, updateErr := w.db.ExecContext(ctx, `
-			UPDATE resources SET status = $1
-			WHERE id = $2 AND status = $3
-		`, resourceStatusActive, id, resourceStatusSuspended)
-		if updateErr != nil {
-			slog.Error("jobs.enforce_storage_quota.unsuspend_failed",
-				"resource_id", id, "error", updateErr)
-			continue
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return unsuspended, fmt.Errorf("EnforceStorageQuotaWorker.unsuspendLoop: rows error: %w", rowsErr)
 		}
-
-		slog.Info("jobs.enforce_storage_quota.unsuspended",
-			"resource_id", id,
-			"token", logsafe.Token(token),
-			"resource_type", resourceType,
-			"tier", tier,
-			"storage_bytes", storageBytes,
-			"limit_mb", limitMB,
-		)
-
-		// Emit the customer-visible audit_log row ONLY after the status flip
-		// back to 'active' actually landed. Best-effort: an audit insert
-		// failure is logged but does not unwind the unsuspend.
-		emitQuotaAuditRow(ctx, w.db, quotaUnsuspendedKind, teamID, id, resourceType, name)
-
-		unsuspended++
-	}
-	if err := rows.Err(); err != nil {
-		return unsuspended, fmt.Errorf("EnforceStorageQuotaWorker.unsuspendLoop: rows error: %w", err)
+		_ = rows.Close()
+		// Short page → the suspended-resource set is drained; stop.
+		if batchCount < quotaScanBatchLimit {
+			break
+		}
 	}
 
 	return unsuspended, nil

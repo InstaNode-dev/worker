@@ -35,7 +35,7 @@ func (m *mockPlanRegistry) StorageLimitMB(tier, service string) int {
 }
 
 func (m *mockPlanRegistry) ConnectionsLimit(tier, service string) int { return -1 }
-func (m *mockPlanRegistry) ProvisionLimit(tier string) int             { return -1 }
+func (m *mockPlanRegistry) ProvisionLimit(tier string) int            { return -1 }
 
 // ── mockResourceInfraRevoker ──────────────────────────────────────────────────
 
@@ -84,11 +84,11 @@ func TestEnforceStorageQuotaWorker_NoResources_NoSuspend(t *testing.T) {
 
 	// Suspend loop query (status='active').
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 	// Unsuspend loop query (status='suspended').
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	plans := &mockPlanRegistry{limitMB: 10}
@@ -109,7 +109,7 @@ func TestEnforceStorageQuotaWorker_DBQueryError_ReturnsError(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnError(errDB)
 
 	plans := &mockPlanRegistry{limitMB: 10}
@@ -157,7 +157,7 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 
 	// Suspend loop query.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, token, resourceType, tier, storageBytes, providerResourceID, teamID, name))
 	// checkStorageQuota inner query.
@@ -175,7 +175,7 @@ func TestEnforceStorageQuotaWorker_OverQuota_SuspendsResource(t *testing.T) {
 
 	// Unsuspend loop query — empty (no suspended resources yet).
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	revoker := &mockResourceInfraRevoker{}
@@ -237,7 +237,7 @@ func TestEnforceStorageQuotaWorker_SuspendCASLoses_NoAuditRow(t *testing.T) {
 
 	// Suspend loop query — one over-quota row.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, token, resourceType, tier, storageBytes, providerResourceID, teamID, name))
 	// checkStorageQuota inner query.
@@ -254,7 +254,7 @@ func TestEnforceStorageQuotaWorker_SuspendCASLoses_NoAuditRow(t *testing.T) {
 
 	// Unsuspend loop query — empty.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	revoker := &mockResourceInfraRevoker{}
@@ -292,7 +292,7 @@ func TestEnforceStorageQuotaWorker_UnderQuota_UnsuspendsResource(t *testing.T) {
 
 	// Suspend loop: no active-status over-quota resources.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	teamID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -300,7 +300,7 @@ func TestEnforceStorageQuotaWorker_UnderQuota_UnsuspendsResource(t *testing.T) {
 
 	// Unsuspend loop: one suspended resource.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, token, resourceType, tier, storageBytes, "", teamID, name)) // empty PRID = legacy row
 	// checkStorageQuota inner query.
@@ -355,7 +355,7 @@ func TestEnforceStorageQuotaWorker_NilRevoker_StatusFlipStillLands(t *testing.T)
 	// team_id is the SQL NULL sentinel ("" in the scanned NullString) — this is
 	// an anonymous resource. nullableTeamID maps it to a NULL audit_log.team_id.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, token, "mongodb", "hobby", storageBytes, "", nil, "")) // empty PRID = legacy row; nil team_id = anonymous
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -369,7 +369,7 @@ func TestEnforceStorageQuotaWorker_NilRevoker_StatusFlipStillLands(t *testing.T)
 		WithArgs(nil, "system", "resource.quota_suspended", sqlmock.AnyArg(), sqlmock.AnyArg(), "mongodb").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	plans := &mockPlanRegistry{limitMB: limitMB}
@@ -410,12 +410,12 @@ func TestEnforceStorageQuotaWorker_HysteresisDeadBand_StaysSuspended(t *testing.
 
 	// Suspend loop: no active over-quota resources.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	// Unsuspend loop: one suspended resource sitting in the dead-band.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, token, resourceType, tier, storageBytes, "", "cccccccc-cccc-cccc-cccc-cccccccccccc", "deadband-db")) // empty PRID = legacy row
 	// readStorageBytes inner query — returns the dead-band value.
@@ -452,13 +452,13 @@ func TestEnforceStorageQuotaWorker_UnlimitedTier_NoSuspend(t *testing.T) {
 	storageBytes := int64(999 * 1024 * 1024) // huge — should not matter
 
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, "tok_unlimited", "postgres", "team", storageBytes, "", "dddddddd-dddd-dddd-dddd-dddddddddddd", "unlimited-db")) // empty PRID = legacy row
 	// No checkStorageQuota call expected — unlimited tier skips quota check.
 	// No UPDATE expected.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	revoker := &mockResourceInfraRevoker{}
@@ -538,7 +538,7 @@ func TestEnforceStorageQuotaWorker_SuspendEmitsAuditRow(t *testing.T) {
 	limitMB := 10
 
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, "tok_s", resourceType, "hobby", storageBytes, "", teamID, name))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -561,7 +561,7 @@ func TestEnforceStorageQuotaWorker_SuspendEmitsAuditRow(t *testing.T) {
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	plans := &mockPlanRegistry{limitMB: limitMB}
@@ -592,11 +592,11 @@ func TestEnforceStorageQuotaWorker_UnsuspendEmitsAuditRow(t *testing.T) {
 
 	// Suspend loop: nothing over quota.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 	// Unsuspend loop: one suspended resource now under quota.
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, "tok_u", resourceType, "hobby", storageBytes, "", teamID, name))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -640,7 +640,7 @@ func TestEnforceStorageQuotaWorker_NoAuditRowWhenUpdateFails(t *testing.T) {
 	storageBytes := int64(20 * 1024 * 1024)
 
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols).
 			AddRow(resourceID, "tok_f", "postgres", "hobby", storageBytes, "", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "fail-db"))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -651,7 +651,7 @@ func TestEnforceStorageQuotaWorker_NoAuditRowWhenUpdateFails(t *testing.T) {
 		WithArgs("suspended", resourceID, "active").
 		WillReturnError(errDB)
 	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows(quotaScanCols))
 
 	plans := &mockPlanRegistry{limitMB: 10}
