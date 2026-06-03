@@ -345,12 +345,13 @@ type redisRow struct {
 // suspend loop, unsuspend loop, then the redis eviction loop returning rows.
 func expectEvictionLoopRows(mock sqlmock.Sqlmock, rows []redisRow) {
 	// Suspend loop (status='active', postgres/redis/mongodb) — empty.
+	// Keyset-paginated: WithArgs(status, cursor, limit).
 	mock.ExpectQuery(`SELECT id, token, resource_type`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
 	// Unsuspend loop (status='suspended') — empty.
 	mock.ExpectQuery(`SELECT id, token, resource_type`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
 	// Redis eviction loop (status='active', resource_type='redis').
 	er := sqlmock.NewRows([]string{"id", "token", "tier", "storage_bytes"})
@@ -358,7 +359,7 @@ func expectEvictionLoopRows(mock sqlmock.Sqlmock, rows []redisRow) {
 		er.AddRow(r.id, r.token, r.tier, r.storageBytes)
 	}
 	mock.ExpectQuery(`SELECT id, token, tier, storage_bytes\s+FROM resources`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(er)
 }
 
@@ -484,10 +485,10 @@ func TestEnforceStorageQuotaWorker_NilEvictor_StillRuns(t *testing.T) {
 	// Suspend + unsuspend loops only — the eviction loop short-circuits before
 	// issuing its SELECT when evictor is nil.
 	mock.ExpectQuery(`SELECT id, token, resource_type`).
-		WithArgs("active").
+		WithArgs("active", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
 	mock.ExpectQuery(`SELECT id, token, resource_type`).
-		WithArgs("suspended").
+		WithArgs("suspended", "", jobs.QuotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes"}))
 
 	plans := &mockPlanRegistry{limitMB: 5}
