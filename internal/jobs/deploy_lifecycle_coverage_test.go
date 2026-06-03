@@ -38,6 +38,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1793,7 +1794,7 @@ func TestOrphanSweep_Pass5_StackIDsQueryError(t *testing.T) {
 	defer db.Close()
 	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
 		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
-	mock.ExpectQuery(`SELECT id::text FROM stacks`).
+	mock.ExpectQuery(`SELECT id::text\s+FROM stacks`).
 		WillReturnError(errors.New("conn lost"))
 
 	lister := newFakeNamespaceLister().withStackNamespaces(ExpireStacksNamespacePrefix + "stack-1")
@@ -1890,7 +1891,7 @@ func TestOrphanSweep_Pass5_DeleteFails(t *testing.T) {
 	orphanNS := ExpireStacksNamespacePrefix + "willfail"
 	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
 		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
-	mock.ExpectQuery(`SELECT id::text FROM stacks`).
+	mock.ExpectQuery(`SELECT id::text\s+FROM stacks`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	lister := newFakeNamespaceLister().withStackNamespaces(orphanNS)
@@ -2121,7 +2122,7 @@ func TestOrphanSweep_FetchLiveStackIDs_ScanError(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(`SELECT id::text FROM stacks`).
+	mock.ExpectQuery(`SELECT id::text\s+FROM stacks`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "extra"}).
 			AddRow("id", "extra"))
 
@@ -2129,6 +2130,113 @@ func TestOrphanSweep_FetchLiveStackIDs_ScanError(t *testing.T) {
 	_, err = w.fetchLiveStackIDs(context.Background())
 	if err == nil {
 		t.Fatal("expected scan error from wrong column count")
+	}
+}
+
+// TestOrphanSweep_FetchLiveStackIDs_KeysetPagination proves the bug-bash
+// 2026-06-03 fix: fetchLiveStackIDs no longer issues one unbounded SELECT but
+// streams the live stack ids in keyset-paginated batches. The first page is
+// FULL (== orphanLiveIDsBatchLimit rows) so the loop must issue a SECOND query
+// whose cursor ($1) is the last id of page 1; the second page is short, ending
+// the loop. The assertion: every id from BOTH pages lands in the returned set,
+// AND the second query's keyset arg equals page 1's tail (proving the cursor
+// advanced rather than re-scanning from the start).
+func TestOrphanSweep_FetchLiveStackIDs_KeysetPagination(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Page 1: exactly orphanLiveIDsBatchLimit rows, zero-padded so they sort
+	// lexicographically in the same order we add them. The last id is the
+	// keyset cursor the second query must carry.
+	page1 := sqlmock.NewRows([]string{"id"})
+	var lastPage1ID string
+	for i := 0; i < orphanLiveIDsBatchLimit; i++ {
+		id := fmt.Sprintf("stack-%06d", i)
+		page1.AddRow(id)
+		lastPage1ID = id
+	}
+	queryRE := `SELECT id::text\s+FROM stacks\s+WHERE id::text > \$1\s+ORDER BY id::text ASC\s+LIMIT \$2`
+	mock.ExpectQuery(queryRE).
+		WithArgs("", orphanLiveIDsBatchLimit).
+		WillReturnRows(page1)
+	// Page 2: short (2 rows < limit) → loop terminates. The cursor MUST be
+	// page 1's tail id.
+	mock.ExpectQuery(queryRE).
+		WithArgs(lastPage1ID, orphanLiveIDsBatchLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow("stack-overflow-a").
+			AddRow("stack-overflow-b"))
+
+	w := &OrphanSweepReconciler{db: db}
+	got, err := w.fetchLiveStackIDs(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLiveStackIDs: %v", err)
+	}
+	wantCount := orphanLiveIDsBatchLimit + 2
+	if len(got) != wantCount {
+		t.Fatalf("live id count = %d; want %d (both pages merged)", len(got), wantCount)
+	}
+	if !got[lastPage1ID] {
+		t.Errorf("page 1 tail id %q missing from set", lastPage1ID)
+	}
+	if !got["stack-overflow-a"] || !got["stack-overflow-b"] {
+		t.Errorf("page 2 ids missing from set: %v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		// Unmet expectation here = the second keyset query never fired (the
+		// loop didn't paginate) or fired with the wrong cursor.
+		t.Errorf("unmet expectations (keyset pagination did not advance correctly): %v", err)
+	}
+}
+
+// TestOrphanSweep_FetchLiveStackIDs_SecondPageError proves a DB error on a
+// LATER keyset page (not just the first) propagates out — the loop must not
+// silently return a partial set, which for PASS 5 could wrongly mark a live
+// stack's namespace as an orphan.
+func TestOrphanSweep_FetchLiveStackIDs_SecondPageError(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	page1 := sqlmock.NewRows([]string{"id"})
+	for i := 0; i < orphanLiveIDsBatchLimit; i++ {
+		page1.AddRow(fmt.Sprintf("stack-%06d", i))
+	}
+	queryRE := `SELECT id::text\s+FROM stacks\s+WHERE id::text > \$1\s+ORDER BY id::text ASC\s+LIMIT \$2`
+	mock.ExpectQuery(queryRE).WillReturnRows(page1)
+	mock.ExpectQuery(queryRE).WillReturnError(errors.New("conn lost mid-sweep"))
+
+	w := &OrphanSweepReconciler{db: db}
+	if _, err := w.fetchLiveStackIDs(context.Background()); err == nil {
+		t.Fatal("expected error from second-page query failure, got nil (partial set must NOT be returned)")
+	}
+}
+
+// TestOrphanSweep_FetchLiveStackIDs_RowsErr proves a row-iteration error
+// (rows.Err() non-nil — e.g. the connection drops mid-stream) propagates out
+// rather than silently truncating the live-id set. Distinct from a
+// QueryContext error: this fires AFTER rows start streaming.
+func TestOrphanSweep_FetchLiveStackIDs_RowsErr(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows([]string{"id"}).
+		AddRow("stack-aaaa").
+		RowError(0, errors.New("conn reset mid-stream"))
+	mock.ExpectQuery(`SELECT id::text\s+FROM stacks\s+WHERE id::text > \$1`).
+		WillReturnRows(rows)
+
+	w := &OrphanSweepReconciler{db: db}
+	if _, err := w.fetchLiveStackIDs(context.Background()); err == nil {
+		t.Fatal("expected rows.Err() to propagate, got nil")
 	}
 }
 
