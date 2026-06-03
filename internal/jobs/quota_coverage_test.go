@@ -1186,11 +1186,11 @@ func TestRunRedisEvictionLoop_QueryError(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(`SELECT id, token, resource_type`).WithArgs("active").
+	mock.ExpectQuery(`SELECT id, token, resource_type`).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id", "team_id", "name"}))
-	mock.ExpectQuery(`SELECT id, token, resource_type`).WithArgs("suspended").
+	mock.ExpectQuery(`SELECT id, token, resource_type`).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "storage_bytes", "provider_resource_id", "team_id", "name"}))
-	mock.ExpectQuery(`SELECT id, token, tier, storage_bytes\s+FROM resources`).WithArgs("active").
+	mock.ExpectQuery(`SELECT id, token, tier, storage_bytes\s+FROM resources`).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnError(errors.New("eviction select down"))
 
 	w := NewEnforceStorageQuotaWorkerWithEvictor(db, &mockPlanRegistryCov{limitMB: 5}, nil, &stubEvictor{})
@@ -1234,7 +1234,7 @@ func TestRunSuspendLoop_ScanError(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			uuid.New().String(), "tok", "postgres", "anonymous",
 			"not-an-int", "", nil, "n"))
@@ -1257,7 +1257,7 @@ func TestRunSuspendLoop_InvalidUUID(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			"not-a-uuid", "tok", "postgres", "anonymous",
 			int64(0), "", nil, "n"))
@@ -1282,7 +1282,7 @@ func TestRunSuspendLoop_CheckError(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -1308,7 +1308,7 @@ func TestRunSuspendLoop_RevokeError(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "redis", "anonymous", int64(0), "", nil, "n"))
 	// over quota: limitMB=1 -> 1MiB; bytes used 2MiB
@@ -1339,7 +1339,7 @@ func TestRunSuspendLoop_UpdateError(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -1366,7 +1366,7 @@ func TestRunSuspendLoop_RowsErr(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().RowError(0, errors.New("rows broke")).AddRow(
 			uuid.New().String(), "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 
@@ -1385,7 +1385,7 @@ func TestRunUnsuspendLoop_ScanError(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			uuid.New().String(), "tok", "postgres", "anonymous",
 			"not-an-int", "", nil, "n"))
@@ -1409,7 +1409,7 @@ func TestRunUnsuspendLoop_SkipSet(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 
@@ -1431,7 +1431,7 @@ func TestRunUnsuspendLoop_InvalidUUID(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			"not-a-uuid", "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 
@@ -1454,7 +1454,7 @@ func TestRunUnsuspendLoop_CheckError(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -1480,7 +1480,7 @@ func TestRunUnsuspendLoop_GrantError(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "redis", "anonymous", int64(0), "", nil, "n"))
 	// well under hysteresis threshold so it unsuspends
@@ -1511,7 +1511,7 @@ func TestRunUnsuspendLoop_UpdateError(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
@@ -1540,7 +1540,7 @@ func TestRunUnsuspendLoop_UnlimitedTierSelfHeals(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(
 			id, "tok", "postgres", "team", int64(0), "", nil, "n"))
 	mock.ExpectExec(`UPDATE resources SET status`).
@@ -1567,7 +1567,7 @@ func TestRunUnsuspendLoop_RowsErr(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().RowError(0, errors.New("rows broke")).AddRow(
 			uuid.New().String(), "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 
@@ -1719,7 +1719,7 @@ func TestRunRedisEvictionLoop_ScanError(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covEvictCols).WithArgs("active").
+	mock.ExpectQuery(covEvictCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(evictRows().AddRow(uuid.New().String(), "tok", "anonymous", "not-int"))
 
 	w := NewEnforceStorageQuotaWorkerWithEvictor(db, &mockPlanRegistryCov{limitMB: 1}, nil, &countingEvictor{})
@@ -1742,7 +1742,7 @@ func TestRunRedisEvictionLoop_KeysDeletedZero(t *testing.T) {
 	}
 	defer db.Close()
 	overCap := int64(2 * 1024 * 1024) // 2 MiB vs 1 MiB cap
-	mock.ExpectQuery(covEvictCols).WithArgs("active").
+	mock.ExpectQuery(covEvictCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(evictRows().AddRow(uuid.New().String(), "tok", "anonymous", overCap))
 
 	w := NewEnforceStorageQuotaWorkerWithEvictor(db, &mockPlanRegistryCov{limitMB: 1}, nil, &countingEvictor{deleted: 0})
@@ -1764,7 +1764,7 @@ func TestRunRedisEvictionLoop_EvictorError(t *testing.T) {
 	}
 	defer db.Close()
 	overCap := int64(2 * 1024 * 1024)
-	mock.ExpectQuery(covEvictCols).WithArgs("active").
+	mock.ExpectQuery(covEvictCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(evictRows().AddRow(uuid.New().String(), "tok", "anonymous", overCap))
 
 	w := NewEnforceStorageQuotaWorkerWithEvictor(db, &mockPlanRegistryCov{limitMB: 1}, nil,
@@ -1787,7 +1787,7 @@ func TestRunRedisEvictionLoop_Success(t *testing.T) {
 	}
 	defer db.Close()
 	overCap := int64(2 * 1024 * 1024)
-	mock.ExpectQuery(covEvictCols).WithArgs("active").
+	mock.ExpectQuery(covEvictCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(evictRows().AddRow(uuid.New().String(), "tok", "anonymous", overCap))
 
 	w := NewEnforceStorageQuotaWorkerWithEvictor(db, &mockPlanRegistryCov{limitMB: 1}, nil,
@@ -1809,7 +1809,7 @@ func TestRunRedisEvictionLoop_RowsErr(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covEvictCols).WithArgs("active").
+	mock.ExpectQuery(covEvictCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(evictRows().RowError(0, errors.New("rows broke")).
 			AddRow(uuid.New().String(), "tok", "anonymous", int64(0)))
 
@@ -1828,7 +1828,7 @@ func TestRunSuspendLoop_NotExceeded(t *testing.T) {
 	}
 	defer db.Close()
 	id := uuid.New().String()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows().AddRow(id, "tok", "postgres", "anonymous", int64(0), "", nil, "n"))
 	mock.ExpectQuery(`SELECT storage_bytes FROM resources WHERE id = \$1`).
 		WillReturnRows(sqlmock.NewRows([]string{"storage_bytes"}).AddRow(int64(0)))
@@ -1851,7 +1851,7 @@ func TestRunUnsuspendLoop_QueryError(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnError(errors.New("unsuspend select down"))
 
 	w := NewEnforceStorageQuotaWorker(db, &mockPlanRegistryCov{limitMB: 5}, nil)
@@ -1869,9 +1869,9 @@ func TestWork_UnsuspendLoopError_Swallowed(t *testing.T) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer db.Close()
-	mock.ExpectQuery(covSuspendCols).WithArgs("active").
+	mock.ExpectQuery(covSuspendCols).WithArgs("active", "", quotaScanBatchLimit).
 		WillReturnRows(suspendRows())
-	mock.ExpectQuery(covSuspendCols).WithArgs("suspended").
+	mock.ExpectQuery(covSuspendCols).WithArgs("suspended", "", quotaScanBatchLimit).
 		WillReturnError(errors.New("unsuspend down"))
 	// No evictor → eviction loop is a no-op (skipped).
 
