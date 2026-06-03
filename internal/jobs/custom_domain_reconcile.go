@@ -70,6 +70,25 @@ const (
 	txtChallengePrefix = "_instanode."
 
 	staleVerificationFailReason = "verification timeout: TXT record not observed within 7 days"
+
+	// customDomainScanBatchLimit caps how many custom_domains rows
+	// listActiveDomains pulls per round-trip. The reconciler still processes the
+	// WHOLE non-terminal set every tick — the rows are streamed in keyset-
+	// paginated batches (WHERE id::text > $cursor ORDER BY id::text ASC LIMIT
+	// customDomainScanBatchLimit) rather than one unbounded SELECT.
+	//
+	// 100 (small) because each row triggers per-domain network work in the
+	// reconcile loop — a DNS TXT lookup or an HTTP HEAD probe (each with its own
+	// timeout). A tight batch keeps each tick's burst of outbound lookups/probes
+	// bounded so a large non-terminal set cannot fan out thousands of concurrent
+	// network calls in one tick.
+	//
+	// Keyset over OFFSET: the (id::text > $cursor) predicate rides the
+	// custom_domains PK, is restart-safe, and never re-scans or drifts under the
+	// concurrent status flips the reconciler performs (a row advanced to a
+	// terminal status — live/failed — drops out of the predicate; the cursor
+	// never revisits it).
+	customDomainScanBatchLimit = 100
 )
 
 // CustomDomainReconcileArgs is the periodic-job payload. Empty — every run is
@@ -357,26 +376,50 @@ func (w *CustomDomainReconciler) lookupTXT(parent context.Context, hostname, tok
 // matches the order the dashboard already uses, but the worker doesn't depend
 // on order — it's purely for log readability.
 func (w *CustomDomainReconciler) listActiveDomains(ctx context.Context) ([]activeCustomDomain, error) {
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, hostname, verification_token, status, created_at
-		FROM custom_domains
-		WHERE status NOT IN ($1, $2)
-		ORDER BY created_at ASC
-	`, statusLive, statusFailed)
-	if err != nil {
-		return nil, fmt.Errorf("listActiveDomains: query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
+	// Keyset-paginate the non-terminal-domain scan: page through the WHOLE
+	// non-terminal set in bounded batches, advancing the cursor by the last
+	// id::text and stopping on a short page. Every non-terminal domain is still
+	// returned (and reconciled by the caller) — only the per-fetch result set
+	// is bounded. The ORDER BY moves from created_at to id::text: the caller
+	// does not depend on order (it was "purely for log readability"), and the
+	// id keyset is the only ride-the-PK, restart-safe cursor.
 	var out []activeCustomDomain
-	for rows.Next() {
-		var d activeCustomDomain
-		if err := rows.Scan(&d.id, &d.hostname, &d.token, &d.status, &d.createdAt); err != nil {
-			return nil, fmt.Errorf("listActiveDomains: scan: %w", err)
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id, hostname, verification_token, status, created_at
+			FROM custom_domains
+			WHERE status NOT IN ($1, $2)
+			  AND id::text > $3
+			ORDER BY id::text ASC
+			LIMIT $4
+		`, statusLive, statusFailed, lastID, customDomainScanBatchLimit)
+		if err != nil {
+			return nil, fmt.Errorf("listActiveDomains: query: %w", err)
 		}
-		out = append(out, d)
+
+		batchCount := 0
+		for rows.Next() {
+			var d activeCustomDomain
+			if err := rows.Scan(&d.id, &d.hostname, &d.token, &d.status, &d.createdAt); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("listActiveDomains: scan: %w", err)
+			}
+			batchCount++
+			lastID = d.id.String()
+			out = append(out, d)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("listActiveDomains: rows: %w", rowsErr)
+		}
+		_ = rows.Close()
+		// Short page → the non-terminal-domain set is drained; stop.
+		if batchCount < customDomainScanBatchLimit {
+			break
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // markVerified is the equivalent of models.MarkCustomDomainVerified. Sets
