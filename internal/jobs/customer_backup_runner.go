@@ -62,6 +62,7 @@ import (
 	"instant.dev/common/crypto"
 	"instant.dev/worker/internal/apiclient"
 	"instant.dev/worker/internal/circuit"
+	"instant.dev/worker/internal/metrics"
 )
 
 // CustomerBackupRunnerArgs holds no fields — periodic job.
@@ -302,6 +303,9 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	// Retention sweep at end of run. A failure here doesn't unwind the
 	// successful uploads from the same tick.
 	w.runRetentionSweep(ctx)
+	// Count cap: keep only the last N healthy backups per resource (retire
+	// older ones even if within the tier's time window). 2026-06-03 request.
+	w.runKeepLastNSweep(ctx)
 
 	// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG. The
 	// runner is invoked per River batch; the steady state in prod is
@@ -410,17 +414,17 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	// or malformed ciphertext is a hard failure since we can't safely
 	// dump from a guess.
 	if !p.connURL.Valid || p.connURL.String == "" {
-		w.markFailed(ctx, p.backupID, "resource.connection_url is empty", start, p)
+		w.markFailed(ctx, p.backupID, "config", "resource.connection_url is empty", start, p)
 		return false
 	}
 	aesKey, keyErr := crypto.ParseAESKey(w.aesKey)
 	if keyErr != nil {
-		w.markFailed(ctx, p.backupID, fmt.Sprintf("AES key invalid: %v", keyErr), start, p)
+		w.markFailed(ctx, p.backupID, "config", fmt.Sprintf("AES key invalid: %v", keyErr), start, p)
 		return false
 	}
 	plainConn, decErr := crypto.Decrypt(aesKey, p.connURL.String)
 	if decErr != nil {
-		w.markFailed(ctx, p.backupID, fmt.Sprintf("decrypt connection_url: %v", decErr), start, p)
+		w.markFailed(ctx, p.backupID, "decrypt", fmt.Sprintf("decrypt connection_url: %v", decErr), start, p)
 		return false
 	}
 
@@ -479,7 +483,7 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	// actionable: "pg_dump: connection refused" vs "pipe: io: read/write
 	// on closed pipe").
 	if dumpErr != nil {
-		w.markFailed(ctx, p.backupID, fmt.Sprintf("pg_dump failed: %v", dumpErr), start, p)
+		w.markFailed(ctx, p.backupID, backupFailReason(dumpErr), fmt.Sprintf("pg_dump failed: %v", dumpErr), start, p)
 		// Best-effort cleanup of a half-written object so we don't pay
 		// for orphan bytes; failure to delete is logged but not fatal.
 		if delErr := w.store.DeleteObject(parentCtx, w.bucket, objectKey); delErr != nil {
@@ -489,7 +493,7 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 		return false
 	}
 	if upErr != nil {
-		w.markFailed(ctx, p.backupID, fmt.Sprintf("S3 upload failed: %v", upErr), start, p)
+		w.markFailed(ctx, p.backupID, "upload", fmt.Sprintf("S3 upload failed: %v", upErr), start, p)
 		return false
 	}
 
@@ -540,6 +544,7 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 			})
 	}
 
+	metrics.CustomerBackupSucceededTotal.Inc()
 	slog.Info("jobs.customer_backup_runner.succeeded",
 		"backup_id", p.backupID,
 		"resource_id", p.resourceID,
@@ -558,8 +563,55 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 // the api's internal refund endpoint so the team's daily counter is
 // credited. Scheduled backups don't burn the manual-counter so no
 // refund is needed.
+// backupFailReason classifies a pg_dump failure into "auth" (the credential
+// was rejected — password auth failed, missing role, no password supplied:
+// credential drift that will NOT self-heal and is SLA-relevant) vs "dump" (any
+// other pg_dump failure — DB briefly unreachable, timeout: transient, retried
+// next run). The match is on Postgres' own error text, lower-cased so it's
+// resilient to surrounding formatting.
+func backupFailReason(err error) string {
+	if err == nil {
+		return "dump"
+	}
+	s := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(s, "password authentication failed"),
+		strings.Contains(s, "authentication failed"),
+		strings.Contains(s, "no password supplied"),
+		strings.Contains(s, "role") && strings.Contains(s, "does not exist"),
+		strings.Contains(s, "permission denied for"):
+		return "auth"
+	default:
+		return "dump"
+	}
+}
+
+// sanitizedBackupFailure maps an internal failure reason to a customer-safe,
+// actionable message. It deliberately contains NO internal host/IP, per-tenant
+// role name, or raw pg_dump stderr — that detail stays in the worker log only.
+// This string is what lands in resource_backups.error_summary, the failure
+// email, and the customer-visible backup-health surface.
+func sanitizedBackupFailure(reason string) string {
+	switch reason {
+	case "auth":
+		return "We couldn't authenticate to your database to take this backup. " +
+			"Our team has been alerted and is investigating — no action is needed from you."
+	case "decrypt", "config":
+		return "This backup couldn't run due to an internal configuration issue. " +
+			"Our team has been alerted — no action is needed from you."
+	case "dump":
+		return "We couldn't read your database for this backup (it may have been " +
+			"briefly unreachable). We'll automatically try again on the next scheduled run."
+	case "upload":
+		return "The backup was created but couldn't be stored. " +
+			"We'll automatically try again on the next scheduled run."
+	default:
+		return "This backup didn't complete. Our team has been alerted."
+	}
+}
+
 func (w *CustomerBackupRunnerWorker) markFailed(
-	ctx context.Context, backupID, errSummary string, start time.Time,
+	ctx context.Context, backupID, reason, internalDetail string, start time.Time,
 	p struct {
 		backupID     string
 		resourceID   string
@@ -571,6 +623,18 @@ func (w *CustomerBackupRunnerWorker) markFailed(
 		teamID       uuid.NullUUID
 	},
 ) {
+	// Observability: count by reason so an SLA-relevant credential/auth drift
+	// (reason="auth", PAGE) is distinguishable from a transient dump/upload
+	// failure (retried next run). NR alert: customer-backup-failed.json.
+	metrics.CustomerBackupFailedTotal.WithLabelValues(reason).Inc()
+
+	// Two summaries: a SANITIZED, user-safe one persisted to the DB + audit
+	// (it surfaces on the customer's failure email and the backup-health
+	// dashboard), and the FULL internalDetail kept only in the worker log
+	// (NR Logs, ops-only). Never persist raw pg_dump stderr — it leaks the
+	// internal host/IP and per-tenant role name to the customer.
+	publicSummary := sanitizedBackupFailure(reason)
+
 	// Use a fresh ctx with a small timeout so a parentCtx-already-cancelled
 	// path still gets the row updated.
 	dbCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -582,7 +646,7 @@ func (w *CustomerBackupRunnerWorker) markFailed(
 		       finished_at = now(),
 		       error_summary = $2
 		 WHERE id = $1
-	`, backupID, errSummary); err != nil {
+	`, backupID, publicSummary); err != nil {
 		slog.Error("jobs.customer_backup_runner.mark_failed_db_error",
 			"backup_id", backupID, "error", err)
 	}
@@ -592,15 +656,18 @@ func (w *CustomerBackupRunnerWorker) markFailed(
 		w.writeAudit(dbCtx, p.teamID.UUID, p.resourceID, p.resourceType,
 			auditKindBackupFailed, "Backup failed", map[string]any{
 				"backup_id":        backupID,
-				"error_summary":    errSummary,
+				"error_summary":    publicSummary,
+				"reason":           reason,
 				"duration_seconds": int(duration.Seconds()),
 				"tier":             p.tier.String,
 			})
 	}
 
+	// Full internal detail — including raw pg_dump stderr — stays HERE only.
 	slog.Error("jobs.customer_backup_runner.failed",
 		"backup_id", backupID,
-		"error_summary", errSummary,
+		"reason", reason,
+		"internal_detail", internalDetail,
 		"duration_ms", duration.Milliseconds(),
 	)
 
@@ -732,6 +799,69 @@ func (w *CustomerBackupRunnerWorker) runRetentionSweep(ctx context.Context) {
 			slog.Info("jobs.customer_backup_runner.retention_swept",
 				"tier", tier, "deleted", len(victims))
 		}
+	}
+}
+
+// keepHealthyBackupsPerResource caps how many successful backups are retained
+// per resource. Beyond this count, the OLDEST ok backups are retired (S3
+// object deleted + row soft-flagged) even if still inside the tier's
+// time-based retention window — "only keep the last N healthy backups"
+// (2026-06-03 operator request).
+const keepHealthyBackupsPerResource = 5
+
+// runKeepLastNSweep retires every status='ok' backup that is NOT among the
+// keepHealthyBackupsPerResource most-recent ok backups for its resource. It
+// reuses runRetentionSweep's retire mechanism: delete the S3 object, then
+// soft-flag the row (s3_key=NULL so the api list/restore surfaces drop it).
+// The error_summary marker distinguishes count-cap retirement from the
+// time-based 'retained:expired'. Fail-soft per victim — an S3 or DB blip on
+// one row never blocks the rest of the sweep.
+func (w *CustomerBackupRunnerWorker) runKeepLastNSweep(ctx context.Context) {
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT id::text, s3_key FROM (
+			SELECT id, s3_key,
+			       row_number() OVER (PARTITION BY resource_id ORDER BY created_at DESC) AS rn
+			  FROM resource_backups
+			 WHERE status = 'ok' AND s3_key IS NOT NULL
+		) ranked
+		WHERE rn > $1
+		LIMIT 500
+	`, keepHealthyBackupsPerResource)
+	if err != nil {
+		slog.Warn("jobs.customer_backup_runner.keep_last_n_query_failed", "error", err)
+		return
+	}
+	type victim struct{ id, s3Key string }
+	var victims []victim
+	for rows.Next() {
+		var v victim
+		if scanErr := rows.Scan(&v.id, &v.s3Key); scanErr != nil {
+			slog.Warn("jobs.customer_backup_runner.keep_last_n_scan_failed", "error", scanErr)
+			continue
+		}
+		victims = append(victims, v)
+	}
+	_ = rows.Close()
+
+	for _, v := range victims {
+		if delErr := w.store.DeleteObject(ctx, w.bucket, v.s3Key); delErr != nil {
+			slog.Warn("jobs.customer_backup_runner.keep_last_n_s3_delete_failed",
+				"s3_key", v.s3Key, "error", delErr)
+			continue
+		}
+		if _, updErr := w.db.ExecContext(ctx, `
+			UPDATE resource_backups
+			   SET s3_key = NULL,
+			       error_summary = 'retained:count-cap'
+			 WHERE id = $1
+		`, v.id); updErr != nil {
+			slog.Warn("jobs.customer_backup_runner.keep_last_n_db_update_failed",
+				"backup_id", v.id, "error", updErr)
+		}
+	}
+	if len(victims) > 0 {
+		slog.Info("jobs.customer_backup_runner.keep_last_n_swept",
+			"retired", len(victims), "keep", keepHealthyBackupsPerResource)
 	}
 }
 
