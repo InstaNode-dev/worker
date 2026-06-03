@@ -184,6 +184,16 @@ const (
 	// (a ghcr.io outage that wedged many builds at once) is drained over
 	// several ticks rather than spamming the k8s API in one burst.
 	orphanStuckBuildBatchLimit = 25
+
+	// orphanLiveIDsBatchLimit caps how many ids fetchLiveStackIDs pulls per
+	// round-trip. The full live-id set is still materialized into the
+	// returned map (PASS 5 needs the complete set to decide orphan-hood),
+	// but the rows are streamed in keyset-paginated batches rather than one
+	// unbounded SELECT — bounding the server-side cursor + per-fetch memory
+	// so a stacks table that grows to tens of thousands of rows cannot
+	// pin a multi-MB result set in one allocation. Keyset (id > $1 ORDER BY
+	// id) is restart-safe and index-friendly (PK scan, no OFFSET drift).
+	orphanLiveIDsBatchLimit = 1000
 )
 
 // customerNamespacePrefix is the prefix of every per-resource customer
@@ -946,23 +956,61 @@ func (w *OrphanSweepReconciler) sweepOrphanedStackNamespaces(ctx context.Context
 // status — even a terminal-status stacks row pins its namespace so the
 // per-stack teardown path owns the delete. The pass is a strict "no row at
 // all = orphan" sweep.
+//
+// Batching (bug bash 2026-06-03): the previous `SELECT id::text FROM stacks`
+// loaded the ENTIRE stacks table into one result set/allocation. This now
+// streams the ids in keyset-paginated batches of orphanLiveIDsBatchLimit
+// (WHERE id > $1 ORDER BY id LIMIT $2), so the server-side cursor + per-fetch
+// memory stay bounded regardless of table size. The complete set is still
+// returned — PASS 5 must see every live id to avoid deleting a live
+// namespace — but it is assembled incrementally rather than in one shot.
+//
+// Keyset over OFFSET: an OFFSET sweep re-scans skipped rows each page and can
+// skip/duplicate ids if rows are inserted/deleted mid-sweep; the (id > last)
+// predicate rides the primary-key index and is stable under concurrent writes
+// (a brand-new stack id either sorts after the cursor — seen this sweep — or
+// before it — already seen; either way it lands in the set). Newly-inserted
+// stacks during the sweep are the conservative case for PASS 5 anyway: a
+// missed live id can only ever PRESERVE a namespace, never wrongly delete one.
 func (w *OrphanSweepReconciler) fetchLiveStackIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := w.db.QueryContext(ctx, `SELECT id::text FROM stacks`)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
 	out := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if scanErr := rows.Scan(&id); scanErr != nil {
-			return nil, scanErr
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id::text
+			  FROM stacks
+			 WHERE id::text > $1
+			 ORDER BY id::text ASC
+			 LIMIT $2
+		`, lastID, orphanLiveIDsBatchLimit)
+		if err != nil {
+			return nil, err
 		}
-		if id != "" {
-			out[id] = true
+		batchCount := 0
+		for rows.Next() {
+			var id string
+			if scanErr := rows.Scan(&id); scanErr != nil {
+				_ = rows.Close()
+				return nil, scanErr
+			}
+			batchCount++
+			lastID = id
+			if id != "" {
+				out[id] = true
+			}
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return nil, rowsErr
+		}
+		_ = rows.Close()
+		// A short page (fewer rows than the limit) means we've drained the
+		// table — the last keyset query returned the tail. Stop.
+		if batchCount < orphanLiveIDsBatchLimit {
+			break
 		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ── PASS 6 — stuck-build detection (2026-05-20) ──────────────────────────

@@ -701,7 +701,8 @@ func TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace(t *testing.T) {
 	// PASS 4 (no customer namespaces — fake returns empty; short-circuits).
 	// PASS 5: live-stack-ids query returns ONLY liveStackID → orphanNS is
 	// the orphan.
-	mock.ExpectQuery(`SELECT id::text FROM stacks`).
+	mock.ExpectQuery(`SELECT id::text\s+FROM stacks\s+WHERE id::text > \$1\s+ORDER BY id::text ASC\s+LIMIT \$2`).
+		WithArgs("", orphanLiveIDsBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(liveStackID))
 
 	lister := newFakeNamespaceLister().withStackNamespaces(liveNS, orphanNS)
