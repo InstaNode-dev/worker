@@ -68,6 +68,31 @@ var (
 		Help: "Resource heartbeat probe attempts by type and outcome",
 	}, []string{"resource_type", "outcome"})
 
+	// CustomerBackupFailedTotal counts customer (per-tenant) backup runs that
+	// failed, labelled by reason so an SLA-relevant credential/auth drift is
+	// distinguishable from a transient timeout:
+	//   auth    — pg_dump rejected the credential (password auth failed / role
+	//             missing). Credential drift between the stored connection_url
+	//             and the live DB role. SLA-relevant; PAGE (P1) — won't self-heal.
+	//   decrypt — connection_url could not be decrypted (AES key mismatch).
+	//   config  — empty connection_url / invalid AES key (misconfiguration).
+	//   dump    — pg_dump failed for a non-auth reason (DB briefly unreachable);
+	//             transient, retried on the next scheduled run.
+	//   upload  — snapshot produced but S3 upload failed; transient.
+	// NR alert: customer-backup-failed.json. Prom: instant-backups group.
+	CustomerBackupFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_customer_backup_failed_total",
+		Help: "Customer backup runs that failed, by reason (auth|decrypt|config|dump|upload). auth = credential drift, SLA-relevant.",
+	}, []string{"reason"})
+
+	// CustomerBackupSucceededTotal counts customer backup runs that completed
+	// and were durably stored in S3. Paired with CustomerBackupFailedTotal to
+	// compute a per-window success ratio on the backup-health dashboard.
+	CustomerBackupSucceededTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_customer_backup_succeeded_total",
+		Help: "Customer backup runs that completed and were stored in S3.",
+	})
+
 	// ResourceDegradedGauge is sampled at the end of each heartbeat run.
 	// Labelled by resource_type so the dashboard can break down "how many
 	// of my Postgres instances are unreachable right now".
