@@ -90,7 +90,7 @@ func TestCustomDomain_ListActiveDomains_QueryAndScanErrors(t *testing.T) {
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
 	mock.ExpectQuery(`SELECT id, hostname, verification_token, status, created_at`).
-		WithArgs(statusLive, statusFailed).
+		WithArgs(statusLive, statusFailed, "", customDomainScanBatchLimit).
 		WillReturnError(errors.New("query boom"))
 	r := &CustomDomainReconciler{db: db}
 	if _, err := r.listActiveDomains(context.Background()); err == nil {
@@ -101,7 +101,7 @@ func TestCustomDomain_ListActiveDomains_QueryAndScanErrors(t *testing.T) {
 	db2, mock2, _ := sqlmock.New()
 	defer db2.Close()
 	mock2.ExpectQuery(`SELECT id, hostname`).
-		WithArgs(statusLive, statusFailed).
+		WithArgs(statusLive, statusFailed, "", customDomainScanBatchLimit).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("not-a-uuid"))
 	r2 := &CustomDomainReconciler{db: db2}
 	if _, err := r2.listActiveDomains(context.Background()); err == nil {
@@ -115,7 +115,7 @@ func TestCustomDomain_Work_Empty(t *testing.T) {
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
 	mock.ExpectQuery(`SELECT id, hostname`).
-		WithArgs(statusLive, statusFailed).
+		WithArgs(statusLive, statusFailed, "", customDomainScanBatchLimit).
 		WillReturnRows(newCDRows())
 	r := &CustomDomainReconciler{db: db}
 	if err := r.Work(context.Background(), customDomainJob()); err != nil {
@@ -127,7 +127,7 @@ func TestCustomDomain_Work_ListError(t *testing.T) {
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
 	mock.ExpectQuery(`SELECT id, hostname`).
-		WithArgs(statusLive, statusFailed).
+		WithArgs(statusLive, statusFailed, "", customDomainScanBatchLimit).
 		WillReturnError(errors.New("boom"))
 	r := &CustomDomainReconciler{db: db}
 	if err := r.Work(context.Background(), customDomainJob()); err == nil {
@@ -150,7 +150,7 @@ func TestCustomDomain_Work_AllArms(t *testing.T) {
 	now := time.Now()
 
 	mock.ExpectQuery(`SELECT id, hostname`).
-		WithArgs(statusLive, statusFailed).
+		WithArgs(statusLive, statusFailed, "", customDomainScanBatchLimit).
 		WillReturnRows(newCDRows().
 			AddRow(idPending, "pending.example.com", "tok-pending", statusPending, now).
 			AddRow(idCert, "cert.example.com", "tok-cert", statusCertReady, now).

@@ -62,6 +62,26 @@ const quotaWallDedupeWindow = 24 * time.Hour
 // late enough that the user has a real signal it matters.
 const quotaWallThresholdPercent = 80
 
+// quotaWallNudgeScanBatchLimit caps how many team rows the wall-nudge scan
+// pulls per round-trip. The scan still evaluates the WHOLE eligible team set
+// every tick — the rows are streamed in keyset-paginated batches (WHERE
+// id::text > $cursor ORDER BY id::text ASC LIMIT quotaWallNudgeScanBatchLimit)
+// rather than one unbounded SELECT, so a platform with tens of thousands of
+// paid teams cannot pin a multi-MB result set in one allocation.
+//
+// 1000 — a cheap scan (id + plan_tier projection); the per-team work (a dedupe
+// read + a few aggregate evaluations) is each its own round-trip and is gated
+// independently, so a 1000-row page drains the team table in a few batches
+// without holding a large result set open across all the per-team queries.
+//
+// Keyset over OFFSET: the (id::text > $cursor) predicate rides the teams PK,
+// is restart-safe, and never re-scans or drifts under concurrent team
+// insert/delete. plan_tier flips (upgrade/downgrade) between pages only change
+// whether a team is in-scope; a missed/duplicated team only ever costs one
+// extra/skipped nudge evaluation (idempotent — at most one row per team per
+// 24h via the dedupe window), never a wrong write.
+const quotaWallNudgeScanBatchLimit = 1000
+
 // quotaWallKind is the audit_log.kind value written by this job. The API
 // endpoint filters audit_log on this exact string. Constant so a typo
 // in either side surfaces at compile time, not silently at runtime.
@@ -112,72 +132,90 @@ func (w *QuotaWallNudgeWorker) Work(ctx context.Context, job *river.Job[QuotaWal
 	ctx, span := otel.Tracer("instant.dev/worker").Start(ctx, "job.quota_wall_nudge")
 	defer span.End()
 
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, plan_tier
-		FROM teams
-		WHERE plan_tier NOT IN ('team', 'anonymous', 'free')
-		ORDER BY id
-	`)
-	if err != nil {
-		return fmt.Errorf("QuotaWallNudgeWorker: list teams: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
 	scanned, nudged, skipped := 0, 0, 0
 
-	for rows.Next() {
-		var (
-			teamIDStr string
-			tier      string
-		)
-		if scanErr := rows.Scan(&teamIDStr, &tier); scanErr != nil {
-			slog.Error("jobs.quota_wall_nudge.scan_error", "error", scanErr)
-			continue
-		}
-		scanned++
-
-		teamID, parseErr := uuid.Parse(teamIDStr)
-		if parseErr != nil {
-			slog.Error("jobs.quota_wall_nudge.invalid_uuid", "id", teamIDStr, "error", parseErr)
-			continue
-		}
-
-		recentlyNudged, dedupeErr := w.teamRecentlyNudged(ctx, teamID)
-		if dedupeErr != nil {
-			slog.Error("jobs.quota_wall_nudge.dedupe_query_failed",
-				"team_id", teamID, "error", dedupeErr)
-			continue
-		}
-		if recentlyNudged {
-			skipped++
-			continue
+	// Keyset-paginate the eligible-team scan: page through the WHOLE in-scope
+	// team set in bounded batches, advancing the cursor by the last id::text
+	// and stopping on a short page. Every eligible team is still evaluated this
+	// tick — only the per-fetch result set is bounded so the per-team nested
+	// queries don't run while one giant team result set is held open.
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id, plan_tier
+			FROM teams
+			WHERE plan_tier NOT IN ('team', 'anonymous', 'free')
+			  AND id::text > $1
+			ORDER BY id::text ASC
+			LIMIT $2
+		`, lastID, quotaWallNudgeScanBatchLimit)
+		if err != nil {
+			return fmt.Errorf("QuotaWallNudgeWorker: list teams: %w", err)
 		}
 
-		hit, hitErr := w.evaluateTeam(ctx, teamID, tier)
-		if hitErr != nil {
-			slog.Error("jobs.quota_wall_nudge.evaluate_failed",
-				"team_id", teamID, "tier", tier, "error", hitErr)
-			continue
-		}
-		if hit == nil {
-			continue
-		}
+		batchCount := 0
+		for rows.Next() {
+			var (
+				teamIDStr string
+				tier      string
+			)
+			if scanErr := rows.Scan(&teamIDStr, &tier); scanErr != nil {
+				slog.Error("jobs.quota_wall_nudge.scan_error", "error", scanErr)
+				continue
+			}
+			batchCount++
+			lastID = teamIDStr
+			scanned++
 
-		if insertErr := w.insertNearWallRow(ctx, teamID, hit); insertErr != nil {
-			slog.Error("jobs.quota_wall_nudge.insert_failed",
-				"team_id", teamID, "tier", tier, "error", insertErr)
-			continue
+			teamID, parseErr := uuid.Parse(teamIDStr)
+			if parseErr != nil {
+				slog.Error("jobs.quota_wall_nudge.invalid_uuid", "id", teamIDStr, "error", parseErr)
+				continue
+			}
+
+			recentlyNudged, dedupeErr := w.teamRecentlyNudged(ctx, teamID)
+			if dedupeErr != nil {
+				slog.Error("jobs.quota_wall_nudge.dedupe_query_failed",
+					"team_id", teamID, "error", dedupeErr)
+				continue
+			}
+			if recentlyNudged {
+				skipped++
+				continue
+			}
+
+			hit, hitErr := w.evaluateTeam(ctx, teamID, tier)
+			if hitErr != nil {
+				slog.Error("jobs.quota_wall_nudge.evaluate_failed",
+					"team_id", teamID, "tier", tier, "error", hitErr)
+				continue
+			}
+			if hit == nil {
+				continue
+			}
+
+			if insertErr := w.insertNearWallRow(ctx, teamID, hit); insertErr != nil {
+				slog.Error("jobs.quota_wall_nudge.insert_failed",
+					"team_id", teamID, "tier", tier, "error", insertErr)
+				continue
+			}
+			nudged++
+			slog.Info("jobs.quota_wall_nudge.wrote_row",
+				"team_id", teamID,
+				"tier", tier,
+				"axis", hit.Axis,
+				"percent_used", hit.PercentUsed,
+			)
 		}
-		nudged++
-		slog.Info("jobs.quota_wall_nudge.wrote_row",
-			"team_id", teamID,
-			"tier", tier,
-			"axis", hit.Axis,
-			"percent_used", hit.PercentUsed,
-		)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("QuotaWallNudgeWorker: rows error: %w", err)
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return fmt.Errorf("QuotaWallNudgeWorker: rows error: %w", rowsErr)
+		}
+		_ = rows.Close()
+		// Short page → the eligible-team set is drained; stop.
+		if batchCount < quotaWallNudgeScanBatchLimit {
+			break
+		}
 	}
 
 	var jobID int64
