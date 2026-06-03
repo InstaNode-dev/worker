@@ -28,6 +28,24 @@ import (
 // services, ingress, and TLS cert forever with no DB pointer.
 const ExpireStacksNamespacePrefix = "instant-stack-"
 
+// expireStacksScanBatchLimit caps how many expired-stack rows the reaper's
+// batch SELECT pulls per round-trip. The reaper still processes the WHOLE
+// expired set every tick — the rows are streamed in keyset-paginated batches
+// (WHERE id::text > $cursor ORDER BY id::text ASC LIMIT
+// expireStacksScanBatchLimit) rather than one unbounded SELECT.
+//
+// 50 (small) because each expired stack triggers a real in-cluster k8s
+// namespace DELETE (tearing down pods + service + ingress + TLS cert) before
+// the row is removed — a tight batch keeps each tick's burst of k8s API
+// DELETEs bounded so a large backlog cannot thundering-herd the API server in
+// one tick.
+//
+// Keyset over OFFSET: the (id::text > $cursor) predicate rides the primary
+// key, is restart-safe, and never re-scans or drifts under the concurrent row
+// DELETEs the reaper performs (a deleted/reaped stack drops out of the
+// expired predicate; the cursor never revisits it).
+const expireStacksScanBatchLimit = 50
+
 // saTokenFile / saCAFile are the in-cluster ServiceAccount projected-volume
 // paths. They are package vars (not consts) ONLY so tests can point them at
 // a temp file to exercise the in-cluster HTTP teardown path; production never
@@ -108,9 +126,9 @@ func deleteK8sNamespace(ctx context.Context, client *http.Client, namespace, nsP
 // and tears down their k8s namespaces when running inside the cluster.
 type ExpireStacksWorker struct {
 	river.WorkerDefaults[ExpireStacksArgs]
-	db           *sql.DB
-	k8sClient    *http.Client // nil when not in-cluster; namespace teardown is skipped
-	nsPrefix     string       // expected namespace prefix, e.g. "instant-apps-"
+	db        *sql.DB
+	k8sClient *http.Client // nil when not in-cluster; namespace teardown is skipped
+	nsPrefix  string       // expected namespace prefix, e.g. "instant-apps-"
 }
 
 // NewExpireStacksWorker constructs an ExpireStacksWorker.
@@ -129,35 +147,54 @@ func NewExpireStacksWorker(db *sql.DB, nsPrefix string) *ExpireStacksWorker {
 func (w *ExpireStacksWorker) Work(ctx context.Context, job *river.Job[ExpireStacksArgs]) error {
 	start := time.Now()
 
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id::text, slug, namespace
-		FROM stacks
-		WHERE expires_at IS NOT NULL
-		  AND expires_at < now()
-		  AND status NOT IN ('deleted', 'deleting', 'failed', 'stopped')
-	`)
-	if err != nil {
-		return fmt.Errorf("ExpireStacksWorker: query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
 	type expiredStack struct {
 		id        string
 		slug      string
 		namespace string
 	}
+
+	// Keyset-paginate the expired-stack scan: page through the WHOLE expired
+	// set in bounded batches, advancing the cursor by the last id::text and
+	// stopping on a short page. Every expired stack is still collected (and
+	// torn down below) — only the per-fetch result set is bounded.
 	var expired []expiredStack
-	for rows.Next() {
-		var s expiredStack
-		if err := rows.Scan(&s.id, &s.slug, &s.namespace); err != nil {
-			return fmt.Errorf("ExpireStacksWorker: scan failed: %w", err)
+	lastID := "" // keyset cursor: empty string sorts before every real id
+	for {
+		rows, err := w.db.QueryContext(ctx, `
+			SELECT id::text, slug, namespace
+			FROM stacks
+			WHERE expires_at IS NOT NULL
+			  AND expires_at < now()
+			  AND status NOT IN ('deleted', 'deleting', 'failed', 'stopped')
+			  AND id::text > $1
+			ORDER BY id::text ASC
+			LIMIT $2
+		`, lastID, expireStacksScanBatchLimit)
+		if err != nil {
+			return fmt.Errorf("ExpireStacksWorker: query failed: %w", err)
 		}
-		expired = append(expired, s)
+
+		batchCount := 0
+		for rows.Next() {
+			var s expiredStack
+			if err := rows.Scan(&s.id, &s.slug, &s.namespace); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("ExpireStacksWorker: scan failed: %w", err)
+			}
+			batchCount++
+			lastID = s.id
+			expired = append(expired, s)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("ExpireStacksWorker: rows error: %w", err)
+		}
+		_ = rows.Close()
+		// Short page → the expired-stack set is drained; stop.
+		if batchCount < expireStacksScanBatchLimit {
+			break
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("ExpireStacksWorker: rows error: %w", err)
-	}
-	_ = rows.Close()
 
 	var deleted int
 	for _, s := range expired {
