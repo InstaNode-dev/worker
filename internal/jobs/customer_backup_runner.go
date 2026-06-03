@@ -303,6 +303,9 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 	// Retention sweep at end of run. A failure here doesn't unwind the
 	// successful uploads from the same tick.
 	w.runRetentionSweep(ctx)
+	// Count cap: keep only the last N healthy backups per resource (retire
+	// older ones even if within the tier's time window). 2026-06-03 request.
+	w.runKeepLastNSweep(ctx)
 
 	// T21 P1-1 (BugBash 2026-05-20): idle-tick demoted INFO→DEBUG. The
 	// runner is invoked per River batch; the steady state in prod is
@@ -796,6 +799,69 @@ func (w *CustomerBackupRunnerWorker) runRetentionSweep(ctx context.Context) {
 			slog.Info("jobs.customer_backup_runner.retention_swept",
 				"tier", tier, "deleted", len(victims))
 		}
+	}
+}
+
+// keepHealthyBackupsPerResource caps how many successful backups are retained
+// per resource. Beyond this count, the OLDEST ok backups are retired (S3
+// object deleted + row soft-flagged) even if still inside the tier's
+// time-based retention window — "only keep the last N healthy backups"
+// (2026-06-03 operator request).
+const keepHealthyBackupsPerResource = 5
+
+// runKeepLastNSweep retires every status='ok' backup that is NOT among the
+// keepHealthyBackupsPerResource most-recent ok backups for its resource. It
+// reuses runRetentionSweep's retire mechanism: delete the S3 object, then
+// soft-flag the row (s3_key=NULL so the api list/restore surfaces drop it).
+// The error_summary marker distinguishes count-cap retirement from the
+// time-based 'retained:expired'. Fail-soft per victim — an S3 or DB blip on
+// one row never blocks the rest of the sweep.
+func (w *CustomerBackupRunnerWorker) runKeepLastNSweep(ctx context.Context) {
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT id::text, s3_key FROM (
+			SELECT id, s3_key,
+			       row_number() OVER (PARTITION BY resource_id ORDER BY created_at DESC) AS rn
+			  FROM resource_backups
+			 WHERE status = 'ok' AND s3_key IS NOT NULL
+		) ranked
+		WHERE rn > $1
+		LIMIT 500
+	`, keepHealthyBackupsPerResource)
+	if err != nil {
+		slog.Warn("jobs.customer_backup_runner.keep_last_n_query_failed", "error", err)
+		return
+	}
+	type victim struct{ id, s3Key string }
+	var victims []victim
+	for rows.Next() {
+		var v victim
+		if scanErr := rows.Scan(&v.id, &v.s3Key); scanErr != nil {
+			slog.Warn("jobs.customer_backup_runner.keep_last_n_scan_failed", "error", scanErr)
+			continue
+		}
+		victims = append(victims, v)
+	}
+	_ = rows.Close()
+
+	for _, v := range victims {
+		if delErr := w.store.DeleteObject(ctx, w.bucket, v.s3Key); delErr != nil {
+			slog.Warn("jobs.customer_backup_runner.keep_last_n_s3_delete_failed",
+				"s3_key", v.s3Key, "error", delErr)
+			continue
+		}
+		if _, updErr := w.db.ExecContext(ctx, `
+			UPDATE resource_backups
+			   SET s3_key = NULL,
+			       error_summary = 'retained:count-cap'
+			 WHERE id = $1
+		`, v.id); updErr != nil {
+			slog.Warn("jobs.customer_backup_runner.keep_last_n_db_update_failed",
+				"backup_id", v.id, "error", updErr)
+		}
+	}
+	if len(victims) > 0 {
+		slog.Info("jobs.customer_backup_runner.keep_last_n_swept",
+			"retired", len(victims), "keep", keepHealthyBackupsPerResource)
 	}
 }
 
