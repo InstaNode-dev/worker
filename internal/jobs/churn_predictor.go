@@ -87,14 +87,14 @@ const churnInactivityWindow = 7 * 24 * time.Hour
 // churnDedupeWindow is the minimum gap between two churn.risk_flagged
 // rows for the same team. 30 days is the brief's window. Rationale:
 //
-//   * Slower than 30d would let a team get re-flagged month after month
+//   - Slower than 30d would let a team get re-flagged month after month
 //     without intervention — operationally noisy and emotionally
 //     repetitive ("you again missed us") for the customer.
-//   * Faster than 30d (e.g. weekly) would risk sending the same
+//   - Faster than 30d (e.g. weekly) would risk sending the same
 //     "we miss you" copy four times in a month to a customer who has
 //     decided not to return; the perception cost (spammy) outweighs
 //     the recall benefit.
-//   * 30d also aligns with monthly billing cycles — most B2B SaaS
+//   - 30d also aligns with monthly billing cycles — most B2B SaaS
 //     reactivation playbooks rate-limit on a monthly cadence for the
 //     same reason.
 //
@@ -210,6 +210,7 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 			)
 		LEFT JOIN resources r ON r.team_id = t.id AND r.status = 'active'
 		WHERE t.plan_tier != 'team'
+		  AND NOT t.is_test_cohort
 		  AND NOT EXISTS (
 			SELECT 1 FROM audit_log f
 			WHERE f.team_id = t.id
@@ -300,10 +301,10 @@ func (w *ChurnPredictorWorker) Work(ctx context.Context, job *river.Job[ChurnPre
 		// the brief enumerated lives here: tier, last_activity_days_ago,
 		// active_resource_count, email.
 		meta := map[string]any{
-			"tier":                    r.planTier,
-			"last_activity_days_ago":  daysSince,
-			"active_resource_count":   r.activeResourceCount,
-			"email":                   r.ownerEmail.String,
+			"tier":                   r.planTier,
+			"last_activity_days_ago": daysSince,
+			"active_resource_count":  r.activeResourceCount,
+			"email":                  r.ownerEmail.String,
 		}
 		metaBytes, mErr := churnMetaMarshal(meta)
 		if mErr != nil {

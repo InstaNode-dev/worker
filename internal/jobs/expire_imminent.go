@@ -167,6 +167,7 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 		  AND r.expires_at IS NOT NULL
 		  AND r.expires_at > $1
 		  AND r.expires_at < $2
+		  AND `+testCohortNotExistsClause("r.team_id")+`
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM audit_log al
@@ -303,4 +304,3 @@ func (w *ExpireImminentWorker) Work(ctx context.Context, job *river.Job[ExpireIm
 	)
 	return nil
 }
-

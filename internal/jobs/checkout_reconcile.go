@@ -148,9 +148,10 @@ func (w *CheckoutReconcileWorker) Work(ctx context.Context, job *river.Job[Check
 
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT subscription_id, team_id, customer_email, plan_tier
-		FROM pending_checkouts
+		FROM pending_checkouts pc
 		WHERE resolved_at IS NULL
 		  AND failure_notified_at IS NULL
+		  AND `+testCohortNotExistsClause("pc.team_id")+`
 		  AND created_at < $1
 		ORDER BY created_at ASC
 		LIMIT $2

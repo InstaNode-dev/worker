@@ -158,6 +158,11 @@ func ensureSchema(t *testing.T, db *sql.DB) {
 		)`,
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS plan_tier TEXT NOT NULL DEFAULT 'hobby'`,
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`,
+		// is_test_cohort (api migration 067) — the synthetic-cohort skip-guard
+		// flag every team-iterating job filters on. Idempotent add so the harness
+		// works against a bare DB AND a fully api-migrated one.
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS is_test_cohort BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`,
 
 		// resources — the entitlement reconciler reads tier / applied_conn_limit.
 		`CREATE TABLE IF NOT EXISTS resources (
@@ -174,6 +179,50 @@ func ensureSchema(t *testing.T, db *sql.DB) {
 		)`,
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS applied_conn_limit INT`,
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS provider_resource_id TEXT`,
+		// Columns the cohort-guarded quota / expiry-warning scans project.
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS storage_bytes BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS name TEXT`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS reminders_sent INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS expiry_reminded_at TIMESTAMPTZ`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS key_prefix TEXT`,
+
+		// users — the expiry-warning + weekly-digest scans join the team's
+		// primary user for the recipient address.
+		`CREATE TABLE IF NOT EXISTS users (
+			id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id    UUID REFERENCES teams(id) ON DELETE CASCADE,
+			email      TEXT NOT NULL,
+			is_primary BOOLEAN NOT NULL DEFAULT false,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT false`,
+
+		// pending_checkouts — the checkout reconciler + billing orphan sweep scan
+		// this; both carry team_id for the cohort guard.
+		`CREATE TABLE IF NOT EXISTS pending_checkouts (
+			subscription_id     TEXT PRIMARY KEY,
+			team_id             UUID REFERENCES teams(id) ON DELETE CASCADE,
+			customer_email      TEXT,
+			plan_tier           TEXT,
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+			resolved_at         TIMESTAMPTZ,
+			failure_notified_at TIMESTAMPTZ
+		)`,
+
+		// payment_grace_periods — the dunning reminder + terminator scan this;
+		// both carry team_id for the cohort guard.
+		`CREATE TABLE IF NOT EXISTS payment_grace_periods (
+			id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id          UUID REFERENCES teams(id) ON DELETE CASCADE,
+			subscription_id  TEXT,
+			status           TEXT NOT NULL DEFAULT 'active',
+			started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+			expires_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+			last_reminder_at TIMESTAMPTZ,
+			reminders_sent   INT NOT NULL DEFAULT 0,
+			terminated_at    TIMESTAMPTZ
+		)`,
 
 		// deployments — the status reconciler + failure autopsy round-trip here.
 		`CREATE TABLE IF NOT EXISTS deployments (

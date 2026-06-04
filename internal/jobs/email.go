@@ -120,6 +120,7 @@ func (w *WeeklyDigestWorker) Work(ctx context.Context, job *river.Job[WeeklyDige
 		FROM users u
 		JOIN teams t ON t.id = u.team_id
 		WHERE t.plan_tier != 'anonymous'
+		  AND NOT t.is_test_cohort
 		  AND NOT EXISTS (
 		    SELECT 1 FROM audit_log a
 		    WHERE a.team_id = t.id
@@ -228,11 +229,12 @@ func (w *WeeklyDigestWorker) buildResourceDigestCounts(ctx context.Context, team
 // to if a per-row count is missing.
 //
 // Metadata shape — buildDigestWeekly (event_email_mapping.go) reads these:
-//   email                   — recipient address (also the forwarder's resolver)
-//   team_name               — display name for the email greeting (may be "")
-//   total_active_resources  — sum across all resource_types; 0 means "empty week"
-//   resource_breakdown      — JSON-encoded array of {resource_type, count}
-//                             (templates that don't render a table can ignore)
+//
+//	email                   — recipient address (also the forwarder's resolver)
+//	team_name               — display name for the email greeting (may be "")
+//	total_active_resources  — sum across all resource_types; 0 means "empty week"
+//	resource_breakdown      — JSON-encoded array of {resource_type, count}
+//	                          (templates that don't render a table can ignore)
 func emitWeeklyDigestAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, email, teamName string, stats []DigestResourceCount) error {
 	var total int64
 	for _, s := range stats {
@@ -268,4 +270,3 @@ func emitWeeklyDigestAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, em
 	}
 	return nil
 }
-

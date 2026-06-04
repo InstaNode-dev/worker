@@ -113,10 +113,11 @@ func (w *PaymentGraceReminderWorker) Work(ctx context.Context, job *river.Job[Pa
 	// first so a backlog drains in FIFO order.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, team_id, expires_at
-		FROM payment_grace_periods
+		FROM payment_grace_periods pgp
 		WHERE status = 'active'
 		  AND expires_at > $1
 		  AND (last_reminder_at IS NULL OR last_reminder_at < $2)
+		  AND `+testCohortNotExistsClause("pgp.team_id")+`
 		ORDER BY last_reminder_at ASC NULLS FIRST, started_at ASC
 		LIMIT $3
 	`, now, cutoff, paymentGraceReminderBatchLimit)
@@ -186,9 +187,9 @@ func (w *PaymentGraceReminderWorker) Work(ctx context.Context, job *river.Job[Pa
 
 		hoursRemaining := math.Round(r.expiresAt.Sub(now).Hours()*10) / 10
 		meta := map[string]any{
-			"grace_id":         r.id.String(),
-			"hours_remaining":  hoursRemaining,
-			"grace_ends_at":    r.expiresAt.UTC().Format(time.RFC3339),
+			"grace_id":        r.id.String(),
+			"hours_remaining": hoursRemaining,
+			"grace_ends_at":   r.expiresAt.UTC().Format(time.RFC3339),
 		}
 		metaBytes, mErr := graceReminderMetaMarshal(meta)
 		if mErr != nil {

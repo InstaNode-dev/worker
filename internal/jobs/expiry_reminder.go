@@ -181,6 +181,7 @@ func (w *ExpiryReminderWorker) Work(ctx context.Context, job *river.Job[ExpiryRe
 		WHERE r.team_id IS NOT NULL
 		  AND r.tier = 'free'
 		  AND r.status = 'active'
+		  AND `+testCohortNotExistsClause("r.team_id")+`
 		  AND r.expires_at IS NOT NULL
 		  AND r.expires_at > $1
 		  AND r.expires_at <= $2
