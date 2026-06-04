@@ -63,7 +63,8 @@ func SeedTeamWithSubscription(t *testing.T, db *sql.DB, planTier, subscriptionID
 		 VALUES ($1, $2, $3, 'active', $4)`,
 		id, "itest-bill-"+id.String()[24:], planTier, subscriptionID,
 	); err != nil {
-		t.Fatalf("SeedTeamWithSubscription: %v", err)
+		tFatalf(t, "SeedTeamWithSubscription: %v", err)
+		return uuid.Nil
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM teams WHERE id = $1`, id)
@@ -84,7 +85,8 @@ func SetTeamSubscription(t *testing.T, db *sql.DB, teamID uuid.UUID, subscriptio
 		`UPDATE teams SET stripe_customer_id = $1 WHERE id = $2`,
 		subscriptionID, teamID,
 	); err != nil {
-		t.Fatalf("SetTeamSubscription: %v", err)
+		tFatalf(t, "SetTeamSubscription: %v", err)
+		return
 	}
 }
 
@@ -97,7 +99,8 @@ func TeamPlanTier(t *testing.T, db *sql.DB, teamID uuid.UUID) string {
 	if err := db.QueryRow(
 		`SELECT plan_tier FROM teams WHERE id = $1`, teamID,
 	).Scan(&tier); err != nil {
-		t.Fatalf("TeamPlanTier: %v", err)
+		tFatalf(t, "TeamPlanTier: %v", err)
+		return ""
 	}
 	return tier
 }
@@ -110,7 +113,8 @@ func TeamStatus(t *testing.T, db *sql.DB, teamID uuid.UUID) string {
 	if err := db.QueryRow(
 		`SELECT status FROM teams WHERE id = $1`, teamID,
 	).Scan(&status); err != nil {
-		t.Fatalf("TeamStatus: %v", err)
+		tFatalf(t, "TeamStatus: %v", err)
+		return ""
 	}
 	return status
 }
@@ -129,7 +133,8 @@ func CountAuditLogByTeam(t *testing.T, db *sql.DB, teamID uuid.UUID, kind string
 		`SELECT count(*) FROM audit_log WHERE team_id = $1 AND kind = $2`,
 		teamID, kind,
 	).Scan(&n); err != nil {
-		t.Fatalf("CountAuditLogByTeam: %v", err)
+		tFatalf(t, "CountAuditLogByTeam: %v", err)
+		return 0
 	}
 	return n
 }
@@ -152,7 +157,8 @@ func SeedTeamPendingDeletion(t *testing.T, db *sql.DB, planTier string, graceEla
 		INSERT INTO teams (id, name, plan_tier, status, stripe_customer_id, deletion_requested_at)
 		VALUES ($1, $2, $3, 'deletion_requested', $4, $5)
 	`, id, "itest-del-"+id.String()[:8], planTier, "sub_"+id.String()[:12], requestedAt); err != nil {
-		t.Fatalf("SeedTeamPendingDeletion: %v", err)
+		tFatalf(t, "SeedTeamPendingDeletion: %v", err)
+		return uuid.Nil
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM teams WHERE id = $1`, id)
@@ -177,7 +183,8 @@ func SeedResourceWithSecret(t *testing.T, db *sql.DB, teamID uuid.UUID, resource
 		"postgres://itest-secret@localhost:5432/db_"+id.String()[:8],
 		"prefix-"+id.String()[:8]+"/",
 	); err != nil {
-		t.Fatalf("SeedResourceWithSecret: %v", err)
+		tFatalf(t, "SeedResourceWithSecret: %v", err)
+		return uuid.Nil
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM resources WHERE id = $1`, id)
@@ -193,7 +200,8 @@ func ResourceSecretFields(t *testing.T, db *sql.DB, id uuid.UUID) (connURL sql.N
 	if err := db.QueryRow(
 		`SELECT connection_url, COALESCE(key_prefix, '') FROM resources WHERE id = $1`, id,
 	).Scan(&connURL, &keyPrefix); err != nil {
-		t.Fatalf("ResourceSecretFields: %v", err)
+		tFatalf(t, "ResourceSecretFields: %v", err)
+		return sql.NullString{}, ""
 	}
 	return connURL, keyPrefix
 }
@@ -225,7 +233,8 @@ func SeedUser(t *testing.T, db *sql.DB, teamID uuid.UUID, email string) uuid.UUI
 		`, id, teamID, email)
 	}
 	if err != nil {
-		t.Fatalf("SeedUser: %v", err)
+		tFatalf(t, "SeedUser: %v", err)
+		return uuid.Nil
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM users WHERE id = $1`, id)
@@ -241,7 +250,8 @@ func UserEmail(t *testing.T, db *sql.DB, id uuid.UUID) string {
 	if err := db.QueryRow(
 		`SELECT email FROM users WHERE id = $1`, id,
 	).Scan(&email); err != nil {
-		t.Fatalf("UserEmail: %v", err)
+		tFatalf(t, "UserEmail: %v", err)
+		return ""
 	}
 	return email
 }
