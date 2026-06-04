@@ -100,9 +100,9 @@ type Config struct {
 	// post-cutover. The actual SDK path is the same minio-go client either
 	// way (DO Spaces speaks the S3 API natively) — the env var lets ops flip
 	// behavior (e.g. retention windows, bucket names) without a code change.
-	ObjectStoreBackend  string // OBJECT_STORE_BACKEND — "minio" (default) | "do-spaces"
-	BackupS3Bucket      string // BACKUP_S3_BUCKET — defaults to ObjectStoreBucket if empty
-	BackupS3PathPrefix  string // BACKUP_S3_PATH_PREFIX — defaults to "backups/"
+	ObjectStoreBackend string // OBJECT_STORE_BACKEND — "minio" (default) | "do-spaces"
+	BackupS3Bucket     string // BACKUP_S3_BUCKET — defaults to ObjectStoreBucket if empty
+	BackupS3PathPrefix string // BACKUP_S3_PATH_PREFIX — defaults to "backups/"
 
 	// PlatformBackupS3Prefix is the inner prefix under
 	// BACKUP_S3_PATH_PREFIX for platform DB dumps. Distinct from the
@@ -151,6 +151,22 @@ type Config struct {
 	DeployProbeBaseURL     string // DEPLOY_PROBE_BASE_URL — default https://api.instanode.dev
 	DeployProbeDeployHost  string // DEPLOY_PROBE_DEPLOY_HOST — default deployment.instanode.dev
 	DeployProbeBearerToken string // DEPLOY_PROBE_BEARER_TOKEN — probe-team session JWT (required)
+
+	// Continuous-monitoring synthetic flow runner (flow_synthetic.go) — runs a
+	// matrix of P0 flows against prod, emits the instant_flow_test_* metrics +
+	// the InstantFlowTest NR event, and pushes the green/red matrix dashboard.
+	// INERT unless FlowSyntheticEnabled is true (the master flag) — a single env
+	// flip turns the whole layer off. JWTSecret mints the Brevo-free session JWT
+	// (plan §1.1); it reuses JWT_SECRET (the same value the api verifies against).
+	// FlowSyntheticTeamEnabled stays OFF until Team is GA
+	// (project_team_plan_not_rolled_out_no_payment.md).
+	FlowSyntheticEnabled     bool   // FLOW_SYNTHETIC_ENABLED — master flag (default false)
+	FlowSyntheticTeamEnabled bool   // FLOW_SYNTHETIC_TEAM_ENABLED — Team-tier flows (default false)
+	FlowSyntheticBaseURL     string // FLOW_SYNTHETIC_BASE_URL — default https://api.instanode.dev
+	FlowSyntheticEmail       string // FLOW_SYNTHETIC_EMAIL — synthetic team primary-user email
+	FlowSyntheticTier        string // FLOW_SYNTHETIC_TIER — seeded tier (default free)
+	FlowSyntheticDisabled    string // FLOW_SYNTHETIC_DISABLED — comma list of per-flow kill switches
+	FlowSyntheticJWTSecret   string // JWT_SECRET — shared with api; mints the synthetic session JWT
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -180,24 +196,24 @@ func require(key string) string {
 // Load reads configuration from environment variables. Panics on missing required fields.
 func Load() *Config {
 	cfg := &Config{
-		DatabaseURL:       require("DATABASE_URL"),
-		RedisURL:          getenv("REDIS_URL", "redis://localhost:6379"),
-		ProvisionerAddr:   os.Getenv("PROVISIONER_ADDR"),
-		ProvisionerSecret: os.Getenv("PROVISIONER_SECRET"),
-		EmailProvider:     os.Getenv("EMAIL_PROVIDER"),
-		BrevoAPIKey:       os.Getenv("BREVO_API_KEY"),
-		BrevoTemplateIDs:  parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
-		BrevoSenderEmail:  os.Getenv("BREVO_SENDER_EMAIL"),
-		BrevoSenderName:   os.Getenv("BREVO_SENDER_NAME"),
-		SESAWSRegion:      os.Getenv("SES_AWS_REGION"),
-		SESAWSAccessKey:   os.Getenv("SES_AWS_ACCESS_KEY_ID"),
-		SESAWSSecretKey:   os.Getenv("SES_AWS_SECRET_ACCESS_KEY"),
-		SESFromEmail:      os.Getenv("SES_FROM_EMAIL"),
-		SESTemplateNames:  parseSESTemplateNames(os.Getenv("SES_TEMPLATE_NAMES")),
-		Environment:       getenv("ENVIRONMENT", "development"),
-		MaxMindLicenseKey: os.Getenv("MAXMIND_LICENSE_KEY"),
-		GeoLite2DBPath:    getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
-		PlansPath:         os.Getenv("PLANS_PATH"),
+		DatabaseURL:          require("DATABASE_URL"),
+		RedisURL:             getenv("REDIS_URL", "redis://localhost:6379"),
+		ProvisionerAddr:      os.Getenv("PROVISIONER_ADDR"),
+		ProvisionerSecret:    os.Getenv("PROVISIONER_SECRET"),
+		EmailProvider:        os.Getenv("EMAIL_PROVIDER"),
+		BrevoAPIKey:          os.Getenv("BREVO_API_KEY"),
+		BrevoTemplateIDs:     parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
+		BrevoSenderEmail:     os.Getenv("BREVO_SENDER_EMAIL"),
+		BrevoSenderName:      os.Getenv("BREVO_SENDER_NAME"),
+		SESAWSRegion:         os.Getenv("SES_AWS_REGION"),
+		SESAWSAccessKey:      os.Getenv("SES_AWS_ACCESS_KEY_ID"),
+		SESAWSSecretKey:      os.Getenv("SES_AWS_SECRET_ACCESS_KEY"),
+		SESFromEmail:         os.Getenv("SES_FROM_EMAIL"),
+		SESTemplateNames:     parseSESTemplateNames(os.Getenv("SES_TEMPLATE_NAMES")),
+		Environment:          getenv("ENVIRONMENT", "development"),
+		MaxMindLicenseKey:    os.Getenv("MAXMIND_LICENSE_KEY"),
+		GeoLite2DBPath:       getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
+		PlansPath:            os.Getenv("PLANS_PATH"),
 		ObjectStoreEndpoint:  os.Getenv("OBJECT_STORE_ENDPOINT"),
 		ObjectStoreAccessKey: os.Getenv("OBJECT_STORE_ACCESS_KEY"),
 		ObjectStoreSecretKey: os.Getenv("OBJECT_STORE_SECRET_KEY"),
@@ -253,6 +269,19 @@ func Load() *Config {
 		DeployProbeBaseURL:     os.Getenv("DEPLOY_PROBE_BASE_URL"),
 		DeployProbeDeployHost:  os.Getenv("DEPLOY_PROBE_DEPLOY_HOST"),
 		DeployProbeBearerToken: os.Getenv("DEPLOY_PROBE_BEARER_TOKEN"),
+
+		// Continuous-monitoring synthetic flow runner. INERT unless
+		// FLOW_SYNTHETIC_ENABLED=true (default off, the DoD habit). JWTSecret
+		// reuses JWT_SECRET so the worker mints a Brevo-free session JWT the api
+		// verifies against. All other fields optional; defaults applied inside
+		// jobs.FlowSyntheticConfig.Defaults().
+		FlowSyntheticEnabled:     os.Getenv("FLOW_SYNTHETIC_ENABLED") == "true",
+		FlowSyntheticTeamEnabled: os.Getenv("FLOW_SYNTHETIC_TEAM_ENABLED") == "true",
+		FlowSyntheticBaseURL:     os.Getenv("FLOW_SYNTHETIC_BASE_URL"),
+		FlowSyntheticEmail:       os.Getenv("FLOW_SYNTHETIC_EMAIL"),
+		FlowSyntheticTier:        os.Getenv("FLOW_SYNTHETIC_TIER"),
+		FlowSyntheticDisabled:    os.Getenv("FLOW_SYNTHETIC_DISABLED"),
+		FlowSyntheticJWTSecret:   os.Getenv("JWT_SECRET"),
 	}
 
 	// Fall back to the shared object-store bucket when the operator hasn't
