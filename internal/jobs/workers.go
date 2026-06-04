@@ -7,15 +7,17 @@ import (
 	"log/slog"
 	"time"
 
-	madmin "github.com/minio/madmin-go/v3"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	madmin "github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/newrelic/go-agent/v3/newrelic"
 	"github.com/redis/go-redis/v9"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
+	"instant.dev/common/analyticsevent"
+	analyticsnr "instant.dev/common/analyticsevent/nr"
 	commonv1 "instant.dev/proto/common/v1"
 	"instant.dev/worker/internal/config"
 	"instant.dev/worker/internal/email"
@@ -97,11 +99,14 @@ const rescueStuckJobsAfter = 25 * time.Minute
 // (double lifecycle emails, double audit_log rows, double Razorpay spend).
 //
 // ByArgs:   uniqueness is scoped to the specific encoded args. The periodic
-//           sweep jobs all use a zero-field args struct, so this is mostly a
-//           belt-and-braces guard for any future job that varies its args.
+//
+//	sweep jobs all use a zero-field args struct, so this is mostly a
+//	belt-and-braces guard for any future job that varies its args.
+//
 // ByPeriod: a job is unique within one rounded period window — exactly the
-//           "one run per tick, not one per replica" guarantee we need. The
-//           period passed in is the job's own scheduling interval.
+//
+//	"one run per tick, not one per replica" guarantee we need. The
+//	period passed in is the job's own scheduling interval.
 //
 // River's default ByState set (available/completed/running/retryable/
 // scheduled) is intentionally kept — a tick that has already completed in
@@ -750,6 +755,38 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}),
 		nrApp,
 	))
+	// Continuous-monitoring synthetic flow runner (flow_synthetic.go). Every
+	// 5 minutes runs the P0 flow matrix (healthz / auth_me / provision→reap)
+	// against prod, emits instant_flow_test_* metrics + the InstantFlowTest NR
+	// custom event (the green/red matrix dashboard source), and reaps every
+	// resource it creates (rule-24 cleanup ledger). INERT unless
+	// FLOW_SYNTHETIC_ENABLED=true — a single env flip turns the whole layer off.
+	// The NR sink is the same *newrelic.Application the worker already holds,
+	// bridged through common/analyticsevent (Factory wraps it fail-open +
+	// PII-sanitizing); when NR is unconfigured Factory returns the noop emitter
+	// so the runner never blocks on analytics. See flow_synthetic.go for the
+	// per-flow assertions + the Brevo-free session-JWT mint.
+	// Override is always non-nil (analyticsnr.New never returns nil — a nil
+	// *newrelic.Application is permitted and yields a fail-open sink), so
+	// Factory's Override path returns (wrapped, nil) — the error is structurally
+	// unreachable here and discarded. (The error return exists for the
+	// Backend-string degrade ladder, which this call site doesn't use.)
+	flowEmitter, _ := analyticsevent.Factory(analyticsevent.Config{
+		Backend:  analyticsevent.BackendNewRelic,
+		Override: analyticsnr.New(nrApp),
+	})
+	river.AddWorker(workers, WithObservability(
+		NewFlowSyntheticWorker(db, nil, FlowSyntheticPromMetrics{}, flowEmitter, FlowSyntheticConfig{
+			Enabled:       cfg.FlowSyntheticEnabled,
+			TeamEnabled:   cfg.FlowSyntheticTeamEnabled,
+			BaseURL:       cfg.FlowSyntheticBaseURL,
+			JWTSecret:     cfg.FlowSyntheticJWTSecret,
+			Email:         cfg.FlowSyntheticEmail,
+			Tier:          cfg.FlowSyntheticTier,
+			DisabledFlows: splitFlowSyntheticDisabled(cfg.FlowSyntheticDisabled),
+		}),
+		nrApp,
+	))
 	// Razorpay webhook-events prune — daily DELETE of razorpay_webhook_events
 	// rows > 30d. The api appends one dedup row per Razorpay webhook delivery;
 	// migration 033 envisioned a periodic prune but never shipped one, so the
@@ -1337,6 +1374,21 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return DeployProbeArgs{}, reconcileInsertOpts(deployProbeInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: false},
+		),
+		// Continuous-monitoring synthetic flow runner — every 5 minutes.
+		// Runs the P0 flow matrix against prod. INERT unless
+		// FLOW_SYNTHETIC_ENABLED=true (the Work method no-ops first thing
+		// when the flag is off), so this periodic registration is always
+		// present but produces no traffic until the operator lights the flag.
+		// Routed to the reconcile queue (reconcileInsertOpts carries the
+		// UniqueOpts so replicas:2 doesn't double-run). RunOnStart=true so a
+		// worker restart immediately writes a baseline matrix row.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(flowSyntheticInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return FlowSyntheticArgs{}, reconcileInsertOpts(flowSyntheticInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
 		),
 		// Razorpay webhook-events prune — daily DELETE of dedup rows > 30d.
 		// RunOnStart=false: a restart shouldn't immediately scan; the table

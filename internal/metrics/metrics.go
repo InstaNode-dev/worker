@@ -793,6 +793,42 @@ var (
 		Help:    "Hourly deploy prober per-leg wall-clock latency. Buckets cover the per-leg budgets up to the 120s cold-cluster Kaniko ceiling.",
 		Buckets: []float64{0.5, 1, 5, 10, 30, 60, 90, 120},
 	}, []string{"leg"})
+
+	// FlowTestTotal — continuous-monitoring synthetic flow-matrix counters
+	// (flow_synthetic.go). One series per (flow, actor, tier, layer, result)
+	// so the NR matrix dashboard renders a green/red cell per flow×actor and
+	// the P0/P1 fail alerts FACET on result="fail". result="fail" is the
+	// alert-able signal — a P0 user flow (provision, login, deploy) broken in
+	// prod. LAZY *Vec: a series first appears at /metrics only after the
+	// runner observes it (i.e. when FLOW_SYNTHETIC_ENABLED is on).
+	// NR alert: flow-test-p0-fail.json / flow-test-p1-fail.json /
+	// flow-test-silent-death.json. Prom rule: FlowTestP0Fail in
+	// prometheus-rules.yaml. Emit site: flow_synthetic.go (FlowSyntheticPromMetrics).
+	FlowTestTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_flow_test_total",
+		Help: "Synthetic flow-matrix outcomes per flow/actor/tier/layer and result (pass|fail|degraded).",
+	}, []string{"flow", "actor", "tier", "layer", "result"})
+
+	// FlowTestLatencySeconds — per-flow end-to-end latency histogram. Only
+	// observed on a real response (DNS / TCP errors omit the observation so a
+	// sustained outage doesn't pile zeros into the bucket). Drives the p95
+	// latency-regression tile + alert. LAZY *Vec (see FlowTestTotal).
+	FlowTestLatencySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "instant_flow_test_latency_seconds",
+		Help:    "Synthetic flow-matrix per-flow end-to-end latency. Buckets span the per-flow budgets (50ms…30s).",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30},
+	}, []string{"flow", "actor", "tier", "layer"})
+
+	// FlowSyntheticReapedTotal — rule-24 cleanup-ledger counter. One series per
+	// (flow, outcome): outcome="reaped" is the happy path, outcome="leaked" is
+	// a DO/k8s resource leak (a real cost + the "never leak resources" promise
+	// breached) and MUST stay 0, outcome="skip" means the flow created nothing.
+	// NR alert: flow-synthetic-leak.json (outcome="leaked" ABOVE 0 → P2). Prom
+	// rule: FlowSyntheticLeak. Emit site: flow_synthetic.go.
+	FlowSyntheticReapedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_flow_synthetic_reaped_total",
+		Help: "Synthetic-runner resource reaps per flow and outcome (reaped|leaked|skip). leaked MUST stay 0.",
+	}, []string{"flow", "outcome"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check on this service.
