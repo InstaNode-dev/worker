@@ -316,6 +316,19 @@ func TestPropagation_ForUpdateSkipLockedIntegration(t *testing.T) {
 	ctx := context.Background()
 	teamID := uuid.New()
 	propID := uuid.New()
+	// pending_propagations.team_id carries a real FK to teams(id) in the api
+	// migration set (ON DELETE CASCADE). Against a fully-migrated DB (the
+	// non-short integration job's environment) the seed must reference a real
+	// team row or the INSERT fails the FK. Seed the parent team first; the FK
+	// cascade tidies the propagation row when the team is deleted in cleanup.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO teams (id) VALUES ($1)`, teamID,
+	); err != nil {
+		t.Fatalf("seed team: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM teams WHERE id = $1`, teamID)
+	})
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO pending_propagations
 			(id, kind, team_id, target_tier, payload, attempts, next_attempt_at, created_at)

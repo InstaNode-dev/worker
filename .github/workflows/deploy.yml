@@ -54,8 +54,109 @@ env:
   K8S_CONTAINER: worker
 
 jobs:
+  # ------------------------------------------------------------------
+  # GATING integration job (W2-T1) — two-gate rule mirror of ci.yml.
+  #
+  # The deploy.yml test step ("Run unit tests") runs `go test ./...
+  # -short`, under which every worker real-DB integration test SKIPS
+  # (testhelpers.SetupTestDB / *_integration_test.go guard on
+  # testing.Short()). So before this job, a broken integration
+  # round-trip could merge to master and DEPLOY — the deploy gate never
+  # ran the integration tests. Per project_api_two_test_gates_ci_and_deploy
+  # (root CLAUDE.md rule 15), a worker test-infra change must land in
+  # BOTH ci.yml and deploy.yml or the deploy wedges while PR CI stays
+  # green. `deploy` now `needs: integration`, so a red integration run
+  # blocks the build/rollout.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instant_dev_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Checkout proto sibling (replace ../proto)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: _proto_ci
+      - run: mv _proto_ci ../proto
+
+      - name: Checkout common sibling (replace ../common)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: _common_ci
+      - run: mv _common_ci ../common
+
+      - name: Checkout api sibling (for migrations + cross-repo tests)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: _api_ci
+          fetch-depth: 1
+      - run: mv _api_ci ../api
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Apply DB migrations to the test database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          if [ -d ../api/internal/db/migrations ]; then
+            for f in $(ls ../api/internal/db/migrations/*.sql | sort); do
+              echo "→ applying api migration $(basename "$f")"
+              psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null
+            done
+            echo "all api migrations applied to instant_dev_test"
+          else
+            echo "::error::no api migrations directory found at ../api/internal/db/migrations — integration tests would skip"
+            exit 1
+          fi
+          if [ -d sql ]; then
+            for f in $(ls sql/*.sql 2>/dev/null | sort); do
+              echo "→ applying worker migration $(basename "$f")"
+              psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null || echo "::warning::worker migration $(basename "$f") failed — likely overlap with api schema; continuing"
+            done
+          fi
+
+      - name: Run real-DB integration tests (NO -short, so they do not skip)
+        env:
+          INSTANT_API_REPO: ${{ github.workspace }}/../api
+        run: go test ./internal/... -run Integration -count=1 -p 1 -v
+
   deploy:
     runs-on: ubuntu-latest
+    needs: integration
     steps:
       - name: Checkout worker (this repo) into ./worker
         uses: actions/checkout@v6
