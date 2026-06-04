@@ -75,10 +75,15 @@ func (w *UpdateStorageBytesWorker) Work(ctx context.Context, job *river.Job[Upda
 		return nil
 	}
 
+	// Scan 'suspended' rows too, not just 'active' (sweep #3): a quota-suspended
+	// resource must keep being re-measured so the unsuspend loop can see its
+	// usage drop back under cap and restore access — the suspend email promises
+	// "access restored automatically once usage drops". Measuring only 'active'
+	// rows froze a suspended resource's storage_bytes, so it could never recover.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, token, resource_type, tier, COALESCE(provider_resource_id, '')
 		FROM resources
-		WHERE status = 'active'
+		WHERE status IN ('active', 'suspended')
 		  AND resource_type IN ('postgres', 'redis', 'mongodb', 'storage')
 		ORDER BY created_at
 	`)
