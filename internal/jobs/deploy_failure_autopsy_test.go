@@ -380,6 +380,71 @@ func TestCaptureDeploymentAutopsy_LastLinesJSONRoundtrip(t *testing.T) {
 	}
 }
 
+// TestEmitDeployFailedAudit_FirstTickInserts verifies that the first autopsy
+// tick for a deployment with no pre-existing deploy.failed audit row resolves
+// the team_id, runs the dedup EXISTS probe (false), then INSERTs the
+// deploy.failed audit row exactly once.
+func TestEmitDeployFailedAudit_FirstTickInserts(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	teamID := uuid.New()
+
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"team_id"}).AddRow(teamID))
+	// Dedup probe: no existing deploy.failed row for this deployment.
+	mock.ExpectQuery(`SELECT EXISTS`).
+		WithArgs(auditKindDeployFailed, id.String()).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`INSERT INTO audit_log`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := emitDeployFailedAudit(context.Background(), db, id, "ImagePullBackOff", "manifest unknown"); err != nil {
+		t.Fatalf("emitDeployFailedAudit (first tick): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEmitDeployFailedAudit_SecondTickIsNoOp verifies the idempotency guard:
+// when a deploy.failed audit row already exists for the deployment (e.g. the
+// api emitted it synchronously, or a prior autopsy tick did), a subsequent
+// tick runs the dedup EXISTS probe (true) and performs NO INSERT — so the
+// email forwarder never sends a duplicate failure email per reconciler tick.
+func TestEmitDeployFailedAudit_SecondTickIsNoOp(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	teamID := uuid.New()
+
+	mock.ExpectQuery(`SELECT team_id FROM deployments`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"team_id"}).AddRow(teamID))
+	// Dedup probe: a deploy.failed row already exists → emit must short-circuit.
+	mock.ExpectQuery(`SELECT EXISTS`).
+		WithArgs(auditKindDeployFailed, id.String()).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// NO ExpectExec(INSERT INTO audit_log) — a second INSERT would be an
+	// unmet/unexpected expectation and fail the test.
+
+	if err := emitDeployFailedAudit(context.Background(), db, id, "ImagePullBackOff", "manifest unknown"); err != nil {
+		t.Fatalf("emitDeployFailedAudit (second tick): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (duplicate INSERT?): %v", err)
+	}
+}
+
 // ── fakeAutopsyK8s stub ───────────────────────────────────────────────────────
 
 type fakeAutopsyK8s struct {
