@@ -82,14 +82,13 @@ func TestUpdateStorageBytesWorker_RemeasuresSuspendedRow(t *testing.T) {
 
 	suspendedID := "ffffffff-1111-2222-3333-444444444444"
 
-	// The scanner must include suspended rows. Assert the status args are
-	// exactly ('active','suspended') so a regression that drops 'suspended'
-	// fails here. The freshly-measured value (300 bytes — well under cap) is the
-	// value the unsuspend loop will later read to release the resource.
+	// The scanner must include suspended rows. Pin the WHERE clause to
+	// ('active', 'suspended') so a regression that drops 'suspended' fails here.
+	// The freshly-measured value (300 bytes — well under cap) is the value the
+	// unsuspend loop will later read to release the resource.
 	rows := sqlmock.NewRows([]string{"id", "token", "resource_type", "tier", "provider_resource_id"}).
 		AddRow(suspendedID, "tok-suspended", "postgres", "hobby", "")
-	mock.ExpectQuery(`SELECT id, token`).
-		WithArgs("active", "suspended", "", 1000).
+	mock.ExpectQuery(`WHERE status IN \('active', 'suspended'\)`).
 		WillReturnRows(rows)
 
 	mock.ExpectExec(`UPDATE resources SET storage_bytes`).
