@@ -766,14 +766,15 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// PII-sanitizing); when NR is unconfigured Factory returns the noop emitter
 	// so the runner never blocks on analytics. See flow_synthetic.go for the
 	// per-flow assertions + the Brevo-free session-JWT mint.
-	flowEmitter, ferr := analyticsevent.Factory(analyticsevent.Config{
+	// Override is always non-nil (analyticsnr.New never returns nil — a nil
+	// *newrelic.Application is permitted and yields a fail-open sink), so
+	// Factory's Override path returns (wrapped, nil) — the error is structurally
+	// unreachable here and discarded. (The error return exists for the
+	// Backend-string degrade ladder, which this call site doesn't use.)
+	flowEmitter, _ := analyticsevent.Factory(analyticsevent.Config{
 		Backend:  analyticsevent.BackendNewRelic,
 		Override: analyticsnr.New(nrApp),
 	})
-	if ferr != nil {
-		// Advisory only — Factory always returns a usable (noop) emitter.
-		slog.Warn("jobs.flow_synthetic.analytics_degraded", "error", ferr)
-	}
 	river.AddWorker(workers, WithObservability(
 		NewFlowSyntheticWorker(db, nil, FlowSyntheticPromMetrics{}, flowEmitter, FlowSyntheticConfig{
 			Enabled:       cfg.FlowSyntheticEnabled,

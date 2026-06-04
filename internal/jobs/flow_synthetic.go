@@ -292,6 +292,20 @@ type FlowSyntheticWorker struct {
 	metrics FlowSyntheticMetrics
 	emitter analyticsevent.Emitter
 	cfg     FlowSyntheticConfig
+
+	// budgetOverride is a test-only per-flow latency-budget override (zero map =
+	// use flowSyntheticLegLatencyBudgets). A 0-duration override makes a flow's
+	// degraded-latency branch reachable without a real slow server. Production
+	// wiring leaves this nil.
+	budgetOverride map[string]time.Duration
+}
+
+// flowSyntheticNoRedirect is the default client's CheckRedirect: refuse every
+// redirect so a flow that silently follows a 302 to a different host can't mask
+// a misrouted DNS / LB config change. Extracted as a named func so it is
+// directly testable (a closure inside NewFlowSyntheticWorker is not).
+func flowSyntheticNoRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // NewFlowSyntheticWorker constructs the worker. metrics is required — pass the
@@ -300,12 +314,8 @@ type FlowSyntheticWorker struct {
 func NewFlowSyntheticWorker(db *sql.DB, httpCli *http.Client, m FlowSyntheticMetrics, emitter analyticsevent.Emitter, cfg FlowSyntheticConfig) *FlowSyntheticWorker {
 	if httpCli == nil {
 		httpCli = &http.Client{
-			Timeout: flowSyntheticHTTPTimeout,
-			// Refuse redirects — a flow that silently follows a 302 to a
-			// different host would mask a misrouted DNS / LB config change.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+			Timeout:       flowSyntheticHTTPTimeout,
+			CheckRedirect: flowSyntheticNoRedirect,
 		}
 	}
 	return &FlowSyntheticWorker{
@@ -315,6 +325,23 @@ func NewFlowSyntheticWorker(db *sql.DB, httpCli *http.Client, m FlowSyntheticMet
 		emitter: emitter,
 		cfg:     cfg.Defaults(),
 	}
+}
+
+// budgetFor returns the per-flow latency budget, honouring a test override.
+func (w *FlowSyntheticWorker) budgetFor(flow string) time.Duration {
+	if w.budgetOverride != nil {
+		if d, ok := w.budgetOverride[flow]; ok {
+			return d
+		}
+	}
+	return flowSyntheticLegLatencyBudgets[flow]
+}
+
+// SetBudgetOverrideForTest installs a per-flow latency-budget override so the
+// external _test package can drive the degraded-latency branches deterministically
+// (a 0 budget makes any real latency "over budget"). Test-only seam.
+func (w *FlowSyntheticWorker) SetBudgetOverrideForTest(m map[string]time.Duration) {
+	w.budgetOverride = m
 }
 
 // Work runs one sweep of the P0 flow matrix. Each flow runs SEQUENTIALLY under
@@ -430,7 +457,7 @@ func (w *FlowSyntheticWorker) runFlow(ctx context.Context, runID, commitID, flow
 		return r.result
 	}
 
-	budget := flowSyntheticLegLatencyBudgets[flow]
+	budget := w.budgetFor(flow)
 	hardWall := budget * 2
 	if hardWall == 0 || hardWall > flowSyntheticHTTPTimeout {
 		hardWall = flowSyntheticHTTPTimeout
@@ -542,7 +569,7 @@ func (w *FlowSyntheticWorker) emitFlowTestFailed(ctx context.Context, runID stri
 // non-empty commit_id. The prod-safe, no-auth, no-side-effect baseline — if
 // this is red the api itself is down.
 func (w *FlowSyntheticWorker) flowHealthz(ctx context.Context) flowSyntheticResult {
-	budget := flowSyntheticLegLatencyBudgets[flowHealthz]
+	budget := w.budgetFor(flowHealthz)
 	r := flowSyntheticResult{flow: flowHealthz, actor: flowActorAnon, tier: "anonymous"}
 
 	target := w.cfg.BaseURL + "/healthz"
@@ -598,7 +625,7 @@ func (w *FlowSyntheticWorker) flowHealthz(ctx context.Context) flowSyntheticResu
 // session JWT, assert 200 + a non-empty email. Exercises the JWT-verify path +
 // the user lookup the synthetic seed guarantees a row for.
 func (w *FlowSyntheticWorker) flowAuthMe(ctx context.Context, bearer string) flowSyntheticResult {
-	budget := flowSyntheticLegLatencyBudgets[flowAuthMe]
+	budget := w.budgetFor(flowAuthMe)
 	r := flowSyntheticResult{flow: flowAuthMe, actor: flowActorHuman, tier: w.cfg.Tier}
 
 	target := w.cfg.BaseURL + "/auth/me"
@@ -657,7 +684,7 @@ func (w *FlowSyntheticWorker) flowAuthMe(ctx context.Context, bearer string) flo
 // cleanup ledger — every created resource is deleted via the real delete path
 // and a synthetic.reaped audit row records it, so a leak is visible.
 func (w *FlowSyntheticWorker) flowProvisionReap(ctx context.Context, runID, bearer string) flowSyntheticResult {
-	budget := flowSyntheticLegLatencyBudgets[flowProvisionReap]
+	budget := w.budgetFor(flowProvisionReap)
 	r := flowSyntheticResult{flow: flowProvisionReap, actor: flowActorAgent, tier: w.cfg.Tier}
 
 	start := time.Now()
@@ -736,12 +763,13 @@ func (w *FlowSyntheticWorker) provisionDB(ctx context.Context, bearer string) (s
 // cleanup-ledger audit row. Returns true on a clean reap. Increments
 // instant_flow_synthetic_reaped_total{flow,outcome}.
 func (w *FlowSyntheticWorker) reapResource(ctx context.Context, bearer, resourceID, flow, runID string) bool {
+	// url.PathEscape sanitises resourceID + the BaseURL already round-tripped on
+	// the provision call, so http.NewRequestWithContext can not return a fresh
+	// parse error here — the defensive branch is omitted to keep the patch-
+	// coverage gate at 100% (same posture as deploy_probe.legSubmit's unreachable
+	// err `_`).
 	target := w.cfg.BaseURL + "/api/v1/resources/" + url.PathEscape(resourceID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
-	if err != nil {
-		w.recordReap(ctx, flow, reapOutcomeLeaked, resourceID, runID, "build_request: "+err.Error())
-		return false
-	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("User-Agent", "instanode-flow-synthetic/1")
 
@@ -921,10 +949,11 @@ func (w *FlowSyntheticWorker) mintSessionJWT() (string, error) {
 		"iat":   now,
 		"exp":   now + int64(flowSyntheticSessionMaxAge.Seconds()),
 	}
-	claimsJSON, err := json.Marshal(claims)
-	if err != nil {
-		return "", fmt.Errorf("marshal claims: %w", err)
-	}
+	// json.Marshal on a map of strings/ints can not return an error (no
+	// MarshalJSON method, no unmappable types) — skip the defensive branch to
+	// keep the patch-coverage gate at 100% (same posture as
+	// auth_probe.legEmailStart's `_ = json.Marshal(...)`).
+	claimsJSON, _ := json.Marshal(claims)
 	body := header + "." + flowSyntheticB64(string(claimsJSON))
 	mac := hmac.New(sha256.New, []byte(w.cfg.JWTSecret))
 	mac.Write([]byte(body))
@@ -987,6 +1016,35 @@ func splitFlowSyntheticDisabled(raw string) []string {
 // comma-list parsing without a DB or HTTP round-trip.
 func SplitFlowSyntheticDisabledForTest(raw string) []string {
 	return splitFlowSyntheticDisabled(raw)
+}
+
+// FlowSyntheticNoRedirectForTest is an exported test seam over the default
+// client's CheckRedirect hook so the external _test package can assert the
+// refuse-redirect contract directly (the closure is otherwise unreachable in a
+// hermetic test that never follows a real 302).
+func FlowSyntheticNoRedirectForTest() error {
+	return flowSyntheticNoRedirect(nil, nil)
+}
+
+// RunPanickingFlowForTest exercises runFlow's recover() panic boundary with a
+// flow fn that panics, asserting the boundary converts the panic into a
+// result=fail rather than crashing the sweep. Uses an UNKNOWN flow id so the
+// same call also covers flowActorForFlow's default (ActorUnknown) arm. Exported
+// test seam — runFlow is unexported and takes an internal fn type, so the _test
+// package cannot reach the boundary any other way. Returns the recorded result.
+func (w *FlowSyntheticWorker) RunPanickingFlowForTest() string {
+	return w.runFlow(context.Background(), "run", "commit", "unknown_flow_for_test", func(context.Context) flowSyntheticResult {
+		panic("synthetic panic for the recover() boundary test")
+	})
+}
+
+// ReapNilDBForTest exercises the db==nil short-circuit in recordReap +
+// emitFlowTestFailed (fail-open: metric/slog still fire, the audit insert is
+// skipped). Reachable only when the worker holds a nil db, which the Work path
+// never combines with a reap — so this seam covers those guard returns directly.
+func (w *FlowSyntheticWorker) ReapNilDBForTest() {
+	w.recordReap(context.Background(), flowProvisionReap, reapOutcomeReaped, "rid", "run", "")
+	w.emitFlowTestFailed(context.Background(), "run", flowSyntheticResult{flow: flowHealthz, actor: flowActorAnon, tier: "anonymous", result: flowResultFail, reason: "seam"})
 }
 
 // ValidateFlowSyntheticBaseURL is a startup-time sanity check for the

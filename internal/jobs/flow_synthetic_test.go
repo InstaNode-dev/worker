@@ -768,6 +768,309 @@ func TestSplitFlowSyntheticDisabled(t *testing.T) {
 	}
 }
 
+// TestFlowSynthetic_BadBaseURL_BuildRequestFails drives every flow's
+// build_request error branch by passing a BaseURL with a control character so
+// http.NewRequestWithContext fails before any network call.
+func TestFlowSynthetic_BadBaseURL_BuildRequestFails(t *testing.T) {
+	// A real server only so the fixture has somewhere to point its client at;
+	// the worker's BaseURL is overridden to the bad URL below.
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+
+	cfg := enabledConfig(srv)
+	cfg.BaseURL = "http://bad\x7fhost" // control char → NewRequest parse error
+	f := newFixtureCfg(t, srv, cfg)
+	defer f.done()
+	expectSeed(f.mock)
+	// healthz + auth_me + provision all fail build_request → 3 audit rows.
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectOrphanSweepEmpty(f.mock)
+
+	f.run(t)
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+		if got := f.fm.resultFor(flow); got != analyticsevent.ResultFail {
+			t.Errorf("bad URL: flow %s want fail, got %q", flow, got)
+		}
+	}
+}
+
+// TestFlowSynthetic_HTTPError_AllFlowsFail points the runner at a closed port so
+// every flow's http_error branch fires (connection refused).
+func TestFlowSynthetic_HTTPError_AllFlowsFail(t *testing.T) {
+	// Bind then immediately close a server to get a definitely-dead address.
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // now deadURL refuses connections
+
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	cfg := enabledConfig(srv)
+	cfg.BaseURL = deadURL
+	f := newFixtureCfg(t, srv, cfg)
+	defer f.done()
+	expectSeed(f.mock)
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	expectOrphanSweepEmpty(f.mock)
+
+	f.run(t)
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+		if got := f.fm.resultFor(flow); got != analyticsevent.ResultFail {
+			t.Errorf("http_error: flow %s want fail, got %q", flow, got)
+		}
+	}
+}
+
+// TestFlowSynthetic_DegradedLatency drives every flow's over-budget branch via a
+// 0-duration budget override (any real latency exceeds it) — slow-but-correct
+// reports degraded, not fail/pass.
+func TestFlowSynthetic_DegradedLatency(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+
+	f := newFixture(t, srv)
+	defer f.done()
+	f.w.SetBudgetOverrideForTest(map[string]time.Duration{
+		"healthz": 0, "auth_me": 0, "provision_reap": 0,
+	})
+	expectSeed(f.mock)
+	expectReapAudit(f.mock) // provision_reap still reaps before the degraded check
+	expectOrphanSweepEmpty(f.mock)
+
+	f.run(t)
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+		if got := f.fm.resultFor(flow); got != "degraded" {
+			t.Errorf("0-budget: flow %s want degraded, got %q", flow, got)
+		}
+	}
+}
+
+// TestFlowSynthetic_ReapHTTPError covers reapResource's http_error branch: the
+// provision succeeds, but the DELETE handler hijacks the connection and closes
+// it without a response, so httpCli.Do returns a transport error → leaked.
+func TestFlowSynthetic_ReapHTTPError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"commit_id":"abc1234"}`))
+	})
+	mux.HandleFunc("/auth/me", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"email":"synthetic+flowtest@instanode.dev"}`))
+	})
+	mux.HandleFunc("/db/new", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"ok":true,"id":"11111111-1111-4111-8111-111111111111"}`))
+	})
+	// DELETE hijacks + closes the conn → client sees an EOF / transport error.
+	mux.HandleFunc("/api/v1/resources/", func(w http.ResponseWriter, _ *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := newFixtureCfg(t, srv, enabledConfig(srv))
+	defer f.done()
+	expectSeed(f.mock)
+	expectReapAudit(f.mock)                                                              // leaked ledger row
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // flow_test_failed (leak)
+	expectOrphanSweepEmpty(f.mock)
+
+	f.run(t)
+	if got := f.fm.resultFor("provision_reap"); got != analyticsevent.ResultFail {
+		t.Errorf("reap http_error: want provision_reap fail, got %q", got)
+	}
+	var leaked bool
+	for _, r := range f.fm.reapOutcomes() {
+		if r.outcome == "leaked" {
+			leaked = true
+		}
+	}
+	if !leaked {
+		t.Error("reap http_error: want a leaked reap outcome")
+	}
+}
+
+// TestFlowSynthetic_SeedSubErrors drives each ensureSyntheticTeam failure branch
+// (user insert, elevate, commit) so all return false → authed flows degrade.
+func TestFlowSynthetic_SeedSubErrors(t *testing.T) {
+	type step struct {
+		name  string
+		setup func(sqlmock.Sqlmock)
+	}
+	steps := []step{
+		{"user_insert", func(m sqlmock.Sqlmock) {
+			m.ExpectBegin()
+			m.ExpectExec(`INSERT INTO teams`).WillReturnResult(sqlmock.NewResult(0, 1))
+			m.ExpectExec(`INSERT INTO users`).WillReturnError(errSeed)
+			m.ExpectRollback()
+		}},
+		{"elevate", func(m sqlmock.Sqlmock) {
+			m.ExpectBegin()
+			m.ExpectExec(`INSERT INTO teams`).WillReturnResult(sqlmock.NewResult(0, 1))
+			m.ExpectExec(`INSERT INTO users`).WillReturnResult(sqlmock.NewResult(0, 1))
+			m.ExpectExec(`UPDATE resources`).WillReturnError(errSeed)
+			m.ExpectRollback()
+		}},
+		{"commit", func(m sqlmock.Sqlmock) {
+			m.ExpectBegin()
+			m.ExpectExec(`INSERT INTO teams`).WillReturnResult(sqlmock.NewResult(0, 1))
+			m.ExpectExec(`INSERT INTO users`).WillReturnResult(sqlmock.NewResult(0, 1))
+			m.ExpectExec(`UPDATE resources`).WillReturnResult(sqlmock.NewResult(0, 0))
+			m.ExpectCommit().WillReturnError(errSeed)
+		}},
+	}
+	for _, s := range steps {
+		t.Run(s.name, func(t *testing.T) {
+			srv := newFlowAPIServer(happyFlowState())
+			defer srv.Close()
+			f := newFixture(t, srv)
+			defer f.done()
+			s.setup(f.mock)
+			expectOrphanSweepEmpty(f.mock)
+
+			f.run(t)
+			if got := f.fm.resultFor("auth_me"); got != "degraded" {
+				t.Errorf("%s seed fail: auth_me want degraded, got %q", s.name, got)
+			}
+		})
+	}
+}
+
+// TestFlowSynthetic_SeedBeginError covers the BeginTx failure branch.
+func TestFlowSynthetic_SeedBeginError(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	f := newFixture(t, srv)
+	defer f.done()
+	f.mock.ExpectBegin().WillReturnError(errSeed)
+	expectOrphanSweepEmpty(f.mock)
+
+	f.run(t)
+	if got := f.fm.resultFor("healthz"); got != analyticsevent.ResultPass {
+		t.Errorf("begin-error: anon healthz should still pass, got %q", got)
+	}
+}
+
+// TestFlowSynthetic_OrphanUpdateError covers the per-row UPDATE failure branch
+// in reapOrphans (a leaked outcome on the backstop).
+func TestFlowSynthetic_OrphanUpdateError(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	f := newFixture(t, srv)
+	defer f.done()
+	expectSeed(f.mock)
+	expectReapAudit(f.mock)
+	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("88888888-8888-4888-8888-888888888888"))
+	f.mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).WillReturnError(errSeed)
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // leaked ledger
+
+	f.run(t)
+	var leaked bool
+	for _, r := range f.fm.reapOutcomes() {
+		if r.flow == "orphan_sweep" && r.outcome == "leaked" {
+			leaked = true
+		}
+	}
+	if !leaked {
+		t.Error("orphan UPDATE error: want orphan_sweep leaked outcome")
+	}
+}
+
+// TestFlowSynthetic_OrphanScanError covers reapOrphans' rows.Scan error branch:
+// a returned row with TWO columns can't scan into the single &id destination
+// ("expected 2 destination arguments in Scan, not 1"), so the per-row scan
+// errors and the loop `continue`s.
+func TestFlowSynthetic_OrphanScanError(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	f := newFixture(t, srv)
+	defer f.done()
+	expectSeed(f.mock)
+	expectReapAudit(f.mock)
+	// Two columns vs the single Scan(&id) destination → Scan error per row.
+	rows := sqlmock.NewRows([]string{"id", "extra"}).AddRow("77777777-7777-4777-8777-777777777777", "x")
+	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).WillReturnRows(rows)
+
+	f.run(t) // must not panic; the scan-error branch logs + continues
+}
+
+// TestFlowSynthetic_OrphanRowsError covers reapOrphans' rows.Err() branch via an
+// injected RowError surfaced after iteration.
+func TestFlowSynthetic_OrphanRowsError(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	f := newFixture(t, srv)
+	defer f.done()
+	expectSeed(f.mock)
+	expectReapAudit(f.mock)
+	rows := sqlmock.NewRows([]string{"id"}).AddRow("66666666-6666-4666-8666-666666666666").RowError(0, errSeed)
+	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).WillReturnRows(rows)
+
+	f.run(t) // must not panic; the rows.Err() branch logs + returns
+}
+
+// TestFlowSyntheticNoRedirect covers the default client's CheckRedirect hook.
+func TestFlowSyntheticNoRedirect(t *testing.T) {
+	if err := jobs.FlowSyntheticNoRedirectForTest(); err != http.ErrUseLastResponse {
+		t.Errorf("CheckRedirect: want ErrUseLastResponse, got %v", err)
+	}
+}
+
+// TestFlowSynthetic_PanicBoundary covers runFlow's recover() boundary (a
+// panicking flow becomes result=fail) AND flowActorForFlow's default arm (the
+// seam uses an unknown flow id).
+func TestFlowSynthetic_PanicBoundary(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	// No DB needed — the panic path records via metrics only when db is nil.
+	w := jobs.NewFlowSyntheticWorker(nil, srv.Client(), &fakeFlowMetrics{}, &fakeFlowEmitter{}, enabledConfig(srv))
+	if got := w.RunPanickingFlowForTest(); got != analyticsevent.ResultFail {
+		t.Errorf("panic boundary: want fail, got %q", got)
+	}
+}
+
+// TestFlowSynthetic_ReapNilDB covers the db==nil guard returns in recordReap +
+// emitFlowTestFailed (fail-open).
+func TestFlowSynthetic_ReapNilDB(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	fm := &fakeFlowMetrics{}
+	w := jobs.NewFlowSyntheticWorker(nil, srv.Client(), fm, &fakeFlowEmitter{}, enabledConfig(srv))
+	w.ReapNilDBForTest() // must not panic; metric still bumped
+	if len(fm.reapOutcomes()) == 0 {
+		t.Error("nil-db recordReap should still bump the reap metric")
+	}
+}
+
+// TestFlowSynthetic_ReapAuditInsertError covers recordReap's audit-insert error
+// branch (logged, non-fatal) via a failing ledger INSERT on the orphan path.
+func TestFlowSynthetic_ReapAuditInsertError(t *testing.T) {
+	srv := newFlowAPIServer(happyFlowState())
+	defer srv.Close()
+	f := newFixture(t, srv)
+	defer f.done()
+	expectSeed(f.mock)
+	// provision_reap inline reap → ledger INSERT fails (non-fatal).
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnError(errSeed)
+	expectOrphanSweepEmpty(f.mock)
+
+	f.run(t) // must not panic; provision_reap still passes (reap succeeded HTTP-side)
+	if got := f.fm.resultFor("provision_reap"); got != analyticsevent.ResultPass {
+		t.Errorf("audit-insert error is non-fatal: want provision_reap pass, got %q", got)
+	}
+}
+
 // TestValidateFlowSyntheticBaseURL covers the startup-time URL validator.
 func TestValidateFlowSyntheticBaseURL(t *testing.T) {
 	cases := []struct {
