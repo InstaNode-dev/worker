@@ -142,6 +142,11 @@ const (
 	deployStatusFailed    = "failed"
 	deployStatusStopped   = "stopped"
 
+	// stuckBuildingReapMessage is stamped onto a reaped row's error_message
+	// (only when the api hadn't already written one) so the user-facing
+	// failure surface explains why the build never produced an app.
+	stuckBuildingReapMessage = "build did not start: api goroutine exited before the build was created (reaped after 15m)"
+
 	// providerIDPrefix mirrors api/internal/providers/compute/k8s/client.go's
 	// deploymentName(appID) = "app-" + appID.
 	providerIDPrefix = "app-"
@@ -150,6 +155,24 @@ const (
 	// provider. The worker derives the namespace from provider_id rather than
 	// storing it on the deployments row.
 	deployNamespacePrefix = "instant-deploy-"
+
+	// stuckBuildingGrace bounds how long a deployments row may sit at
+	// status="building" with an EMPTY provider_id before the reconciler reaps
+	// it to "failed". An empty provider_id normally means runDeploy() on the
+	// api side hasn't reached UpdateDeploymentProviderID yet (kaniko build in
+	// flight) — those fresh rows are left alone. But a deploy whose api
+	// goroutine DIED before that write (pod OOM, ctx kill, crash mid-runDeploy)
+	// leaves the row "building" with no provider_id FOREVER: the per-row sweep
+	// has nothing to poll (no namespace derivable without a provider_id), so it
+	// is skipped every tick and the row permanently consumes the team's
+	// deployments_apps tier cap (sweep finding #5, P2).
+	//
+	// 15m is well beyond the normal ~30-90s build, so the grace window cannot
+	// catch a legitimately in-flight build — a "building" row with no
+	// provider_id still present at 15m is genuinely wedged. Reaping it frees
+	// the tier cap; the separate deploy_failure_autopsy job (idempotent) then
+	// emits the deploy.failed audit → failure email.
+	stuckBuildingGrace = 15 * time.Minute
 
 	// buildJobNamePrefix mirrors the api's k8s.buildImage() jobName format:
 	//   jobName := "build-" + sanitizeName(appID)
@@ -310,6 +333,7 @@ type activeDeployment struct {
 	id         uuid.UUID
 	providerID string
 	status     string
+	createdAt  time.Time
 }
 
 // Work runs the full sweep. Errors on individual rows are logged and swallowed
@@ -351,6 +375,7 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 		transitions int
 		errors      int
 		skipped     int
+		reaped      int
 		// autopsiesThisTick counts failure-autopsy captures performed in
 		// this sweep; deferred counts failed rows whose autopsy was
 		// skipped because a per-tick cap was reached (BugBash 2026-05-18
@@ -363,6 +388,26 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 
 	for _, d := range deployments {
 		if d.providerID == "" {
+			// A "building" row with no provider_id whose api goroutine died
+			// before UpdateDeploymentProviderID (crash mid-runDeploy) sits
+			// here forever, permanently consuming the team's deployments_apps
+			// tier cap (sweep finding #5). Reap it once it's past the grace
+			// window — a fresh build (<15m) is still left alone (the build is
+			// genuinely in flight, runDeploy just hasn't stamped provider_id).
+			age := time.Since(d.createdAt)
+			if d.status == deployStatusBuilding && age > stuckBuildingGrace {
+				if err := w.reapStuckBuilding(ctx, d.id); err != nil {
+					slog.Error("jobs.deploy_status_reconcile.stuck_building_reap_failed",
+						"id", d.id, "age", age.String(), "error", err)
+					errors++
+					continue
+				}
+				slog.Warn("jobs.deploy_status_reconcile.stuck_building_reaped",
+					"id", d.id, "age", age.String(),
+					"note", "building row with empty provider_id past grace window; api goroutine likely died before the build was created — reaped to failed to free the tier cap")
+				reaped++
+				continue
+			}
 			// runDeploy() hasn't reached UpdateDeploymentProviderID yet
 			// (kaniko build still in flight on the api side). Nothing to
 			// poll — leave the row alone.
@@ -456,6 +501,7 @@ func (w *DeployStatusReconciler) Work(ctx context.Context, job *river.Job[Deploy
 		"transitions", transitions,
 		"errors", errors,
 		"skipped", skipped,
+		"reaped", reaped,
 		"autopsies", autopsiesThisTick,
 		"autopsies_deferred", autopsiesDeferred,
 		"duration_ms", time.Since(start).Milliseconds(),
@@ -662,7 +708,7 @@ func deployNamespaceFromProviderID(providerID string) string {
 // "deploying" and "building" transitively — both are picked up here.
 func (w *DeployStatusReconciler) listActiveDeployments(ctx context.Context) ([]activeDeployment, error) {
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, COALESCE(provider_id, ''), status
+		SELECT id, COALESCE(provider_id, ''), status, created_at
 		FROM deployments
 		WHERE status IN ($1, $2, $3)
 		ORDER BY updated_at ASC
@@ -675,7 +721,7 @@ func (w *DeployStatusReconciler) listActiveDeployments(ctx context.Context) ([]a
 	var out []activeDeployment
 	for rows.Next() {
 		var d activeDeployment
-		if err := rows.Scan(&d.id, &d.providerID, &d.status); err != nil {
+		if err := rows.Scan(&d.id, &d.providerID, &d.status, &d.createdAt); err != nil {
 			return nil, fmt.Errorf("listActiveDeployments: scan: %w", err)
 		}
 		out = append(out, d)
@@ -701,6 +747,34 @@ func (w *DeployStatusReconciler) updateStatus(ctx context.Context, id uuid.UUID,
 	`, status, id, deployStatusBuilding, deployStatusDeploying, deployStatusHealthy)
 	if err != nil {
 		return fmt.Errorf("updateStatus: %w", err)
+	}
+	return nil
+}
+
+// reapStuckBuilding flips a deployments row that has been stuck at
+// status="building" with no provider_id (api goroutine died before the build
+// was created) to "failed", freeing the team's deployments_apps tier cap
+// (sweep finding #5).
+//
+// We deliberately do NOT reuse updateStatus — that helper gates only on
+// status IN (building, deploying, healthy) and would happily flip a row that
+// has since acquired a provider_id. This UPDATE is double-guarded on BOTH
+// status='building' AND a still-empty provider_id, so it is a no-op if the api
+// raced us and stamped the provider_id (the next tick reconciles it normally)
+// or already wrote a terminal status. The COALESCE/NULLIF preserves any
+// error_message the api may have written before crashing.
+func (w *DeployStatusReconciler) reapStuckBuilding(ctx context.Context, id uuid.UUID) error {
+	_, err := w.db.ExecContext(ctx, `
+		UPDATE deployments
+		SET status = $1,
+		    error_message = COALESCE(NULLIF(error_message, ''), $2),
+		    updated_at = now()
+		WHERE id = $3
+		  AND status = $4
+		  AND (provider_id IS NULL OR provider_id = '')
+	`, deployStatusFailed, stuckBuildingReapMessage, id, deployStatusBuilding)
+	if err != nil {
+		return fmt.Errorf("reapStuckBuilding: %w", err)
 	}
 	return nil
 }

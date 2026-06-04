@@ -237,10 +237,10 @@ func TestDeployNamespaceFromProviderID(t *testing.T) {
 	}{
 		{"app-abc", "instant-deploy-abc"},
 		{"app-1234", "instant-deploy-1234"},
-		{"app-", ""},                            // empty appID after prefix
-		{"instant-stack-xyz", ""},              // foreign prefix
-		{"", ""},                                // nothing
-		{"appabc", ""},                          // missing hyphen
+		{"app-", ""},              // empty appID after prefix
+		{"instant-stack-xyz", ""}, // foreign prefix
+		{"", ""},                  // nothing
+		{"appabc", ""},            // missing hyphen
 	}
 	for _, tc := range cases {
 		if got := deployNamespaceFromProviderID(tc.in); got != tc.want {
@@ -297,7 +297,7 @@ func TestDeployStatusReconciler_Work_NoActiveRows(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}))
 
 	w := NewDeployStatusReconciler(db, newFakeDeployStatusK8s())
 	if err := w.Work(context.Background(), fakeRiverJob[DeployStatusReconcileArgs]()); err != nil {
@@ -347,14 +347,18 @@ func TestDeployStatusReconciler_Work_FullSweep(t *testing.T) {
 	idHealthy := uuid.New()
 	idFailed := uuid.New()
 
+	// idBlank gets a FRESH created_at so the empty-provider_id row stays
+	// "skipped" (a build still in flight), not reaped by the stuck-building
+	// path — that path is exercised in its own dedicated tests.
+	now := time.Now().UTC()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(idBlank, "", "building").
-			AddRow(idForeign, "instant-stack-zzz", "building").
-			AddRow(idStopped, "app-stopped", "building").
-			AddRow(idSame, "app-same", "building").
-			AddRow(idHealthy, "app-healthy", "building").
-			AddRow(idFailed, "app-failed", "deploying"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(idBlank, "", "building", now).
+			AddRow(idForeign, "instant-stack-zzz", "building", now).
+			AddRow(idStopped, "app-stopped", "building", now).
+			AddRow(idSame, "app-same", "building", now).
+			AddRow(idHealthy, "app-healthy", "building", now).
+			AddRow(idFailed, "app-failed", "deploying", now))
 
 	k8s := newFakeDeployStatusK8s()
 	// app-same: deployment with all-zero status → building
@@ -413,12 +417,12 @@ func TestDeployStatusReconciler_Work_AutopsyCapDeferred(t *testing.T) {
 
 	const n = maxAutopsiesPerTick + 1 // one beyond the cap → at least 1 deferred
 	k8s := newFakeDeployStatusK8s()
-	rows := sqlmock.NewRows([]string{"id", "provider_id", "status"})
+	rows := sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"})
 	ids := make([]uuid.UUID, n)
 	for i := 0; i < n; i++ {
 		ids[i] = uuid.New()
 		appID := "appfail" + uuid.NewString()[:8]
-		rows.AddRow(ids[i], "app-"+appID, "deploying")
+		rows.AddRow(ids[i], "app-"+appID, "deploying", time.Now().UTC())
 		k8s.objs["instant-deploy-"+appID+"|app-"+appID] = &appsv1.Deployment{
 			Status: appsv1.DeploymentStatus{
 				Conditions: []appsv1.DeploymentCondition{{
@@ -481,8 +485,8 @@ func TestDeployStatusReconciler_Work_K8sGetFailed(t *testing.T) {
 
 	idA := uuid.New()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(idA, "app-broken", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(idA, "app-broken", "building", time.Now().UTC()))
 
 	k8s := newFakeDeployStatusK8s()
 	k8s.errOn["instant-deploy-broken|app-broken"] = errors.New("network blip")
@@ -507,8 +511,8 @@ func TestDeployStatusReconciler_Work_UpdateFailed(t *testing.T) {
 
 	id := uuid.New()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(id, "app-borked", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "app-borked", "building", time.Now().UTC()))
 
 	k8s := newFakeDeployStatusK8s()
 	k8s.objs["instant-deploy-borked|app-borked"] = &appsv1.Deployment{
@@ -539,8 +543,8 @@ func TestDeployStatusReconciler_listActiveDeployments_ScanError(t *testing.T) {
 
 	// Return a row whose id is not a UUID → Scan fails.
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow("not-a-uuid", "app-x", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow("not-a-uuid", "app-x", "building", time.Now().UTC()))
 
 	w := NewDeployStatusReconciler(db, newFakeDeployStatusK8s())
 	if werr := w.Work(context.Background(), fakeRiverJob[DeployStatusReconcileArgs]()); werr == nil {
@@ -556,6 +560,154 @@ func TestComputeNewStatus_ForeignProviderID(t *testing.T) {
 	_, err := w.computeNewStatus(context.Background(), "instant-stack-foreign")
 	if !errors.Is(err, errSkipForeignProviderID) {
 		t.Errorf("expected errSkipForeignProviderID, got %v", err)
+	}
+}
+
+// ─── stuck-building reaper (sweep finding #5) ─────────────────────────────────
+
+// TestDeployStatusReconciler_Work_StuckBuildingReaped pins the core finding-#5
+// fix: a deployments row stuck at status="building" with an EMPTY provider_id
+// for longer than stuckBuildingGrace (api goroutine died before the build was
+// created) is reaped to "failed" via the guarded UPDATE — freeing the team's
+// deployments_apps tier cap. No k8s Get happens (nothing to poll without a
+// provider_id); the only DB write is the guarded reap UPDATE.
+func TestDeployStatusReconciler_Work_StuckBuildingReaped(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	stale := time.Now().UTC().Add(-stuckBuildingGrace - time.Minute) // > grace
+	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "", "building", stale))
+
+	// The guarded reap UPDATE: status→failed, double-guarded on the prior
+	// status='building' AND empty provider_id.
+	mock.ExpectExec(`UPDATE deployments\s+SET status = \$1`).
+		WithArgs(deployStatusFailed, stuckBuildingReapMessage, id, deployStatusBuilding).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// k8s provider must NOT be consulted for an empty-provider_id row.
+	k8s := newFakeDeployStatusK8s()
+	w := NewDeployStatusReconciler(db, k8s)
+	if werr := w.Work(context.Background(), fakeRiverJob[DeployStatusReconcileArgs]()); werr != nil {
+		t.Fatalf("Work: %v", werr)
+	}
+	if len(k8s.callLog) != 0 {
+		t.Errorf("empty-provider_id reap must not call GetDeployment, got calls: %v", k8s.callLog)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestDeployStatusReconciler_Work_StuckBuildingFreshNotReaped pins the
+// safety boundary: a FRESH (< stuckBuildingGrace) "building" row with an empty
+// provider_id is a build still in flight — it MUST be left alone (skipped), no
+// UPDATE, so a legitimately-in-progress build is never killed early.
+func TestDeployStatusReconciler_Work_StuckBuildingFreshNotReaped(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	fresh := time.Now().UTC().Add(-30 * time.Second) // well inside grace
+	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "", "building", fresh))
+	// No ExpectExec — any UPDATE is an unmet/unexpected expectation failure.
+
+	w := NewDeployStatusReconciler(db, newFakeDeployStatusK8s())
+	if werr := w.Work(context.Background(), fakeRiverJob[DeployStatusReconcileArgs]()); werr != nil {
+		t.Fatalf("Work: %v", werr)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a fresh empty-provider_id build must not be reaped: %v", err)
+	}
+}
+
+// TestDeployStatusReconciler_Work_StuckBuildingReapFailed covers the reap
+// UPDATE error branch: the failure is logged and counted but the sweep does
+// not abort (fail-open) — Work returns nil.
+func TestDeployStatusReconciler_Work_StuckBuildingReapFailed(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	stale := time.Now().UTC().Add(-stuckBuildingGrace - time.Minute)
+	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "", "building", stale))
+	mock.ExpectExec(`UPDATE deployments\s+SET status = \$1`).
+		WithArgs(deployStatusFailed, stuckBuildingReapMessage, id, deployStatusBuilding).
+		WillReturnError(errors.New("deadlock"))
+
+	w := NewDeployStatusReconciler(db, newFakeDeployStatusK8s())
+	if werr := w.Work(context.Background(), fakeRiverJob[DeployStatusReconcileArgs]()); werr != nil {
+		t.Fatalf("Work must isolate a reap-UPDATE failure (fail-open), got: %v", werr)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestDeployStatusReconciler_Work_StuckDeployingEmptyProviderNotReaped guards
+// that the reaper is scoped to status="building" ONLY: an empty-provider_id
+// row in "deploying" (an unusual but possible interim state) is NOT reaped even
+// when old — the guard is `d.status == deployStatusBuilding`.
+func TestDeployStatusReconciler_Work_StuckDeployingEmptyProviderNotReaped(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	stale := time.Now().UTC().Add(-stuckBuildingGrace - time.Hour)
+	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "", "deploying", stale))
+	// No ExpectExec — a non-building status must be skipped, never reaped.
+
+	w := NewDeployStatusReconciler(db, newFakeDeployStatusK8s())
+	if werr := w.Work(context.Background(), fakeRiverJob[DeployStatusReconcileArgs]()); werr != nil {
+		t.Fatalf("Work: %v", werr)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a non-building empty-provider_id row must not be reaped: %v", err)
+	}
+}
+
+// TestReapStuckBuilding_RowWithProviderIDUnaffected exercises the guarded
+// helper directly: the UPDATE is double-guarded on empty provider_id, so a row
+// that raced and acquired a provider_id between SELECT and UPDATE matches zero
+// rows (RowsAffected 0) and the helper returns nil — a safe no-op.
+func TestReapStuckBuilding_RowWithProviderIDUnaffected(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE deployments\s+SET status = \$1`).
+		WithArgs(deployStatusFailed, stuckBuildingReapMessage, id, deployStatusBuilding).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // guard matched nothing
+
+	w := NewDeployStatusReconciler(db, newFakeDeployStatusK8s())
+	if err := w.reapStuckBuilding(context.Background(), id); err != nil {
+		t.Fatalf("reapStuckBuilding no-op must not error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
@@ -1558,7 +1710,7 @@ func TestDeploymentReminderWorker_FullSweep(t *testing.T) {
 	//   row B: CAS wins, past expiry → floor branch + audit emit
 	rows := sqlmock.NewRows(reminderCandidateCols).
 		AddRow("deploy-A", teamID, "appA", "https://a.deployment.instanode.dev",
-			pastExpiry, 0, "auto_24h", "owner@example.com").
+							pastExpiry, 0, "auto_24h", "owner@example.com").
 		AddRow("deploy-B", teamID, "appB", "", // empty app_url → deployURL fallback
 			pastExpiry, 1, "auto_24h", nil) // nil email → audited_no_owner branch
 	mock.ExpectQuery(`SELECT d.id::text, d.team_id::text, d.app_id, d.app_url`).
@@ -2289,11 +2441,11 @@ func TestNewRazorpayOrphanCanceler_UnconfiguredReturnsNil(t *testing.T) {
 
 // TestRazorpayOrphanCanceler_CancelSubscription_Fake exercises the
 // production CancelSubscription wrapper logic through the test seam:
-//  - empty subID is a no-op
-//  - whitespace subID is a no-op
-//  - non-empty subID hits the SDK
-//  - SDK error fragment is mapped to "terminal" success
-//  - SDK error not in the terminal set is propagated
+//   - empty subID is a no-op
+//   - whitespace subID is a no-op
+//   - non-empty subID hits the SDK
+//   - SDK error fragment is mapped to "terminal" success
+//   - SDK error not in the terminal set is propagated
 func TestRazorpayOrphanCanceler_CancelSubscription_Fake(t *testing.T) {
 	// Empty + whitespace.
 	sdk := &fakeCancelSDKCov{}
