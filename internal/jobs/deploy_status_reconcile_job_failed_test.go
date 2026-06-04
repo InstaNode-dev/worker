@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
@@ -109,8 +110,8 @@ func TestDeployStatusReconcile_JobFailedAfterPodGC(t *testing.T) {
 
 	id := uuid.New()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(id, "app-gced", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "app-gced", "building", time.Now().UTC()))
 
 	k8s := newFakeDeployStatusK8s()
 	// Deployment is missing (build never reached the apply step) — pre-fix
@@ -153,8 +154,8 @@ func TestDeployStatusReconcile_JobActiveAndPodMissing_StaysBuilding(t *testing.T
 
 	id := uuid.New()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(id, "app-active", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "app-active", "building", time.Now().UTC()))
 
 	k8s := newFakeDeployStatusK8s()
 	// Deployment missing — apply step hasn't run yet.
@@ -186,8 +187,8 @@ func TestDeployStatusReconcile_BothNotFound_StaysStopped(t *testing.T) {
 
 	id := uuid.New()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(id, "app-gone", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "app-gone", "building", time.Now().UTC()))
 
 	// Both Deployment AND Job missing from the fake → NewNotFound errors.
 	k8s := newFakeDeployStatusK8s()
@@ -219,8 +220,8 @@ func TestDeployStatusReconcile_JobQueryError_FallsThroughToDeployment(t *testing
 
 	id := uuid.New()
 	mock.ExpectQuery(`FROM deployments\s+WHERE status IN`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status"}).
-			AddRow(id, "app-h1", "building"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id", "status", "created_at"}).
+			AddRow(id, "app-h1", "building", time.Now().UTC()))
 
 	k8s := newFakeDeployStatusK8s()
 	// Healthy runtime Deployment — Deployment query MUST be authoritative.
