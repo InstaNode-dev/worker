@@ -145,6 +145,7 @@ func (w *QuotaWallNudgeWorker) Work(ctx context.Context, job *river.Job[QuotaWal
 			SELECT id, plan_tier
 			FROM teams
 			WHERE plan_tier NOT IN ('team', 'anonymous', 'free')
+			  AND NOT is_test_cohort
 			  AND id::text > $1
 			ORDER BY id::text ASC
 			LIMIT $2

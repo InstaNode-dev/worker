@@ -149,9 +149,10 @@ func (w *PaymentGraceTerminatorWorker) Work(ctx context.Context, job *river.Job[
 	// Candidate query: active grace rows whose clock has expired.
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT id, team_id, expires_at
-		FROM payment_grace_periods
+		FROM payment_grace_periods pgp
 		WHERE status = 'active'
 		  AND expires_at < $1
+		  AND `+testCohortNotExistsClause("pgp.team_id")+`
 		ORDER BY expires_at ASC
 		LIMIT $2
 	`, now, paymentGraceTerminatorBatchLimit)
@@ -308,14 +309,15 @@ func (w *PaymentGraceTerminatorWorker) terminate(ctx context.Context, teamID uui
 // HS256 algorithm and the claim set below.
 //
 // Claims:
-//   sub  — the team id being terminated (allows the api to assert the
-//          path :id matches the JWT subject; prevents a stolen token
-//          from terminating a different team)
-//   iss  — "instanode-worker" so the api can route on issuer
-//   iat  — issued-at (UTC seconds)
-//   exp  — issued-at + 5 minutes (short window — single-shot use)
-//   aud  — "internal-teams-terminate" so the same secret can't be
-//          re-used by an attacker against a different internal route
+//
+//	sub  — the team id being terminated (allows the api to assert the
+//	       path :id matches the JWT subject; prevents a stolen token
+//	       from terminating a different team)
+//	iss  — "instanode-worker" so the api can route on issuer
+//	iat  — issued-at (UTC seconds)
+//	exp  — issued-at + 5 minutes (short window — single-shot use)
+//	aud  — "internal-teams-terminate" so the same secret can't be
+//	       re-used by an attacker against a different internal route
 func signWorkerInternalJWT(secret, teamID string) (string, error) {
 	if secret == "" {
 		return "", errors.New("empty secret")

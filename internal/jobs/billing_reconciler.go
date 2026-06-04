@@ -822,6 +822,7 @@ func (w *BillingReconcilerWorker) Work(ctx context.Context, job *river.Job[Billi
 		  FROM teams
 		 WHERE stripe_customer_id IS NOT NULL
 		   AND stripe_customer_id != ''
+		   AND NOT is_test_cohort
 		 ORDER BY id
 		 LIMIT $1
 	`, billingReconcilerBatchLimit)
@@ -1204,6 +1205,7 @@ func (w *BillingReconcilerWorker) runOrphanSweep(ctx context.Context) (scanned, 
 		  JOIN teams t ON t.id = pc.team_id
 		 WHERE pc.subscription_id IS NOT NULL
 		   AND pc.subscription_id != ''
+		   AND NOT t.is_test_cohort
 		   AND pc.created_at < $1
 		 ORDER BY pc.created_at
 		 LIMIT $2

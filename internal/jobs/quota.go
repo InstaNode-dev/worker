@@ -241,9 +241,10 @@ func (w *EnforceStorageQuotaWorker) runRedisEvictionLoop(ctx context.Context) (i
 	for {
 		rows, err := w.db.QueryContext(ctx, `
 			SELECT id, token, tier, storage_bytes
-			FROM resources
+			FROM resources r
 			WHERE status = $1
 			  AND resource_type = 'redis'
+			  AND `+testCohortNotExistsClause("r.team_id")+`
 			  AND id::text > $2
 			ORDER BY id::text ASC
 			LIMIT $3
@@ -362,9 +363,10 @@ func (w *EnforceStorageQuotaWorker) runSuspendLoop(ctx context.Context) ([]strin
 			SELECT id, token, resource_type, tier, storage_bytes,
 			       COALESCE(provider_resource_id, ''),
 			       team_id, COALESCE(name, '')
-			FROM resources
+			FROM resources r
 			WHERE status = $1
 			  AND resource_type IN ('postgres', 'redis', 'mongodb')
+			  AND `+testCohortNotExistsClause("r.team_id")+`
 			  AND id::text > $2
 			ORDER BY id::text ASC
 			LIMIT $3
@@ -528,9 +530,10 @@ func (w *EnforceStorageQuotaWorker) runUnsuspendLoop(ctx context.Context, skipID
 			SELECT id, token, resource_type, tier, storage_bytes,
 			       COALESCE(provider_resource_id, ''),
 			       team_id, COALESCE(name, '')
-			FROM resources
+			FROM resources r
 			WHERE status = $1
 			  AND resource_type IN ('postgres', 'redis', 'mongodb')
+			  AND `+testCohortNotExistsClause("r.team_id")+`
 			  AND id::text > $2
 			ORDER BY id::text ASC
 			LIMIT $3
