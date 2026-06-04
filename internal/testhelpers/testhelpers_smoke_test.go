@@ -105,6 +105,24 @@ func TestIsUndefinedColumn(t *testing.T) {
 	}
 }
 
+// TestIntegration_SetupTestDB_DefaultDSNFallback covers the
+// `TEST_DATABASE_URL unset -> DefaultTestDBURL` fallback branch. CI always
+// exports TEST_DATABASE_URL, so only an explicit unset exercises it. The
+// default DSN points at the same local/CI Postgres (localhost:5432), so when a
+// DB is reachable SetupTestDB succeeds; otherwise it skips via the ping arm —
+// either way the fallback assignment line runs.
+func TestIntegration_SetupTestDB_DefaultDSNFallback(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL", "") // empty -> SetupTestDB falls back to DefaultTestDBURL
+	db, cleanup := SetupTestDB(t)     // skips here if the default DSN is unreachable
+	defer cleanup()
+	if db == nil {
+		t.Fatal("SetupTestDB returned nil db after default-DSN fallback")
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("default-DSN db not usable: %v", err)
+	}
+}
+
 // TestSetupTestDB_BadDSN covers SetupTestDB's DSN-parse skip arm by pointing
 // TEST_DATABASE_URL at a string pq.NewConnector rejects (invalid URL escape).
 func TestSetupTestDB_BadDSN(t *testing.T) {
