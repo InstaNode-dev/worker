@@ -44,7 +44,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
+)
+
+// tFatalf / tSkipf are indirection seams over (*testing.T).Fatalf / .Skipf.
+// They exist solely so the harness's own error/skip arms (a DB that fails to
+// open, an INSERT that errors, a scan that fails) are reachable from this
+// package's in-package coverage tests — which swap them for recording stubs and
+// drive the arms with a deliberately-broken DB. In every real test run they are
+// the genuine t.Fatalf / t.Skipf. This is a test seam (per the platform's
+// "use test seams, not waivers" coverage rule), NOT a behavioural change:
+// production callers see identical fail/skip semantics. The default values are
+// reassigned only inside testhelpers_smoke_test.go and restored via t.Cleanup.
+var (
+	tFatalf = func(t *testing.T, format string, args ...any) { t.Helper(); t.Fatalf(format, args...) }
+	tSkipf  = func(t *testing.T, format string, args ...any) { t.Helper(); t.Skipf(format, args...) }
 )
 
 // isUndefinedColumn reports whether err is a Postgres "column does not exist"
@@ -70,28 +84,38 @@ const DefaultTestDBURL = "postgres://postgres@localhost:5432/instant_dev_test?ss
 // schema subset the worker integration tests need, and returns the *sql.DB
 // plus a cleanup function.
 //
-// It SKIPS (does not fail) the test when:
-//   - running under `-short` (the regular `make gate` / deploy.yml path), or
-//   - TEST_DATABASE_URL is unset AND the default local DB is unreachable.
+// It SKIPS (does not fail) the test when TEST_DATABASE_URL is unset AND the
+// default local DB is unreachable. This keeps `make gate` / deploy.yml / ci.yml
+// green without a DB (those workflows ship no Postgres service container, so the
+// ping below misses and the test skips) while still running the real round-trip
+// — and crediting this package's own coverage — wherever a Postgres is provided
+// (developer machine, coverage.yml's postgres service).
 //
-// This keeps `make gate` green without a DB while still running the real
-// round-trip locally / wherever a Postgres is provided.
+// NOTE: this deliberately does NOT short-circuit on `testing.Short()`. The
+// coverage.yml job runs `go test ./... -short` against a real Postgres service;
+// a `-short` guard here would skip the harness in that job and leave every line
+// of this file uncovered, reding the 100%-patch-coverage gate. Gating purely on
+// DB reachability matches api/internal/testhelpers.SetupTestDB and keeps the
+// `-short`, no-DB workflows green via the ping skip below.
 func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
-
-	if testing.Short() {
-		t.Skip("skip real-DB worker integration test under -short (regular gate / deploy.yml path)")
-	}
 
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		dsn = DefaultTestDBURL
 	}
 
-	db, err := sql.Open("postgres", dsn)
+	// Build the connector explicitly via pq.NewConnector rather than sql.Open:
+	// sql.Open only validates the (always-"postgres") driver string and never
+	// returns an error here, so its error arm would be an untestable dead branch
+	// under the patch-coverage gate. pq.NewConnector parses the DSN eagerly and
+	// DOES return an error for a malformed DSN — a reachable, tested skip arm.
+	connector, err := pq.NewConnector(dsn)
 	if err != nil {
-		t.Skipf("testhelpers.SetupTestDB: open %q: %v — set TEST_DATABASE_URL to a reachable platform DB", dsn, err)
+		tSkipf(t, "testhelpers.SetupTestDB: parse DSN %q: %v — set TEST_DATABASE_URL to a valid platform DB", dsn, err)
+		return nil, func() {}
 	}
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 
@@ -99,7 +123,8 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		t.Skipf("testhelpers.SetupTestDB: ping %q failed: %v — DB not reachable (set TEST_DATABASE_URL or start postgres)", dsn, err)
+		tSkipf(t, "testhelpers.SetupTestDB: ping %q failed: %v — DB not reachable (set TEST_DATABASE_URL or start postgres)", dsn, err)
+		return nil, func() {}
 	}
 
 	ensureSchema(t, db)
@@ -203,7 +228,8 @@ func ensureSchema(t *testing.T, db *sql.DB) {
 
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
-			t.Fatalf("testhelpers.ensureSchema: %v\n  SQL: %.140s", err, s)
+			tFatalf(t, "testhelpers.ensureSchema: %v\n  SQL: %.140s", err, s)
+			return
 		}
 	}
 
@@ -237,7 +263,8 @@ func ensureAutopsyUniqueIndex(t *testing.T, db *sql.DB) {
 			   AND pg_get_indexdef(i.indexrelid) ILIKE '%failure_autopsy%'
 		)
 	`).Scan(&present); err != nil {
-		t.Fatalf("ensureAutopsyUniqueIndex: probe: %v", err)
+		tFatalf(t, "ensureAutopsyUniqueIndex: probe: %v", err)
+		return
 	}
 	if present {
 		return
@@ -249,7 +276,8 @@ func ensureAutopsyUniqueIndex(t *testing.T, db *sql.DB) {
 			ON public.deployment_events (deployment_id, kind)
 			WHERE kind = 'failure_autopsy'
 	`); err != nil {
-		t.Fatalf("ensureAutopsyUniqueIndex: create: %v", err)
+		tFatalf(t, "ensureAutopsyUniqueIndex: create: %v", err)
+		return
 	}
 }
 
@@ -267,7 +295,8 @@ func SeedTeam(t *testing.T, db *sql.DB, planTier string) uuid.UUID {
 		`INSERT INTO teams (id, name, plan_tier, status) VALUES ($1, $2, $3, 'active')`,
 		id, "itest-"+id.String()[:8], planTier,
 	); err != nil {
-		t.Fatalf("SeedTeam: %v", err)
+		tFatalf(t, "SeedTeam: %v", err)
+		return uuid.Nil
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM teams WHERE id = $1`, id)
@@ -307,7 +336,8 @@ func SeedDeployment(t *testing.T, db *sql.DB, teamID uuid.UUID, status, provider
 		)
 	}
 	if err != nil {
-		t.Fatalf("SeedDeployment: %v", err)
+		tFatalf(t, "SeedDeployment: %v", err)
+		return uuid.Nil
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM deployments WHERE id = $1`, id)
@@ -339,7 +369,8 @@ func SeedResource(
 		 VALUES ($1, $2, $3, $4, $5, 'active', $6, now())`,
 		id, teamID, token, resourceType, tier, limitArg,
 	); err != nil {
-		t.Fatalf("SeedResource: %v", err)
+		tFatalf(t, "SeedResource: %v", err)
+		return uuid.Nil, ""
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM resources WHERE id = $1`, id)
@@ -353,7 +384,8 @@ func DeploymentStatus(t *testing.T, db *sql.DB, id uuid.UUID) (status string, er
 	if err := db.QueryRow(
 		`SELECT status, error_message FROM deployments WHERE id = $1`, id,
 	).Scan(&status, &errorMessage); err != nil {
-		t.Fatalf("DeploymentStatus: %v", err)
+		tFatalf(t, "DeploymentStatus: %v", err)
+		return "", sql.NullString{}
 	}
 	return status, errorMessage
 }
@@ -365,7 +397,8 @@ func AppliedConnLimit(t *testing.T, db *sql.DB, id uuid.UUID) sql.NullInt64 {
 	if err := db.QueryRow(
 		`SELECT applied_conn_limit FROM resources WHERE id = $1`, id,
 	).Scan(&v); err != nil {
-		t.Fatalf("AppliedConnLimit: %v", err)
+		tFatalf(t, "AppliedConnLimit: %v", err)
+		return sql.NullInt64{}
 	}
 	return v
 }
@@ -380,7 +413,8 @@ func CountAuditLog(t *testing.T, db *sql.DB, kind, deployID string) int {
 		`SELECT count(*) FROM audit_log WHERE kind = $1 AND metadata->>'deploy_id' = $2`,
 		kind, deployID,
 	).Scan(&n); err != nil {
-		t.Fatalf("CountAuditLog: %v", err)
+		tFatalf(t, "CountAuditLog: %v", err)
+		return 0
 	}
 	return n
 }
@@ -398,7 +432,8 @@ func AutopsyRow(t *testing.T, db *sql.DB, deploymentID uuid.UUID) (reason string
 		return "", false
 	}
 	if err != nil {
-		t.Fatalf("AutopsyRow: %v", err)
+		tFatalf(t, "AutopsyRow: %v", err)
+		return "", false
 	}
 	return reason, true
 }

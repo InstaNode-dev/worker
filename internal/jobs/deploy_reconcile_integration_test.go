@@ -21,11 +21,10 @@ package jobs
 // deploy/k8s jobs use a fake clientset for the k8s leg but a real DB for the
 // row mutation."
 //
-// GATING: testhelpers.SetupTestDB skips under -short / when no DB is reachable,
-// so `make gate` (deploy.yml) and ci.yml (no DB service) skip these cleanly.
-// They run locally against
-// postgres://postgres@localhost:5432/instant_dev_test and wherever a
-// TEST_DATABASE_URL is supplied.
+// GATING: testhelpers.SetupTestDB skips when no DB is reachable, so `make gate`
+// (deploy.yml) and ci.yml (no DB service) skip these cleanly. They run locally
+// against postgres://postgres@localhost:5432/instant_dev_test and wherever a
+// TEST_DATABASE_URL is supplied (developer DB, coverage.yml's postgres service).
 
 import (
 	"context"

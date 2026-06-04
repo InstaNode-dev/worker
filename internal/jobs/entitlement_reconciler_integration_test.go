@@ -16,8 +16,9 @@ package jobs
 // signal the job depends on in production: a sqlmock test passes whether or not
 // the UPDATE's WHERE id = $2 matches the live row; this proves it does.
 //
-// GATING: testhelpers.SetupTestDB skips under -short / no-DB, so the regular
-// gate stays green without a Postgres.
+// GATING: testhelpers.SetupTestDB skips when no DB is reachable, so the regular
+// gate (deploy.yml / ci.yml, no Postgres service) stays green. It runs against a
+// real Postgres wherever one is supplied (developer DB, coverage.yml service).
 
 import (
 	"context"
