@@ -360,6 +360,10 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 			FromEmail:     cfg.SESFromEmail,
 			TemplateNames: cfg.SESTemplateNames,
 		},
+		// Inert by default (EMAIL_PROVIDER_FALLBACK unset → nil → single
+		// provider). When set, NewProvider wraps the primary + named fallbacks
+		// in a FailoverProvider. See email.Config.Fallbacks.
+		Fallbacks: cfg.EmailProviderFallback,
 	})
 	if err != nil {
 		slog.Error("jobs.workers.email_provider_init_failed",

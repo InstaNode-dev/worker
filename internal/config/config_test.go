@@ -306,3 +306,56 @@ func TestParseSESTemplateNames(t *testing.T) {
 		t.Errorf("malformed should be empty map: %v", bad)
 	}
 }
+
+func TestParseCSVProviders(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"whitespace-only", "   ", nil},
+		{"single", "ses", []string{"ses"}},
+		{"ordered-pair", "ses,brevo", []string{"ses", "brevo"}},
+		{"trims-and-drops-blanks", " ses , , brevo ", []string{"ses", "brevo"}},
+		{"trailing-comma", "ses,", []string{"ses"}},
+		{"leading-comma", ",ses", []string{"ses"}},
+		{"all-blank-segments", " , , ", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseCSVProviders(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseCSVProviders(%q) = %v; want %v", tc.raw, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("parseCSVProviders(%q)[%d] = %q; want %q", tc.raw, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestLoad_EmailProviderFallback — the env var flows through Load() into the
+// ordered Fallbacks slice; unset → nil (inert default).
+func TestLoad_EmailProviderFallback(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("EMAIL_PROVIDER_FALLBACK", "ses, brevo")
+	cfg := Load()
+	if len(cfg.EmailProviderFallback) != 2 ||
+		cfg.EmailProviderFallback[0] != "ses" || cfg.EmailProviderFallback[1] != "brevo" {
+		t.Errorf("EmailProviderFallback = %v; want [ses brevo]", cfg.EmailProviderFallback)
+	}
+}
+
+// TestLoad_EmailProviderFallback_UnsetIsNil — the inert default at the config
+// layer: no env var → nil slice → single-provider mode.
+func TestLoad_EmailProviderFallback_UnsetIsNil(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("EMAIL_PROVIDER_FALLBACK", "")
+	cfg := Load()
+	if cfg.EmailProviderFallback != nil {
+		t.Errorf("EmailProviderFallback = %v; want nil (inert default)", cfg.EmailProviderFallback)
+	}
+}

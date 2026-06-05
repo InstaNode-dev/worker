@@ -459,6 +459,39 @@ var (
 		Help: "Event-email forwarder hits on an audit_log row whose kind has a builder but no Go renderer. A non-zero rate means a kind is being silently dropped — fix the eventEmailBodyRenderers map.",
 	}, []string{"kind"})
 
+	// ── Failover-ESP engagement counter (task #35) ───────────────────────────
+	//
+	// Tracks the FailoverProvider's per-send outcome so an operator can see
+	// at a glance whether the primary ESP (Brevo) is carrying the traffic or
+	// the secondary (SES) is being pressed into service. This is the live
+	// signal that hardens the standing P0 (Brevo sender unvalidated → every
+	// send rejected): a sustained `fallback_ok` rate means the primary is
+	// degraded but email is still flowing via the secondary; any `all_failed`
+	// means BOTH providers refused the send and the email is being lost (the
+	// forwarder holds its cursor on the last Transient class, but a stream of
+	// all_failed is a data-loss-grade outage).
+	//
+	// Inert by default: the FailoverProvider is only constructed when
+	// EMAIL_PROVIDER_FALLBACK is set. With no secondary configured the worker
+	// uses the bare single provider and this counter never observes a label
+	// (lazy *Vec — absent from /metrics until first emit, per CLAUDE.md
+	// rule 25's eager-vs-lazy note).
+	//
+	// Label `outcome`:
+	//   primary_ok  — the first (primary) provider succeeded; no fallback engaged.
+	//   fallback_ok — the primary failed/skipped and a later provider succeeded.
+	//   all_failed  — every provider in the chain failed; last error returned.
+	//
+	// NR alerts (shipped in the infra PR per rule 25):
+	//   P1: rate(instant_email_failover_total{outcome="fallback_ok"}[10m]) > 0
+	//       sustained → primary ESP degraded, secondary carrying load.
+	//   P0: rate(instant_email_failover_total{outcome="all_failed"}[5m]) > 0
+	//       → both ESPs refusing; email being lost.
+	EmailFailoverTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_email_failover_total",
+		Help: "FailoverProvider per-send outcome. Labelled by outcome (primary_ok|fallback_ok|all_failed). A non-zero fallback_ok rate means the primary ESP is degraded; all_failed means both ESPs refused and email is being lost.",
+	}, []string{"outcome"})
+
 	// ── propagation_runner — unexpected_skip counter (CHAOS-DRILL-2026-05-20 F1) ─
 	//
 	// Every time the propagation_runner's per-resource RegradeResource call
