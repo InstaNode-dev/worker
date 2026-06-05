@@ -123,6 +123,39 @@ var (
 		Help: "Deployments soft-deleted (status='expired') by the expirer worker.",
 	})
 
+	// ── scale-to-zero (deploy_idle_scaler.go, Task #54) ──────────────────────
+	//
+	// DeployScaledToZeroTotal increments once per scale action, labelled by
+	// outcome:
+	//   outcome="scaled_down"  — an idle app was descheduled to replicas=0
+	//                            (k8s patch + DB flip both succeeded). The
+	//                            happy "we saved compute" path.
+	//   outcome="woke_up"      — reserved for a worker-initiated wake (the api
+	//                            wake endpoint owns the user-initiated path);
+	//                            present so the dashboard series exists.
+	//   outcome="wake_failed"  — a wake/scale-up attempt failed (k8s error).
+	//                            P1 if > 0: a user's app may be stuck asleep.
+	//   outcome="scale_failed" — a scale-DOWN k8s patch failed (the row is left
+	//                            untouched and retried next tick). P2 observ.
+	//
+	// NR alert: deploy-scale-to-zero-fail.json (wake_failed > 0 → P1;
+	// scale_failed sustained → P2). Prom rule: DeployScaleToZeroFailures.
+	// Dashboard tile: infra/newrelic/dashboards/instanode-reliability.json.
+	// Catalog: infra/observability/METRICS-CATALOG.md (lazy *Vec — label
+	// families primed in metrics_test.go so /metrics exposes them from start).
+	DeployScaledToZeroTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_scaled_to_zero_total",
+		Help: "Scale-to-zero idle-scaler actions by outcome (scaled_down | woke_up | wake_failed | scale_failed).",
+	}, []string{"outcome"})
+
+	// DeployIdleApps is the gauge of apps observed asleep (scaled_to_zero=true)
+	// at the end of each idle-scaler tick. Tracks the descheduled fleet size —
+	// the headline "how much compute scale-to-zero is reclaiming" signal.
+	DeployIdleApps = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "instant_deploy_idle_apps",
+		Help: "Deployments currently scaled to zero (asleep), sampled each idle-scaler tick.",
+	})
+
 	// DeployRemindersSentTotal counts reminder emails actually dispatched
 	// to a real owner email (post-CAS, post-email-send).
 	DeployRemindersSentTotal = promauto.NewCounter(prometheus.CounterOpts{
