@@ -30,7 +30,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	clientfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"instant.dev/worker/internal/metrics"
@@ -308,6 +310,51 @@ func TestNewK8sDeployScaleClientFromCluster_NoConfig(t *testing.T) {
 	if _, err := NewK8sDeployScaleClientFromCluster(); err == nil {
 		t.Error("expected error with no in-cluster config and no kubeconfig")
 	}
+}
+
+// TestNewK8sDeployScaleClientFromCluster_Success overrides the clientset builder
+// seam so the success return is exercised without a reachable cluster. A
+// rest.Config pointed at an unroutable host builds a *kubernetes.Clientset
+// without connecting, proving the constructor wraps it into a non-nil provider.
+func TestNewK8sDeployScaleClientFromCluster_Success(t *testing.T) {
+	orig := newDeployScaleClientset
+	t.Cleanup(func() { newDeployScaleClientset = orig })
+	newDeployScaleClientset = func() (*kubernetes.Clientset, error) {
+		return kubernetes.NewForConfig(&rest.Config{Host: "http://localhost:1"})
+	}
+	prov, err := NewK8sDeployScaleClientFromCluster()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if prov == nil {
+		t.Fatal("expected non-nil scale provider")
+	}
+}
+
+// TestBuildIdleScaleK8s covers both branches of the StartWorkers helper that
+// wires the idle-scaler's k8s client: success returns the provider; a builder
+// error returns nil (fail-open) rather than propagating.
+func TestBuildIdleScaleK8s(t *testing.T) {
+	orig := newDeployScaleClientset
+	t.Cleanup(func() { newDeployScaleClientset = orig })
+
+	t.Run("success returns provider", func(t *testing.T) {
+		newDeployScaleClientset = func() (*kubernetes.Clientset, error) {
+			return kubernetes.NewForConfig(&rest.Config{Host: "http://localhost:1"})
+		}
+		if got := buildIdleScaleK8s(); got == nil {
+			t.Fatal("expected non-nil provider on success")
+		}
+	})
+
+	t.Run("builder error returns nil", func(t *testing.T) {
+		newDeployScaleClientset = func() (*kubernetes.Clientset, error) {
+			return nil, errors.New("no cluster")
+		}
+		if got := buildIdleScaleK8s(); got != nil {
+			t.Fatalf("expected nil provider on builder error; got %v", got)
+		}
+	})
 }
 
 // TestDeployIdleScaler_ListQueryError: a failing candidate SELECT bubbles up as

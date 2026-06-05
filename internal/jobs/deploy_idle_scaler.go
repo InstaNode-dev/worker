@@ -144,12 +144,18 @@ func NewK8sDeployScaleClient(cs kubernetes.Interface) deployScaleK8sProvider {
 // short-circuits with a WARN each tick (fail-open, identical to the status
 // reconciler). Reuses newDeployK8sClientset from deploy_status_reconcile.go.
 func NewK8sDeployScaleClientFromCluster() (deployScaleK8sProvider, error) {
-	cs, err := newDeployK8sClientset()
+	cs, err := newDeployScaleClientset()
 	if err != nil {
 		return nil, err
 	}
 	return &k8sDeployScaleClient{cs: cs}, nil
 }
+
+// newDeployScaleClientset is a package-level indirection over
+// newDeployK8sClientset so tests can override the clientset builder to exercise
+// the success return of NewK8sDeployScaleClientFromCluster without a reachable
+// cluster.
+var newDeployScaleClientset = newDeployK8sClientset
 
 // compile-time assertion that the production client satisfies the interface.
 var _ deployScaleK8sProvider = (*k8sDeployScaleClient)(nil)

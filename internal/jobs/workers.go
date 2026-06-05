@@ -317,6 +317,23 @@ func newMinioAdminClient(cfg *config.Config) (*madmin.AdminClient, error) {
 	})
 }
 
+// buildIdleScaleK8s constructs the scale-to-zero idle-scaler's k8s client from
+// cluster config. Returns nil (NOT an error) when no cluster is reachable
+// (CI / docker-compose) so StartWorkers stays fail-open: the worker warn-logs
+// and the idle-scaler short-circuits each tick while every other periodic job
+// keeps running. Extracted from StartWorkers so the success/failure branches
+// are unit-testable without a live River DB.
+func buildIdleScaleK8s() deployScaleK8sProvider {
+	scaleClient, scErr := NewK8sDeployScaleClientFromCluster()
+	if scErr != nil {
+		slog.Warn("workers.deploy_idle_scaler.k8s_client_unavailable",
+			"error", scErr,
+			"note", "idle-scaler will short-circuit each tick until the worker restarts with a reachable cluster")
+		return nil
+	}
+	return scaleClient
+}
+
 func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, backupPlans BackupPlanRegistry, deployStatusK8s deployStatusK8sProvider, deployAutopsyK8s deployAutopsyK8sProvider, nrApp *newrelic.Application) *Workers {
 	// rdb is used by LoopsEventForwarderWorker (cursor storage). Other
 	// workers access redis indirectly via the platform DB.
@@ -511,14 +528,7 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// client from cluster config; nil when unreachable (CI / docker-compose) →
 	// the worker warn-logs each tick and other periodic jobs keep running. See
 	// deploy_idle_scaler.go for the idle-signal + cold-start design notes.
-	var idleScaleK8s deployScaleK8sProvider
-	if scaleClient, scErr := NewK8sDeployScaleClientFromCluster(); scErr != nil {
-		slog.Warn("workers.deploy_idle_scaler.k8s_client_unavailable",
-			"error", scErr,
-			"note", "idle-scaler will short-circuit each tick until the worker restarts with a reachable cluster")
-	} else {
-		idleScaleK8s = scaleClient
-	}
+	idleScaleK8s := buildIdleScaleK8s()
 	river.AddWorker(workers, WithObservability(
 		NewDeployIdleScaler(db, idleScaleK8s, cfg.DeployScaleToZeroEnabled, cfg.DeployScaleToZeroIdleMinutes),
 		nrApp))
