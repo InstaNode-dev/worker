@@ -163,6 +163,12 @@ func ensureSchema(t *testing.T, db *sql.DB) {
 		// works against a bare DB AND a fully api-migrated one.
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS is_test_cohort BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`,
+		// deletion-lifecycle columns the team-deletion executor + the
+		// e2e_cohort_sweep reaper read/write (status flip, tombstone stamp,
+		// grace-window scan). Idempotent adds so the harness works on a bare DB
+		// AND a fully api-migrated one (where these come from the deletion migs).
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ`,
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS tombstoned_at TIMESTAMPTZ`,
 
 		// resources — the entitlement reconciler reads tier / applied_conn_limit.
 		`CREATE TABLE IF NOT EXISTS resources (

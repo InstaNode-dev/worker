@@ -701,6 +701,38 @@ var (
 		Help: "Orphan-sweep reconciler reap attempts that failed (k8s API error or DB write failure), labelled by reason.",
 	}, []string{"reason"})
 
+	// E2ECohortSweptTotal counts the e2e_cohort_sweep job's per-team outcomes.
+	// The job is the belt-and-suspenders backstop that purges STALE synthetic
+	// test-cohort teams (teams.is_test_cohort=true, api migration 067) — the
+	// ephemeral accounts a CI run creates via the api's /internal/e2e/account
+	// endpoint and is supposed to delete on its own. If a CI run dies before
+	// reaping its account, this job tombstones the leftover team after a short
+	// TTL so a half-cleaned cohort team never lingers (and never re-enters a
+	// real funnel scan).
+	//
+	// outcome label (bounded set):
+	//   "swept"              — team purged + tombstoned via the team-deletion
+	//                          executor's idempotent per-team teardown.
+	//   "failed"            — purge attempt errored; the team stays in
+	//                          deletion_pending for the next tick / operator.
+	//   "skipped_not_cohort" — DEFENSIVE guard tripped: a candidate that the
+	//                          WHERE clause selected was re-checked at purge
+	//                          time and was NOT is_test_cohort (the row flipped
+	//                          underneath us). A non-zero rate here means the
+	//                          candidate query and the guard disagree — alert.
+	//
+	// NR alert (mandatory, rule 25):
+	//   sum(rate(instant_e2e_cohort_swept_total{outcome="skipped_not_cohort"}[1h])) > 0
+	//     → P1 page. The sweep nearly purged a non-cohort team — the candidate
+	//     query may have regressed; investigate before the next tick.
+	//   sum(rate(instant_e2e_cohort_swept_total{outcome="failed"}[6h])) > 0
+	//     → P2 page. A cohort team could not be torn down; CI accounts are
+	//     leaking compute/DB rows.
+	E2ECohortSweptTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_e2e_cohort_swept_total",
+		Help: "e2e_cohort_sweep per-team outcomes (swept/failed/skipped_not_cohort). Backstop reaper for stale CI test-cohort teams.",
+	}, []string{"outcome"})
+
 	// PGPool* gauges expose worker's *sql.DB pool state. Sampled every
 	// 5s by the exporter started from main.go. See api/internal/metrics
 	// for the matching counterparts in the api process.
