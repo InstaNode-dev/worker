@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 )
 
 // Config holds all runtime configuration for the worker service.
@@ -52,6 +53,16 @@ type Config struct {
 	SESAWSSecretKey  string            // SES_AWS_SECRET_ACCESS_KEY
 	SESFromEmail     string            // SES_FROM_EMAIL (must be a verified SES identity)
 	SESTemplateNames map[string]string // SES_TEMPLATE_NAMES (JSON object: audit_log.kind → SES template name)
+
+	// EmailProviderFallback is the EMAIL_PROVIDER_FALLBACK env var: a
+	// comma-separated, ordered list of secondary provider names (e.g. "ses")
+	// the failover provider retries through when the primary errors or hard-
+	// rejects a send. Inert by default — unset/empty means single-provider
+	// mode, byte-identical to the pre-failover worker. Each named fallback
+	// reuses that provider's existing sub-config (Brevo*/SES*). A fallback
+	// whose creds are unset is skipped-with-warning at boot (not fatal) so an
+	// operator can stage EMAIL_PROVIDER_FALLBACK ahead of the secret.
+	EmailProviderFallback []string // EMAIL_PROVIDER_FALLBACK (comma-separated)
 
 	Environment       string // ENVIRONMENT
 	MaxMindLicenseKey string // MAXMIND_LICENSE_KEY — for GeoLite2 refresh job
@@ -196,30 +207,31 @@ func require(key string) string {
 // Load reads configuration from environment variables. Panics on missing required fields.
 func Load() *Config {
 	cfg := &Config{
-		DatabaseURL:          require("DATABASE_URL"),
-		RedisURL:             getenv("REDIS_URL", "redis://localhost:6379"),
-		ProvisionerAddr:      os.Getenv("PROVISIONER_ADDR"),
-		ProvisionerSecret:    os.Getenv("PROVISIONER_SECRET"),
-		EmailProvider:        os.Getenv("EMAIL_PROVIDER"),
-		BrevoAPIKey:          os.Getenv("BREVO_API_KEY"),
-		BrevoTemplateIDs:     parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
-		BrevoSenderEmail:     os.Getenv("BREVO_SENDER_EMAIL"),
-		BrevoSenderName:      os.Getenv("BREVO_SENDER_NAME"),
-		SESAWSRegion:         os.Getenv("SES_AWS_REGION"),
-		SESAWSAccessKey:      os.Getenv("SES_AWS_ACCESS_KEY_ID"),
-		SESAWSSecretKey:      os.Getenv("SES_AWS_SECRET_ACCESS_KEY"),
-		SESFromEmail:         os.Getenv("SES_FROM_EMAIL"),
-		SESTemplateNames:     parseSESTemplateNames(os.Getenv("SES_TEMPLATE_NAMES")),
-		Environment:          getenv("ENVIRONMENT", "development"),
-		MaxMindLicenseKey:    os.Getenv("MAXMIND_LICENSE_KEY"),
-		GeoLite2DBPath:       getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
-		PlansPath:            os.Getenv("PLANS_PATH"),
-		ObjectStoreEndpoint:  os.Getenv("OBJECT_STORE_ENDPOINT"),
-		ObjectStoreAccessKey: os.Getenv("OBJECT_STORE_ACCESS_KEY"),
-		ObjectStoreSecretKey: os.Getenv("OBJECT_STORE_SECRET_KEY"),
-		ObjectStoreBucket:    getenv("OBJECT_STORE_BUCKET", "instant-shared"),
-		ObjectStoreRegion:    os.Getenv("OBJECT_STORE_REGION"),
-		ObjectStoreSecure:    os.Getenv("OBJECT_STORE_SECURE") == "true",
+		DatabaseURL:           require("DATABASE_URL"),
+		RedisURL:              getenv("REDIS_URL", "redis://localhost:6379"),
+		ProvisionerAddr:       os.Getenv("PROVISIONER_ADDR"),
+		ProvisionerSecret:     os.Getenv("PROVISIONER_SECRET"),
+		EmailProvider:         os.Getenv("EMAIL_PROVIDER"),
+		BrevoAPIKey:           os.Getenv("BREVO_API_KEY"),
+		BrevoTemplateIDs:      parseBrevoTemplateIDs(os.Getenv("BREVO_TEMPLATE_IDS")),
+		BrevoSenderEmail:      os.Getenv("BREVO_SENDER_EMAIL"),
+		BrevoSenderName:       os.Getenv("BREVO_SENDER_NAME"),
+		SESAWSRegion:          os.Getenv("SES_AWS_REGION"),
+		SESAWSAccessKey:       os.Getenv("SES_AWS_ACCESS_KEY_ID"),
+		SESAWSSecretKey:       os.Getenv("SES_AWS_SECRET_ACCESS_KEY"),
+		SESFromEmail:          os.Getenv("SES_FROM_EMAIL"),
+		SESTemplateNames:      parseSESTemplateNames(os.Getenv("SES_TEMPLATE_NAMES")),
+		EmailProviderFallback: parseCSVProviders(os.Getenv("EMAIL_PROVIDER_FALLBACK")),
+		Environment:           getenv("ENVIRONMENT", "development"),
+		MaxMindLicenseKey:     os.Getenv("MAXMIND_LICENSE_KEY"),
+		GeoLite2DBPath:        getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
+		PlansPath:             os.Getenv("PLANS_PATH"),
+		ObjectStoreEndpoint:   os.Getenv("OBJECT_STORE_ENDPOINT"),
+		ObjectStoreAccessKey:  os.Getenv("OBJECT_STORE_ACCESS_KEY"),
+		ObjectStoreSecretKey:  os.Getenv("OBJECT_STORE_SECRET_KEY"),
+		ObjectStoreBucket:     getenv("OBJECT_STORE_BUCKET", "instant-shared"),
+		ObjectStoreRegion:     os.Getenv("OBJECT_STORE_REGION"),
+		ObjectStoreSecure:     os.Getenv("OBJECT_STORE_SECURE") == "true",
 
 		MinioEndpoint:     os.Getenv("MINIO_ENDPOINT"),
 		MinioRootUser:     os.Getenv("MINIO_ROOT_USER"),
@@ -371,4 +383,25 @@ func parseSESTemplateNames(raw string) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+// parseCSVProviders splits the EMAIL_PROVIDER_FALLBACK env var into an ordered,
+// trimmed list of provider names, dropping empty segments. "" → nil (inert
+// default: no failover). "ses" → ["ses"]. " ses , brevo " → ["ses","brevo"].
+// Returns nil (not an empty slice) when there are no usable entries so the
+// factory's len(cfg.Fallbacks)==0 inert-default check is unambiguous.
+func parseCSVProviders(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	out := make([]string, 0, 2)
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
