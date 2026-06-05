@@ -17,6 +17,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"testing"
 
@@ -30,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"instant.dev/worker/internal/metrics"
 )
@@ -282,6 +284,137 @@ func TestNamespaceAndNameFromProviderID(t *testing.T) {
 			t.Errorf("namespaceAndNameFromProviderID(%q) = (%q,%q); want (%q,%q)",
 				c.providerID, ns, name, c.wantNS, c.wantName)
 		}
+	}
+}
+
+// TestDeployIdleScalerArgs_Kind pins the River job kind.
+func TestDeployIdleScalerArgs_Kind(t *testing.T) {
+	if (DeployIdleScalerArgs{}).Kind() != "deploy_idle_scaler" {
+		t.Errorf("Kind() = %q; want deploy_idle_scaler", (DeployIdleScalerArgs{}).Kind())
+	}
+}
+
+// TestNewK8sDeployScaleClientFromCluster_NoConfig exercises the cluster
+// constructor's error path when neither in-cluster config nor a kubeconfig is
+// reachable. Gated like TestNewDeployK8sClientset_NoConfig so it does not pick
+// up a developer's ~/.kube/config.
+func TestNewK8sDeployScaleClientFromCluster_NoConfig(t *testing.T) {
+	if _, err := os.Stat(clientcmd.RecommendedHomeFile); err == nil {
+		t.Skip("kubeconfig present on host — error path not reachable here")
+	}
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		t.Skip("running in-cluster — in-cluster config will succeed")
+	}
+	if _, err := NewK8sDeployScaleClientFromCluster(); err == nil {
+		t.Error("expected error with no in-cluster config and no kubeconfig")
+	}
+}
+
+// TestDeployIdleScaler_ListQueryError: a failing candidate SELECT bubbles up as
+// a job error (River retries).
+func TestDeployIdleScaler_ListQueryError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(`SELECT id, COALESCE\(provider_id`).
+		WillReturnError(errors.New("db down"))
+	w := NewDeployIdleScaler(db, &recordingScaleProvider{}, true, 30)
+	if err := w.Work(context.Background(), idleScalerJob()); err == nil {
+		t.Error("list query error should fail the job")
+	}
+}
+
+// TestDeployIdleScaler_ScanError: a row whose id column is a non-UUID scrap
+// forces a rows.Scan error inside listIdleCandidates → job error.
+func TestDeployIdleScaler_ScanError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(`SELECT id, COALESCE\(provider_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id"}).
+			AddRow("not-a-uuid", "app-x"))
+	w := NewDeployIdleScaler(db, &recordingScaleProvider{}, true, 30)
+	if err := w.Work(context.Background(), idleScalerJob()); err == nil {
+		t.Error("scan error should fail the job")
+	}
+}
+
+// TestDeployIdleScaler_SkipsForeignProviderID: a candidate whose provider_id is
+// not in app-<appID> shape (e.g. a stack row that slipped the SQL filter) is
+// skipped without a scale call or DB flip.
+func TestDeployIdleScaler_SkipsForeignProviderID(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(`SELECT id, COALESCE\(provider_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id"}).
+			AddRow(uuid.New(), "instant-stack-xyz"))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM deployments WHERE scaled_to_zero = true`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	prov := &recordingScaleProvider{}
+	w := NewDeployIdleScaler(db, prov, true, 30)
+	if err := w.Work(context.Background(), idleScalerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if prov.callCount() != 0 {
+		t.Errorf("foreign provider_id must not be scaled; got %d calls", prov.callCount())
+	}
+}
+
+// TestDeployIdleScaler_DBFlipError: a failing scaled_to_zero UPDATE after a
+// successful scale increments scale_failed (the row is retried next tick).
+func TestDeployIdleScaler_DBFlipError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	id := uuid.New()
+	mock.ExpectQuery(`SELECT id, COALESCE\(provider_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id"}).AddRow(id, "app-dbflip"))
+	mock.ExpectExec(`UPDATE deployments`).
+		WithArgs(id, "healthy").
+		WillReturnError(errors.New("update exploded"))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM deployments WHERE scaled_to_zero = true`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	prov := &recordingScaleProvider{}
+	w := NewDeployIdleScaler(db, prov, true, 30)
+
+	before := testutil.ToFloat64(metrics.DeployScaledToZeroTotal.WithLabelValues("scale_failed"))
+	if err := w.Work(context.Background(), idleScalerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	after := testutil.ToFloat64(metrics.DeployScaledToZeroTotal.WithLabelValues("scale_failed"))
+	if after != before+1 {
+		t.Errorf("db-flip error must increment scale_failed: before=%v after=%v", before, after)
+	}
+}
+
+// TestDeployIdleScaler_GaugeSampleError: a failing countAsleep query is logged
+// but does not fail the job (the scale-down already succeeded).
+func TestDeployIdleScaler_GaugeSampleError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	id := uuid.New()
+	mock.ExpectQuery(`SELECT id, COALESCE\(provider_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "provider_id"}).AddRow(id, "app-g"))
+	mock.ExpectExec(`UPDATE deployments`).
+		WithArgs(id, "healthy").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM deployments WHERE scaled_to_zero = true`).
+		WillReturnError(errors.New("count failed"))
+	w := NewDeployIdleScaler(db, &recordingScaleProvider{}, true, 30)
+	if err := w.Work(context.Background(), idleScalerJob()); err != nil {
+		t.Fatalf("gauge-sample error must not fail the job, got: %v", err)
 	}
 }
 
