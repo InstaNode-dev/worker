@@ -108,6 +108,16 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	DeployAutopsyCapturedTotal.WithLabelValues("logs_unavailable").Add(0)
 	DeployAutopsyCapturedTotal.WithLabelValues("already_present").Add(0)
 	DeployAutopsyCapturedTotal.WithLabelValues("audit_emit_failed").Add(0)
+	// Prime all four scale-to-zero outcome label values so /metrics exposes the
+	// series from process start (lazy *Vec otherwise leaves the dashboard tile
+	// empty until the first real scale action).
+	DeployScaledToZeroTotal.WithLabelValues("scaled_down").Add(0)
+	DeployScaledToZeroTotal.WithLabelValues("woke_up").Add(0)
+	DeployScaledToZeroTotal.WithLabelValues("wake_failed").Add(0)
+	DeployScaledToZeroTotal.WithLabelValues("scale_failed").Add(0)
+
+	// Plain gauge
+	DeployIdleApps.Set(0)
 
 	// Gauge vecs
 	ResourceDegradedGauge.WithLabelValues("postgres").Set(0)

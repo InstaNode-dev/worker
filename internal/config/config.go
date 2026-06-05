@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -178,6 +179,15 @@ type Config struct {
 	FlowSyntheticTier        string // FLOW_SYNTHETIC_TIER — seeded tier (default free)
 	FlowSyntheticDisabled    string // FLOW_SYNTHETIC_DISABLED — comma list of per-flow kill switches
 	FlowSyntheticJWTSecret   string // JWT_SECRET — shared with api; mints the synthetic session JWT
+
+	// Scale-to-zero idle-scaler (deploy_idle_scaler.go, Task #54). INERT unless
+	// DeployScaleToZeroEnabled is true — the master flag (shared name with the
+	// api's wake-path flag). When off, the idle-scaler sweep is a no-op (no k8s
+	// patch, no DB write). DeployScaleToZeroIdleMinutes is the no-activity
+	// threshold before an app is descheduled (default 30; floored at 5 to avoid
+	// pathological flapping). Enabling is an operator action after a canary.
+	DeployScaleToZeroEnabled     bool // DEPLOY_SCALE_TO_ZERO_ENABLED — master flag (default false)
+	DeployScaleToZeroIdleMinutes int  // DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES — idle threshold (default 30)
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -294,6 +304,20 @@ func Load() *Config {
 		FlowSyntheticTier:        os.Getenv("FLOW_SYNTHETIC_TIER"),
 		FlowSyntheticDisabled:    os.Getenv("FLOW_SYNTHETIC_DISABLED"),
 		FlowSyntheticJWTSecret:   os.Getenv("JWT_SECRET"),
+
+		// Scale-to-zero idle-scaler (Task #54). Default OFF; idle threshold
+		// default 30 min (parsed below).
+		DeployScaleToZeroEnabled: os.Getenv("DEPLOY_SCALE_TO_ZERO_ENABLED") == "true",
+	}
+
+	// DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES: minutes of no-activity before an app is
+	// descheduled. Default 30; an unset / unparseable / sub-5 value floors to 30
+	// so a misconfig can't make the scaler aggressively flap apps to sleep.
+	cfg.DeployScaleToZeroIdleMinutes = 30
+	if v := strings.TrimSpace(os.Getenv("DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 5 {
+			cfg.DeployScaleToZeroIdleMinutes = n
+		}
 	}
 
 	// Fall back to the shared object-store bucket when the operator hasn't

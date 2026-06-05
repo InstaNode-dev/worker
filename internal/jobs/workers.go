@@ -317,6 +317,23 @@ func newMinioAdminClient(cfg *config.Config) (*madmin.AdminClient, error) {
 	})
 }
 
+// buildIdleScaleK8s constructs the scale-to-zero idle-scaler's k8s client from
+// cluster config. Returns nil (NOT an error) when no cluster is reachable
+// (CI / docker-compose) so StartWorkers stays fail-open: the worker warn-logs
+// and the idle-scaler short-circuits each tick while every other periodic job
+// keeps running. Extracted from StartWorkers so the success/failure branches
+// are unit-testable without a live River DB.
+func buildIdleScaleK8s() deployScaleK8sProvider {
+	scaleClient, scErr := NewK8sDeployScaleClientFromCluster()
+	if scErr != nil {
+		slog.Warn("workers.deploy_idle_scaler.k8s_client_unavailable",
+			"error", scErr,
+			"note", "idle-scaler will short-circuit each tick until the worker restarts with a reachable cluster")
+		return nil
+	}
+	return scaleClient
+}
+
 func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient *provisioner.Client, planRegistry PlanRegistry, backupPlans BackupPlanRegistry, deployStatusK8s deployStatusK8sProvider, deployAutopsyK8s deployAutopsyK8sProvider, nrApp *newrelic.Application) *Workers {
 	// rdb is used by LoopsEventForwarderWorker (cursor storage). Other
 	// workers access redis indirectly via the platform DB.
@@ -506,6 +523,15 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	statusReconciler := NewDeployStatusReconciler(db, deployStatusK8s).
 		WithAutopsyK8s(deployAutopsyK8s)
 	river.AddWorker(workers, WithObservability(statusReconciler, nrApp))
+	// Scale-to-zero idle-scaler (Task #54). INERT unless
+	// DEPLOY_SCALE_TO_ZERO_ENABLED is set (default off). Builds its own scale
+	// client from cluster config; nil when unreachable (CI / docker-compose) →
+	// the worker warn-logs each tick and other periodic jobs keep running. See
+	// deploy_idle_scaler.go for the idle-signal + cold-start design notes.
+	idleScaleK8s := buildIdleScaleK8s()
+	river.AddWorker(workers, WithObservability(
+		NewDeployIdleScaler(db, idleScaleK8s, cfg.DeployScaleToZeroEnabled, cfg.DeployScaleToZeroIdleMinutes),
+		nrApp))
 	// Event-email forwarder — drains audit_log rows into the configured
 	// provider every 60s for lifecycle email triggering. The provider is
 	// always non-nil (NoopProvider when EMAIL_PROVIDER is unset). See
@@ -1125,6 +1151,18 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return GitHubDeployDispatcherArgs{}, reconcileInsertOpts(githubDispatcherInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Scale-to-zero idle-scaler (Task #54) — every 2 min. INERT unless
+		// DEPLOY_SCALE_TO_ZERO_ENABLED (the worker is registered regardless; its
+		// Work() short-circuits when the flag is off). RunOnStart=false: there's
+		// no backlog to drain on boot and we don't want a worker restart to
+		// immediately deschedule apps before the first idle window elapses.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(deployIdleScalerInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return DeployIdleScalerArgs{}, reconcileInsertOpts(deployIdleScalerInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
 		),
 		// Magic-link reconciler — every 60s. RunOnStart=true so a worker
 		// restart immediately drains rows whose first send failed while

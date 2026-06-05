@@ -126,6 +126,36 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
+// TestLoad_DeployScaleToZeroIdleMinutes exercises the env-parse branch for
+// DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES: a valid value is honoured; an invalid /
+// sub-5 value floors to the 30-minute default.
+func TestLoad_DeployScaleToZeroIdleMinutes(t *testing.T) {
+	t.Run("valid override", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost/db")
+		t.Setenv("DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES", "45")
+		if got := Load().DeployScaleToZeroIdleMinutes; got != 45 {
+			t.Errorf("DeployScaleToZeroIdleMinutes = %d; want 45", got)
+		}
+	})
+	t.Run("sub-5 floors to default", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost/db")
+		t.Setenv("DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES", "3")
+		if got := Load().DeployScaleToZeroIdleMinutes; got != 30 {
+			t.Errorf("sub-5 DeployScaleToZeroIdleMinutes = %d; want floor 30", got)
+		}
+	})
+	t.Run("non-numeric floors to default", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost/db")
+		t.Setenv("DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES", "abc")
+		if got := Load().DeployScaleToZeroIdleMinutes; got != 30 {
+			t.Errorf("non-numeric DeployScaleToZeroIdleMinutes = %d; want floor 30", got)
+		}
+	})
+}
+
 func TestLoad_PanicsWithoutDatabaseURL(t *testing.T) {
 	clearEnv(t)
 	defer func() {
