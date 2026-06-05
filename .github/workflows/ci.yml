@@ -113,6 +113,13 @@ jobs:
           suite: build-and-test
           pr-number: ${{ github.event.pull_request.number }}
           failed-step: ${{ job.status != 'success' && 'go build / vet / test (-race)' || '' }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ github.ref_name }}
+          commit-sha: ${{ github.sha }}
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          event-name: ${{ github.event_name }}
+          actor: ${{ github.actor }}
 
   # ------------------------------------------------------------------
   # GATING integration job (W2-T1).
@@ -241,3 +248,10 @@ jobs:
           suite: integration
           pr-number: ${{ github.event.pull_request.number }}
           failed-step: ${{ job.status != 'success' && 'real-DB integration tests' || '' }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ github.ref_name }}
+          commit-sha: ${{ github.sha }}
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          event-name: ${{ github.event_name }}
+          actor: ${{ github.actor }}
