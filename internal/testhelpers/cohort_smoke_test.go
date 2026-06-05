@@ -55,6 +55,14 @@ func TestCohortErrorArms(t *testing.T) {
 	// SetTeamTestCohort returns nothing; the closed-DB Exec error fires tFatalf.
 	SetTeamTestCohort(t, closed, id, true)
 
+	if got := SeedCohortTeamWithAge(t, closed, 3*time.Hour); got != uuid.Nil {
+		t.Fatalf("SeedCohortTeamWithAge on closed db = %v, want Nil", got)
+	}
+
+	// ClearPreexistingTestCohortTeams returns nothing; the closed-DB Exec
+	// error fires tFatalf.
+	ClearPreexistingTestCohortTeams(t, closed)
+
 	if got := SeedPrimaryUser(t, closed, id, "smoke"); got != uuid.Nil {
 		t.Fatalf("SeedPrimaryUser on closed db = %v, want Nil", got)
 	}
@@ -77,9 +85,9 @@ func TestCohortErrorArms(t *testing.T) {
 		t.Fatal("CheckoutNotified on closed db = true, want false")
 	}
 
-	// 8 distinct fallible call paths each recorded at least one Fatalf.
-	if len(*fatals) < 8 {
-		t.Fatalf("expected >=8 recorded Fatalf arms against the closed DB, got %d: %v", len(*fatals), *fatals)
+	// 10 distinct fallible call paths each recorded at least one Fatalf.
+	if len(*fatals) < 10 {
+		t.Fatalf("expected >=10 recorded Fatalf arms against the closed DB, got %d: %v", len(*fatals), *fatals)
 	}
 }
 
@@ -105,6 +113,24 @@ func TestIntegration_CohortRoundTrip(t *testing.T) {
 	SetTeamTestCohort(t, db, team, false)
 	if got := isTestCohort(t, db, team); got {
 		t.Fatal("SetTeamTestCohort(false) did not clear is_test_cohort")
+	}
+
+	// SeedCohortTeamWithAge: a stale (3h-old) is_test_cohort team — the
+	// e2e_cohort_sweep candidate shape. Read back the flag + age to exercise
+	// the happy path.
+	staleCohort := SeedCohortTeamWithAge(t, db, 3*time.Hour)
+	if staleCohort == uuid.Nil {
+		t.Fatal("SeedCohortTeamWithAge returned nil uuid")
+	}
+	if got := isTestCohort(t, db, staleCohort); !got {
+		t.Fatal("SeedCohortTeamWithAge did not set is_test_cohort=true")
+	}
+
+	// ClearPreexistingTestCohortTeams flips the flag off across the DB — the
+	// staleCohort team above must read back is_test_cohort=false afterwards.
+	ClearPreexistingTestCohortTeams(t, db)
+	if got := isTestCohort(t, db, staleCohort); got {
+		t.Fatal("ClearPreexistingTestCohortTeams did not clear is_test_cohort")
 	}
 
 	// SeedPrimaryUser: inserts an is_primary=true user with a globally-unique addr.

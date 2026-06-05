@@ -11,6 +11,7 @@ package testhelpers
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,6 +28,45 @@ func SetTeamTestCohort(t *testing.T, db *sql.DB, teamID uuid.UUID, flagged bool)
 	); err != nil {
 		tFatalf(t, "SetTeamTestCohort: %v", err)
 	}
+}
+
+// ClearPreexistingTestCohortTeams flips is_test_cohort=false on every team that
+// currently carries it — clearing the accumulated debris that prior cohort
+// skip-guard / sweep test runs leave behind on a shared local DB. The
+// e2e_cohort_sweep reaper scans ALL cohort teams globally under a batch limit,
+// so a test that seeds its own cohort teams must first neutralize pre-existing
+// ones or the batch fills with debris and the seeded team is never reached.
+//
+// This is SAFE: no real team is ever is_test_cohort=true (api migration 067
+// defaults every row to false; only synthetic/CI accounts flip it), so the flag
+// on a shared test DB is purely test state. The reset is scoped to the flag
+// only — it does not delete or otherwise mutate the rows.
+func ClearPreexistingTestCohortTeams(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(
+		`UPDATE teams SET is_test_cohort = false WHERE is_test_cohort = true`,
+	); err != nil {
+		tFatalf(t, "ClearPreexistingTestCohortTeams: %v", err)
+	}
+}
+
+// SeedCohortTeamWithAge inserts an 'active' team flagged is_test_cohort=true
+// whose created_at is backdated by `age` — the exact shape the e2e_cohort_sweep
+// reaper keys on. A positive age yields a STALE cohort team (a leaked CI
+// account past the sweep TTL); a small/zero age yields a FRESH one (a CI run
+// still in flight, which the sweep must NOT reap). Returns the team id.
+func SeedCohortTeamWithAge(t *testing.T, db *sql.DB, age time.Duration) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := db.Exec(`
+		INSERT INTO teams (id, name, plan_tier, status, is_test_cohort, created_at)
+		VALUES ($1, $2, 'free', 'active', true, now() - $3::interval)
+	`, id, "itest-cohort-"+id.String()[:8], fmt.Sprintf("%d seconds", int64(age.Seconds()))); err != nil {
+		tFatalf(t, "SeedCohortTeamWithAge: %v", err)
+		return uuid.Nil
+	}
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM teams WHERE id = $1`, id) })
+	return id
 }
 
 // SeedPrimaryUser inserts a primary (is_primary=true) user for a team — the

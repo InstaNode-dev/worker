@@ -94,6 +94,12 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	PropagationUnknownKindTotal.WithLabelValues("unknown").Add(0)
 	OrphanSweepReapedTotal.WithLabelValues("team_tombstoned").Add(0)
 	OrphanSweepReapFailedTotal.WithLabelValues("team_tombstoned").Add(0)
+	// Prime all three e2e_cohort_sweep outcome label values so /metrics
+	// exposes them from process start (lazy emit otherwise leaves the panel
+	// empty until the first real cohort sweep fires).
+	E2ECohortSweptTotal.WithLabelValues("swept").Add(0)
+	E2ECohortSweptTotal.WithLabelValues("failed").Add(0)
+	E2ECohortSweptTotal.WithLabelValues("skipped_not_cohort").Add(0)
 	DeployJobFailedDetectedTotal.WithLabelValues("BackoffLimitExceeded").Add(0)
 	// Prime all four DeployAutopsyCapturedTotal outcome label values so
 	// /metrics exposes them from process start (lazy emit otherwise leaves

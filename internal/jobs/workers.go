@@ -690,6 +690,18 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		orphanReconciler = orphanReconciler.WithPodStateProvider(podStateClient)
 	}
 	river.AddWorker(workers, WithObservability(orphanReconciler, nrApp))
+	// E2E cohort sweep — hourly belt-and-suspenders reaper for STALE
+	// synthetic test-cohort teams (teams.is_test_cohort=true, api migration
+	// 067). CI mints an ephemeral account per E2E run via the api's
+	// /internal/e2e/account endpoint and is supposed to delete it at the end
+	// of the run; a CI run that dies mid-flight leaks the account. This job
+	// purges any is_test_cohort team older than cohortSweepTTL (2h) by reusing
+	// the SAME team-deletion executor's idempotent per-team teardown the
+	// orphan-sweep reconciler reuses. INERT in practice — no real team is
+	// is_test_cohort=true (migration 067 defaults false). The executor is
+	// always non-nil here (it was constructed above), so the job never
+	// fail-open-skips in production. See e2e_cohort_sweep.go.
+	river.AddWorker(workers, WithObservability(NewE2ECohortSweepWorker(db, teamDeletionExecutor), nrApp))
 	// Provisioner-reconciler (W5-A). Every 2min, recovers or abandons
 	// stuck pending resources.
 	//
@@ -1303,6 +1315,19 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 			river.PeriodicInterval(orphanSweepInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return OrphanSweepReconcilerArgs{}, reconcileInsertOpts(orphanSweepInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// E2E cohort sweep — hourly. Belt-and-suspenders reaper for stale CI
+		// test-cohort teams (teams.is_test_cohort=true) leaked by a CI run
+		// that died before deleting its own /internal/e2e/account. Routed to
+		// the reconcile queue so a default-queue fan-out cannot starve it.
+		// RunOnStart=true so a worker restart immediately reclaims accounts
+		// that leaked while it was down. Inert until cohort accounts exist.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(cohortSweepInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return E2ECohortSweepArgs{}, reconcileInsertOpts(cohortSweepInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),
