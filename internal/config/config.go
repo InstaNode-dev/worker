@@ -180,6 +180,24 @@ type Config struct {
 	FlowSyntheticDisabled    string // FLOW_SYNTHETIC_DISABLED — comma list of per-flow kill switches
 	FlowSyntheticJWTSecret   string // JWT_SECRET — shared with api; mints the synthetic session JWT
 
+	// Layer-3 payment prober (payment_probe.go) — the money heartbeat. Drives the
+	// iframe-free payment-funnel contract path against prod every 5 min: checkout
+	// reachability + billing/invoices read surfaces + the webhook signature
+	// security contract, plus an OPTIONAL test-mode upgrade proof. INERT unless
+	// PaymentProbeEnabled is true (the master flag) — a single env flip turns the
+	// whole prober off. JWTSecret reuses JWT_SECRET to mint the Brevo-free session
+	// JWT for the authed prod-safe legs. The upgrade leg is gated on
+	// PaymentProbeTestWebhookSecret + PaymentProbeTestPlanIDPro being set (skips
+	// clean otherwise) and drives NO live Razorpay / no real money. NEVER wire the
+	// LIVE webhook secret here.
+	PaymentProbeEnabled           bool   // PAYMENT_PROBE_ENABLED — master flag (default false)
+	PaymentProbeBaseURL           string // PAYMENT_PROBE_BASE_URL — default https://api.instanode.dev
+	PaymentProbeJWTSecret         string // JWT_SECRET — shared with api; mints the synthetic session JWT
+	PaymentProbeEmail             string // PAYMENT_PROBE_EMAIL — synthetic team primary-user email
+	PaymentProbeTier              string // PAYMENT_PROBE_TIER — seeded tier (default free)
+	PaymentProbeTestWebhookSecret string // RAZORPAY_TEST_WEBHOOK_SECRET — gates the optional upgrade leg (TEST secret only, never live)
+	PaymentProbeTestPlanIDPro     string // PAYMENT_PROBE_TEST_PLAN_ID_PRO — Razorpay TEST plan_id resolving to "pro"
+
 	// Scale-to-zero idle-scaler (deploy_idle_scaler.go, Task #54). INERT unless
 	// DeployScaleToZeroEnabled is true — the master flag (shared name with the
 	// api's wake-path flag). When off, the idle-scaler sweep is a no-op (no k8s
@@ -304,6 +322,20 @@ func Load() *Config {
 		FlowSyntheticTier:        os.Getenv("FLOW_SYNTHETIC_TIER"),
 		FlowSyntheticDisabled:    os.Getenv("FLOW_SYNTHETIC_DISABLED"),
 		FlowSyntheticJWTSecret:   os.Getenv("JWT_SECRET"),
+
+		// Layer-3 payment prober. INERT unless PAYMENT_PROBE_ENABLED=true
+		// (default off, the DoD habit). JWTSecret reuses JWT_SECRET so the worker
+		// mints a Brevo-free session JWT the api verifies against. The upgrade leg
+		// is gated on the TEST webhook secret + test plan id (skips clean
+		// otherwise) — NEVER the live secret, NEVER a real charge. Defaults applied
+		// inside jobs.PaymentProbeConfig.Defaults().
+		PaymentProbeEnabled:           os.Getenv("PAYMENT_PROBE_ENABLED") == "true",
+		PaymentProbeBaseURL:           os.Getenv("PAYMENT_PROBE_BASE_URL"),
+		PaymentProbeJWTSecret:         os.Getenv("JWT_SECRET"),
+		PaymentProbeEmail:             os.Getenv("PAYMENT_PROBE_EMAIL"),
+		PaymentProbeTier:              os.Getenv("PAYMENT_PROBE_TIER"),
+		PaymentProbeTestWebhookSecret: os.Getenv("RAZORPAY_TEST_WEBHOOK_SECRET"),
+		PaymentProbeTestPlanIDPro:     os.Getenv("PAYMENT_PROBE_TEST_PLAN_ID_PRO"),
 
 		// Scale-to-zero idle-scaler (Task #54). Default OFF; idle threshold
 		// default 30 min (parsed below).
