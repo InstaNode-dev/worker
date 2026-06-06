@@ -4,7 +4,9 @@ package jobs
 // payment_grace_periods table looking for teams whose grace expired
 // (expires_at < now()) and calls the api repo's
 // POST /internal/teams/:id/terminate endpoint to (a) pause all resources,
-// (b) downgrade tier to anonymous, (c) mark the dunning row terminated.
+// (b) downgrade tier to FREE — NOT anonymous; a terminated team keeps its
+// team_id, so "free" (claimed-but-unpaid) is the correct floor (see
+// api internal_terminate.go), (c) mark the dunning row terminated.
 //
 // Cadence: every 1h (per the brief). The 1h floor is fine because the
 // grace clock is 7 days; a customer who recovers in the final hour
@@ -27,14 +29,18 @@ package jobs
 // without action — better than booting the worker with no secret and
 // later writing audit_log rows for non-terminations.
 //
-// TODO(ops): WORKER_INTERNAL_JWT_SECRET is a new env var. Operator must
+// OPS: WORKER_INTERNAL_JWT_SECRET is a shared env var. Operator must
 // (1) generate a 32-byte random value, (2) write it into the worker's
 // secrets, (3) write the same value into the api's secrets under
-// WORKER_INTERNAL_JWT_SECRET so the api can verify the bearer token,
-// (4) the api must expose POST /internal/teams/:id/terminate that
-// accepts the bearer + does pause/downgrade/mark-terminated. The
-// endpoint is referenced by this dispatcher but NOT yet implemented in
-// the api repo — that side ships in a separate PR.
+// WORKER_INTERNAL_JWT_SECRET so the api can verify the bearer token.
+// The api side IS shipped: POST /internal/teams/:id/terminate is
+// registered (api router.go → internal_terminate.go::Terminate) and
+// does the pause-resources + downgrade-to-free + mark-grace-terminated
+// + audit-emit work. This dispatcher only fires the call and mirrors the
+// lifecycle event into audit_log for the email forwarder. (Historical
+// note: when this file was first written the api endpoint was a separate
+// follow-up PR — that PR has since merged, so the prior "NOT yet
+// implemented" TODO is removed to avoid misleading an agent reading it.)
 
 import (
 	"bytes"
