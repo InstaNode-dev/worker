@@ -375,7 +375,28 @@ func (w *FlowSyntheticWorker) Work(ctx context.Context, job *river.Job[FlowSynth
 	// flows (recorded per-flow below).
 	seedOK := w.ensureSyntheticTeam(ctx)
 
-	results := w.runMatrix(ctx, runID, commitID, seedOK)
+	// Mint the session JWT once for every authed leg (P0 + money). If the seed
+	// failed OR the mint fails, the authed legs degrade (config/DB drift, not an
+	// outage) — recorded per-flow inside each matrix.
+	bearer := ""
+	if seedOK {
+		var err error
+		bearer, err = w.mintSessionJWT()
+		if err != nil {
+			seedOK = false
+			slog.Warn("jobs.flow_synthetic.mint_failed", "reason", err.Error())
+		}
+	}
+
+	results := w.runMatrix(ctx, runID, commitID, bearer, seedOK)
+
+	// Money/value-journey legs (claim, deploy gate, checkout, magic-link →
+	// Brevo classification) — the value paths a paying customer's money rides
+	// on, each reading a truth surface (rule 12). Same flag, same counters/event,
+	// same matrix. See flow_synthetic_money.go.
+	for flow, res := range w.runMoneyMatrix(ctx, runID, commitID, bearer, seedOK) {
+		results[flow] = res
+	}
 
 	// Reaper backstop: sweep any synthetic resource an earlier mid-leg crash
 	// left behind. Inline reap already handles the happy path; this catches
@@ -408,7 +429,7 @@ type flowSyntheticResult struct {
 // runMatrix executes every (enabled) flow in the P0 set sequentially and
 // returns a flow→result map for the completion log. Each flow is wrapped by
 // runFlow (timeout + recover + record).
-func (w *FlowSyntheticWorker) runMatrix(ctx context.Context, runID, commitID string, seedOK bool) map[string]string {
+func (w *FlowSyntheticWorker) runMatrix(ctx context.Context, runID, commitID, bearer string, seedOK bool) map[string]string {
 	out := map[string]string{}
 
 	// Flow 1 — healthz (anonymous, no auth).
@@ -416,18 +437,9 @@ func (w *FlowSyntheticWorker) runMatrix(ctx context.Context, runID, commitID str
 		return w.flowHealthz(fctx)
 	})
 
-	// Flows 2 & 3 require the seeded team + a minted session JWT. If the seed
-	// failed they degrade (config/DB drift, not an outage) so they don't page.
-	bearer := ""
-	if seedOK {
-		var err error
-		bearer, err = w.mintSessionJWT()
-		if err != nil {
-			seedOK = false
-			slog.Warn("jobs.flow_synthetic.mint_failed", "reason", err.Error())
-		}
-	}
-
+	// Flows 2 & 3 require the seeded team + the minted session JWT (minted once
+	// in Work and passed in). If the seed failed / mint failed seedOK is false
+	// and they degrade (config/DB drift, not an outage) so they don't page.
 	out[flowAuthMe] = w.runFlow(ctx, runID, commitID, flowAuthMe, func(fctx context.Context) flowSyntheticResult {
 		if !seedOK {
 			return flowSyntheticResult{flow: flowAuthMe, actor: flowActorHuman, tier: w.cfg.Tier, result: flowResultDegraded, reason: "synthetic team/JWT unavailable — flow skipped"}
@@ -488,6 +500,14 @@ func flowActorForFlow(flow string) string {
 	case flowAuthMe:
 		return flowActorHuman
 	case flowProvisionReap:
+		return flowActorAgent
+	case flowClaim:
+		return flowActorAnon
+	case flowMagicLink:
+		return flowActorHuman
+	case flowCheckout:
+		return flowActorHuman
+	case flowDeployStatus:
 		return flowActorAgent
 	default:
 		return analyticsevent.ActorUnknown

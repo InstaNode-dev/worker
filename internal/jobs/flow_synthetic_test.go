@@ -18,6 +18,7 @@ package jobs_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +141,17 @@ type flowAPIState struct {
 	dbNewStatus   int
 	dbNewBody     string
 	deleteStatus  int
+
+	// Money/value-journey legs (flow_synthetic_money.go).
+	claimStatus    int    // GET /claim/preview status (contract: 400)
+	claimBody      string // GET /claim/preview body (contract: {"error":"invalid_token"})
+	deployStatus   int    // POST /deploy/new status (free-tier contract: 402)
+	deployBody     string // POST /deploy/new body
+	deployDelStat  int    // DELETE /api/v1/deployments/:id status (reap path)
+	checkoutStatus int    // POST /api/v1/billing/checkout status (contract: non-5xx)
+	checkoutBody   string // POST /api/v1/billing/checkout body
+	emailStartStat int    // POST /auth/email/start status (contract: 202)
+	emailStartBody string // POST /auth/email/start body
 }
 
 func newFlowAPIServer(st *flowAPIState) *httptest.Server {
@@ -160,6 +172,26 @@ func newFlowAPIServer(st *flowAPIState) *httptest.Server {
 	mux.HandleFunc("/api/v1/resources/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(st.deleteStatus)
 	})
+	// Money/value-journey routes.
+	mux.HandleFunc("/claim/preview", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(st.claimStatus)
+		_, _ = w.Write([]byte(st.claimBody))
+	})
+	mux.HandleFunc("/deploy/new", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(st.deployStatus)
+		_, _ = w.Write([]byte(st.deployBody))
+	})
+	mux.HandleFunc("/api/v1/deployments/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(st.deployDelStat)
+	})
+	mux.HandleFunc("/api/v1/billing/checkout", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(st.checkoutStatus)
+		_, _ = w.Write([]byte(st.checkoutBody))
+	})
+	mux.HandleFunc("/auth/email/start", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(st.emailStartStat)
+		_, _ = w.Write([]byte(st.emailStartBody))
+	})
 	return httptest.NewServer(mux)
 }
 
@@ -173,6 +205,17 @@ func happyFlowState() *flowAPIState {
 		dbNewStatus:   http.StatusCreated,
 		dbNewBody:     `{"ok":true,"id":"11111111-1111-4111-8111-111111111111","token":"22222222-2222-4222-8222-222222222222"}`,
 		deleteStatus:  http.StatusOK,
+
+		// Money/value legs — happy contract defaults.
+		claimStatus:    http.StatusBadRequest, // claim preview contract: bad token → 400
+		claimBody:      `{"error":"invalid_token"}`,
+		deployStatus:   http.StatusPaymentRequired, // free-tier deploy gate contract: 402
+		deployBody:     `{"error":"over_limit"}`,
+		deployDelStat:  http.StatusOK,
+		checkoutStatus: http.StatusOK, // checkout reachable, non-5xx
+		checkoutBody:   `{"short_url":"https://rzp.example/x"}`,
+		emailStartStat: http.StatusAccepted, // magic-link send accepted: 202
+		emailStartBody: `{"ok":true}`,
 	}
 }
 
@@ -207,6 +250,23 @@ func expectReapAudit(mock sqlmock.Sqlmock) {
 func expectOrphanSweepEmpty(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(`SELECT id::text\s+FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+}
+
+// expectForwarderClassification sets the expectation for the magic_link leg's
+// rule-12 truth-surface read (latestForwarderClassification). Pass the
+// classification the synthetic recipient's latest send resolved to ("success",
+// "rejected", …). Call once per seeded Work() (the magic_link leg runs only
+// when the DB is present and the leg is not killed).
+func expectForwarderClassification(mock sqlmock.Sqlmock, classification string) {
+	mock.ExpectQuery(`SELECT classification\s+FROM forwarder_sent`).
+		WillReturnRows(sqlmock.NewRows([]string{"classification"}).AddRow(classification))
+}
+
+// expectForwarderNoRow sets the expectation for the magic_link leg finding no
+// recent forwarder_sent row (the async-no-verdict case → leg passes on the 202).
+func expectForwarderNoRow(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`SELECT classification\s+FROM forwarder_sent`).
+		WillReturnError(sql.ErrNoRows)
 }
 
 // flowFixture bundles a worker wired against an sqlmock DB + httptest server,
@@ -292,12 +352,13 @@ func TestFlowSynthetic_HappyPath_AllFlowsPass(t *testing.T) {
 	f := newFixture(t, srv)
 	defer f.done()
 	expectSeed(f.mock)
-	expectReapAudit(f.mock) // the provision→reap leg's synthetic.reaped row
+	expectReapAudit(f.mock)                          // the provision→reap leg's synthetic.reaped row
+	expectForwarderClassification(f.mock, "success") // magic_link rule-12 truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
 
-	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap", "claim", "magic_link", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != analyticsevent.ResultPass {
 			t.Errorf("flow %s: want result=pass, got %q", flow, got)
 		}
@@ -316,9 +377,11 @@ func TestFlowSynthetic_HappyPath_AllFlowsPass(t *testing.T) {
 		t.Errorf("want 1 reaped resource, got %d", reaped)
 	}
 	// One InstantFlowTest event per flow, all cohort=synthetic + commitId.
+	// 7 flows: 3 P0 (healthz/auth_me/provision_reap) + 4 money
+	// (claim/magic_link/deploy_status/checkout).
 	evs := f.fe.flowEvents()
-	if len(evs) != 3 {
-		t.Fatalf("want 3 events, got %d", len(evs))
+	if len(evs) != 7 {
+		t.Fatalf("want 7 events, got %d", len(evs))
 	}
 	for _, e := range evs {
 		if e.eventType != analyticsevent.EventFlowTest {
@@ -348,7 +411,8 @@ func TestFlowSynthetic_HealthzDown_FailsAndAudits(t *testing.T) {
 	expectSeed(f.mock)
 	// healthz fail → audit row for flow_test_failed.
 	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
-	expectReapAudit(f.mock) // provision→reap still reaps
+	expectReapAudit(f.mock)                          // provision→reap still reaps
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -372,6 +436,7 @@ func TestFlowSynthetic_ProvisionReapLeak_Fails(t *testing.T) {
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)                                                              // the leaked reap still writes a ledger row
 	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // flow_test_failed for the leak
+	expectForwarderClassification(f.mock, "success")                                     // magic_link truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -403,6 +468,7 @@ func TestFlowSynthetic_ProvisionFails_NoReap(t *testing.T) {
 	defer f.done()
 	expectSeed(f.mock)
 	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // provision fail audit
+	expectForwarderClassification(f.mock, "success")                                     // magic_link truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -430,6 +496,7 @@ func TestFlowSynthetic_PerFlowKillSwitch_Degrades(t *testing.T) {
 	defer f.done()
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -453,7 +520,8 @@ func TestFlowSynthetic_NoJWTSecret_AuthedFlowsDegrade(t *testing.T) {
 	cfg.JWTSecret = "" // the field under test
 	f := newFixtureCfg(t, srv, cfg)
 	defer f.done()
-	expectSeed(f.mock) // seed still runs (DB present); only the mint fails
+	expectSeed(f.mock)                               // seed still runs (DB present); only the mint fails
+	expectForwarderClassification(f.mock, "success") // claim+magic_link still run (no bearer needed); deploy/checkout degrade
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -461,9 +529,15 @@ func TestFlowSynthetic_NoJWTSecret_AuthedFlowsDegrade(t *testing.T) {
 	if got := f.fm.resultFor("healthz"); got != analyticsevent.ResultPass {
 		t.Errorf("anon healthz should pass: got %q", got)
 	}
-	for _, flow := range []string{"auth_me", "provision_reap"} {
+	for _, flow := range []string{"auth_me", "provision_reap", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != "degraded" {
 			t.Errorf("flow %s with no JWT: want degraded, got %q", flow, got)
+		}
+	}
+	// claim (anon) + magic_link (DB-only) still run despite the mint failure.
+	for _, flow := range []string{"claim", "magic_link"} {
+		if got := f.fm.resultFor(flow); got != analyticsevent.ResultPass {
+			t.Errorf("flow %s should still run without a JWT: want pass, got %q", flow, got)
 		}
 	}
 }
@@ -477,7 +551,8 @@ func TestFlowSynthetic_OrphanSweep_ReapsBackstop(t *testing.T) {
 	f := newFixture(t, srv)
 	defer f.done()
 	expectSeed(f.mock)
-	expectReapAudit(f.mock) // provision→reap inline
+	expectReapAudit(f.mock)                          // provision→reap inline
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface (before the orphan sweep)
 	// Orphan sweep finds one stale resource → UPDATE + ledger row.
 	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("99999999-9999-4999-8999-999999999999"))
@@ -509,6 +584,7 @@ func TestFlowSynthetic_SeedFails_AuthedFlowsDegrade(t *testing.T) {
 	f.mock.ExpectBegin()
 	f.mock.ExpectExec(`INSERT INTO teams`).WillReturnError(errSeed)
 	f.mock.ExpectRollback()
+	expectForwarderClassification(f.mock, "success") // claim+magic_link still run despite seed failure
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -516,7 +592,7 @@ func TestFlowSynthetic_SeedFails_AuthedFlowsDegrade(t *testing.T) {
 	if got := f.fm.resultFor("healthz"); got != analyticsevent.ResultPass {
 		t.Errorf("anon healthz should still pass on seed failure: got %q", got)
 	}
-	for _, flow := range []string{"auth_me", "provision_reap"} {
+	for _, flow := range []string{"auth_me", "provision_reap", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != "degraded" {
 			t.Errorf("flow %s on seed failure: want degraded, got %q", flow, got)
 		}
@@ -545,6 +621,7 @@ func TestFlowSynthetic_HealthzBadBody_Fails(t *testing.T) {
 			expectSeed(f.mock)
 			f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // healthz fail
 			expectReapAudit(f.mock)
+			expectForwarderClassification(f.mock, "success")
 			expectOrphanSweepEmpty(f.mock)
 
 			f.run(t)
@@ -580,6 +657,7 @@ func TestFlowSynthetic_AuthMeBadBody_Fails(t *testing.T) {
 			expectSeed(f.mock)
 			f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // auth_me fail
 			expectReapAudit(f.mock)
+			expectForwarderClassification(f.mock, "success")
 			expectOrphanSweepEmpty(f.mock)
 
 			f.run(t)
@@ -611,6 +689,7 @@ func TestFlowSynthetic_ProvisionBadBody_Fails(t *testing.T) {
 			defer f.done()
 			expectSeed(f.mock)
 			f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // provision fail
+			expectForwarderClassification(f.mock, "success")                                     // magic_link truth surface
 			expectOrphanSweepEmpty(f.mock)
 
 			f.run(t)
@@ -628,7 +707,7 @@ func TestFlowSynthetic_AllFlowsKilled(t *testing.T) {
 	defer srv.Close()
 
 	cfg := enabledConfig(srv)
-	cfg.DisabledFlows = []string{"healthz", "auth_me", "provision_reap"}
+	cfg.DisabledFlows = []string{"healthz", "auth_me", "provision_reap", "claim", "magic_link", "deploy_status", "checkout"}
 	f := newFixtureCfg(t, srv, cfg)
 	defer f.done()
 	expectSeed(f.mock)
@@ -636,7 +715,7 @@ func TestFlowSynthetic_AllFlowsKilled(t *testing.T) {
 
 	f.run(t)
 
-	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap", "claim", "magic_link", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != "degraded" {
 			t.Errorf("killed flow %s: want degraded, got %q", flow, got)
 		}
@@ -708,6 +787,7 @@ func TestFlowSynthetic_AuditInsertError_NonFatal(t *testing.T) {
 	expectSeed(f.mock)
 	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnError(errSeed) // audit write fails
 	expectReapAudit(f.mock)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t) // must not panic / error
@@ -726,6 +806,7 @@ func TestFlowSynthetic_OrphanQueryError_NonFatal(t *testing.T) {
 	defer f.done()
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface (before the orphan sweep)
 	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).WillReturnError(errSeed)
 
 	f.run(t) // must not panic
@@ -782,14 +863,17 @@ func TestFlowSynthetic_BadBaseURL_BuildRequestFails(t *testing.T) {
 	f := newFixtureCfg(t, srv, cfg)
 	defer f.done()
 	expectSeed(f.mock)
-	// healthz + auth_me + provision all fail build_request → 3 audit rows.
-	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
-	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
-	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	// Every flow fails build_request (the bad URL never parses) → one audit row
+	// each. P0: healthz, auth_me, provision_reap. Money: claim, magic_link,
+	// deploy_status, checkout. The magic_link leg fails on build_request BEFORE
+	// the forwarder read, so there is no forwarder query in this case. 7 rows.
+	for i := 0; i < 7; i++ {
+		f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	}
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
-	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap", "claim", "magic_link", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != analyticsevent.ResultFail {
 			t.Errorf("bad URL: flow %s want fail, got %q", flow, got)
 		}
@@ -811,13 +895,16 @@ func TestFlowSynthetic_HTTPError_AllFlowsFail(t *testing.T) {
 	f := newFixtureCfg(t, srv, cfg)
 	defer f.done()
 	expectSeed(f.mock)
-	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
-	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
-	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	// All 7 flows hit a dead address → http_error fail → one audit row each.
+	// magic_link fails on the http_error before the forwarder read, so no
+	// forwarder query here.
+	for i := 0; i < 7; i++ {
+		f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
+	}
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
-	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap", "claim", "magic_link", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != analyticsevent.ResultFail {
 			t.Errorf("http_error: flow %s want fail, got %q", flow, got)
 		}
@@ -835,13 +922,15 @@ func TestFlowSynthetic_DegradedLatency(t *testing.T) {
 	defer f.done()
 	f.w.SetBudgetOverrideForTest(map[string]time.Duration{
 		"healthz": 0, "auth_me": 0, "provision_reap": 0,
+		"claim": 0, "magic_link": 0, "deploy_status": 0, "checkout": 0,
 	})
 	expectSeed(f.mock)
-	expectReapAudit(f.mock) // provision_reap still reaps before the degraded check
+	expectReapAudit(f.mock)                          // provision_reap still reaps before the degraded check
+	expectForwarderClassification(f.mock, "success") // magic_link reads classification, then degrades on budget
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
-	for _, flow := range []string{"healthz", "auth_me", "provision_reap"} {
+	for _, flow := range []string{"healthz", "auth_me", "provision_reap", "claim", "magic_link", "deploy_status", "checkout"} {
 		if got := f.fm.resultFor(flow); got != "degraded" {
 			t.Errorf("0-budget: flow %s want degraded, got %q", flow, got)
 		}
@@ -883,6 +972,13 @@ func TestFlowSynthetic_ReapHTTPError(t *testing.T) {
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)                                                              // leaked ledger row
 	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // flow_test_failed (leak)
+	// This custom mux does NOT serve the money routes, so claim (404≠400) and
+	// magic_link (404≠202) fail → one flow_test_failed audit row each. deploy
+	// (404 is 4xx → non-5xx contract held → pass) and checkout (404<500 → pass)
+	// do not audit. magic_link fails on the 404 before the forwarder read, so no
+	// forwarder query.
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // claim fail
+	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1)) // magic_link fail
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -936,6 +1032,7 @@ func TestFlowSynthetic_SeedSubErrors(t *testing.T) {
 			f := newFixture(t, srv)
 			defer f.done()
 			s.setup(f.mock)
+			expectForwarderClassification(f.mock, "success") // claim+magic_link still run despite seed sub-failure
 			expectOrphanSweepEmpty(f.mock)
 
 			f.run(t)
@@ -953,6 +1050,7 @@ func TestFlowSynthetic_SeedBeginError(t *testing.T) {
 	f := newFixture(t, srv)
 	defer f.done()
 	f.mock.ExpectBegin().WillReturnError(errSeed)
+	expectForwarderClassification(f.mock, "success") // claim+magic_link still run despite seed-begin failure
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t)
@@ -970,6 +1068,7 @@ func TestFlowSynthetic_OrphanUpdateError(t *testing.T) {
 	defer f.done()
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface (before the orphan sweep)
 	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("88888888-8888-4888-8888-888888888888"))
 	f.mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).WillReturnError(errSeed)
@@ -998,6 +1097,7 @@ func TestFlowSynthetic_OrphanScanError(t *testing.T) {
 	defer f.done()
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface (before the orphan sweep)
 	// Two columns vs the single Scan(&id) destination → Scan error per row.
 	rows := sqlmock.NewRows([]string{"id", "extra"}).AddRow("77777777-7777-4777-8777-777777777777", "x")
 	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).WillReturnRows(rows)
@@ -1014,6 +1114,7 @@ func TestFlowSynthetic_OrphanRowsError(t *testing.T) {
 	defer f.done()
 	expectSeed(f.mock)
 	expectReapAudit(f.mock)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface (before the orphan sweep)
 	rows := sqlmock.NewRows([]string{"id"}).AddRow("66666666-6666-4666-8666-666666666666").RowError(0, errSeed)
 	f.mock.ExpectQuery(`SELECT id::text\s+FROM resources`).WillReturnRows(rows)
 
@@ -1063,6 +1164,7 @@ func TestFlowSynthetic_ReapAuditInsertError(t *testing.T) {
 	expectSeed(f.mock)
 	// provision_reap inline reap → ledger INSERT fails (non-fatal).
 	f.mock.ExpectExec(`INSERT INTO audit_log`).WillReturnError(errSeed)
+	expectForwarderClassification(f.mock, "success") // magic_link truth surface
 	expectOrphanSweepEmpty(f.mock)
 
 	f.run(t) // must not panic; provision_reap still passes (reap succeeded HTTP-side)
