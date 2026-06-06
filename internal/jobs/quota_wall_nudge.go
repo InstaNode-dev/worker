@@ -13,9 +13,13 @@ package jobs
 // inside the last 24h, regardless of axis. This keeps the dashboard banner
 // stable (it won't flicker between axes once it's earned a slot).
 //
-// Tier gating: teams on the "team" tier are skipped entirely — team tier
-// is unlimited on every axis, so a wall nudge is incoherent. Teams on
-// tier "free" (claimed-but-unpaid) and "anonymous" (unclaimed) are also
+// Tier gating: teams on the "team" tier are skipped entirely — Team is the
+// top self-serve tier, so an "upgrade for headroom" nudge has no target
+// to point at. (The wall nudge is an UPGRADE banner; post the
+// strict-≥80%-margin redesign of 2026-06-05 Team is no longer "unlimited"
+// — it carries finite high-capacity limits — but there is still nothing
+// above it to upsell, so skipping it remains correct.) Teams on tier
+// "free" (claimed-but-unpaid) and "anonymous" (unclaimed) are also
 // skipped: they are pre-conversion and the conversion CTA is the claim
 // banner, not an upgrade banner.
 //
