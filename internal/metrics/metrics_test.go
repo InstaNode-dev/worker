@@ -116,6 +116,16 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	DeployScaledToZeroTotal.WithLabelValues("wake_failed").Add(0)
 	DeployScaledToZeroTotal.WithLabelValues("scale_failed").Add(0)
 
+	// Prime the Layer-3 payment-prober label families so /metrics exposes the
+	// series from process start (lazy *Vec otherwise leaves the dashboard tile
+	// empty until the operator lights PAYMENT_PROBE_ENABLED and the first tick
+	// fires). One representative (leg, result) plus a latency observation.
+	PaymentProbeOutcomeTotal.WithLabelValues("checkout_reachable", "pass").Add(0)
+	PaymentProbeOutcomeTotal.WithLabelValues("checkout_reachable", "fail").Add(0)
+	PaymentProbeOutcomeTotal.WithLabelValues("webhook_security", "pass").Add(0)
+	PaymentProbeOutcomeTotal.WithLabelValues("upgrade_webhook_e2e", "degraded").Add(0)
+	PaymentProbeLatencySeconds.WithLabelValues("checkout_reachable").Observe(0)
+
 	// Plain gauge
 	DeployIdleApps.Set(0)
 

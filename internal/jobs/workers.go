@@ -829,6 +829,31 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		}),
 		nrApp,
 	))
+	// Layer-3 payment prober (payment_probe.go) — the money heartbeat. Every 5
+	// minutes drives the iframe-free payment-funnel contract path against prod:
+	// checkout reachability + billing/invoices read surfaces + the webhook
+	// signature security contract, plus an OPTIONAL test-mode upgrade proof
+	// (mint cohort → inject signed TEST webhook → assert tier flip → reap). It
+	// emits instant_payment_probe_outcome_total + the InstantPaymentProbe NR
+	// event. INERT unless PAYMENT_PROBE_ENABLED=true (the Work method no-ops
+	// first thing when the flag is off) — a single env flip turns the whole
+	// prober off. Drives NO live Razorpay / no real money; the upgrade leg is
+	// further gated on RAZORPAY_TEST_WEBHOOK_SECRET (skips clean otherwise).
+	// Reuses the same NR sink (flowEmitter, cohort=synthetic) so payment-probe
+	// events never pollute the billing/revenue dashboards. See payment_probe.go
+	// for the per-leg truth-surface assertions (forum verdict §4 Layer 3).
+	river.AddWorker(workers, WithObservability(
+		NewPaymentProbeWorker(db, nil, PaymentProbePromMetrics{}, flowEmitter, PaymentProbeConfig{
+			Enabled:           cfg.PaymentProbeEnabled,
+			BaseURL:           cfg.PaymentProbeBaseURL,
+			JWTSecret:         cfg.PaymentProbeJWTSecret,
+			Email:             cfg.PaymentProbeEmail,
+			Tier:              cfg.PaymentProbeTier,
+			TestWebhookSecret: cfg.PaymentProbeTestWebhookSecret,
+			TestPlanIDPro:     cfg.PaymentProbeTestPlanIDPro,
+		}),
+		nrApp,
+	))
 	// Razorpay webhook-events prune — daily DELETE of razorpay_webhook_events
 	// rows > 30d. The api appends one dedup row per Razorpay webhook delivery;
 	// migration 033 envisioned a periodic prune but never shipped one, so the
@@ -1454,6 +1479,23 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 			river.PeriodicInterval(flowSyntheticInterval),
 			func() (river.JobArgs, *river.InsertOpts) {
 				return FlowSyntheticArgs{}, reconcileInsertOpts(flowSyntheticInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Layer-3 payment prober — every 5 minutes. Drives the iframe-free
+		// payment-funnel contract path against prod (checkout reachability +
+		// billing/invoices read surfaces + webhook signature security + an
+		// optional test-mode upgrade proof). INERT unless
+		// PAYMENT_PROBE_ENABLED=true (the Work method no-ops first thing when the
+		// flag is off), so this periodic registration is always present but
+		// produces no traffic until the operator lights the flag. Routed to the
+		// reconcile queue (reconcileInsertOpts carries the UniqueOpts so
+		// replicas:2 doesn't double-run). RunOnStart=true so a worker restart
+		// immediately writes a baseline pass/fail per leg.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(paymentProbeInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PaymentProbeArgs{}, reconcileInsertOpts(paymentProbeInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
 		),

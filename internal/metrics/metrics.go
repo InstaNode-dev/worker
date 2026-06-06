@@ -892,6 +892,41 @@ var (
 		Buckets: []float64{0.5, 1, 5, 10, 30, 60, 90, 120},
 	}, []string{"leg"})
 
+	// PaymentProbeOutcomeTotal — Layer-3 payment-prober counters (the money
+	// heartbeat). Labelled by `leg` (checkout_reachable | billing_state |
+	// invoices_reachable | webhook_security | upgrade_webhook_e2e) and `result`
+	// (pass | fail | degraded). result="fail" is the alert-able signal — the
+	// paid-revenue funnel is broken (checkout 5xx, the webhook signature gate
+	// accepting an unsigned payload, or the test-mode upgrade pipeline failing to
+	// flip the tier). Forum verdict (docs/ci/FORUM-PAYMENT-E2E-TOOLING.md §4
+	// Layer 3): this is the fastest, most-deterministic money-path signal, an
+	// iframe-free in-cluster Go prober.
+	//
+	// LAZY *Vec: INERT until PAYMENT_PROBE_ENABLED=true — a series first appears
+	// at /metrics only after the prober runs (i.e. when the operator lights the
+	// flag). The upgrade_webhook_e2e leg additionally needs a test webhook secret
+	// (degraded otherwise). The label families are primed in metrics_test.go so
+	// the dashboard tile renders from process start once the prober is on.
+	//
+	// NR alert: payment-probe-fail.json (P1: paid revenue path down). Prom rule:
+	// PaymentProbeFail (instant-worker-probes group). Emit site:
+	// worker/internal/jobs/payment_probe.go (PaymentProbePromMetrics).
+	PaymentProbeOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_payment_probe_outcome_total",
+		Help: "Layer-3 payment-prober outcomes per leg (checkout_reachable|billing_state|invoices_reachable|webhook_security|upgrade_webhook_e2e) and result (pass|fail|degraded). INERT until PAYMENT_PROBE_ENABLED=true.",
+	}, []string{"leg", "result"})
+
+	// PaymentProbeLatencySeconds — per-leg HTTP/DB latency histogram. Only
+	// observed when a real request was performed (a config-skipped leg omits the
+	// observation so the histogram isn't polluted with 0s entries). Buckets span
+	// the per-leg budgets (50ms…8s upgrade-leg ceiling). LAZY *Vec (see
+	// PaymentProbeOutcomeTotal).
+	PaymentProbeLatencySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "instant_payment_probe_latency_seconds",
+		Help:    "Layer-3 payment-prober per-leg latency. Buckets span the per-leg budgets up to the 8s upgrade-leg ceiling.",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 8},
+	}, []string{"leg"})
+
 	// FlowTestTotal — continuous-monitoring synthetic flow-matrix counters
 	// (flow_synthetic.go). One series per (flow, actor, tier, layer, result)
 	// so the NR matrix dashboard renders a green/red cell per flow×actor and
