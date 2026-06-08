@@ -40,6 +40,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"instant.dev/worker/internal/metrics"
+	"instant.dev/worker/internal/provisioner"
 )
 
 func init() {
@@ -538,6 +539,23 @@ func TestOrphanDBSweep_ModeLabel(t *testing.T) {
 func TestOrphanDBSweepArgs_Kind(t *testing.T) {
 	if k := (OrphanDBSweepArgs{}).Kind(); k != "orphan_db_sweep" {
 		t.Errorf("Kind() = %q; want orphan_db_sweep", k)
+	}
+}
+
+// TestOrphanDBSweepDeprovisionerFor — the typed-nil-safe conversion the
+// StartWorkers wiring uses. A nil *provisioner.Client → a genuine nil interface
+// (so destructiveArmed stays false); a non-nil pointer → a usable interface.
+func TestOrphanDBSweepDeprovisionerFor(t *testing.T) {
+	if got := orphanDBSweepDeprovisionerFor(nil); got != nil {
+		t.Errorf("orphanDBSweepDeprovisionerFor(nil) = %v; want nil interface (typed-nil safety)", got)
+	}
+	client, conn, err := provisioner.NewClient("127.0.0.1:1", "secret")
+	if err != nil {
+		t.Fatalf("provisioner.NewClient: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if got := orphanDBSweepDeprovisionerFor(client); got == nil {
+		t.Error("orphanDBSweepDeprovisionerFor(non-nil client) = nil; want a usable ResourceDeprovisioner")
 	}
 }
 

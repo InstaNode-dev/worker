@@ -753,13 +753,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// namespace List + age check, and provClient (the audited deprovisioner) for
 	// the flag-gated destructive arm. nsLister nil (CI / docker-compose) → the
 	// sweep WARN-skips each tick. provClient nil → the destructive arm is
-	// permanently unreachable regardless of the flags.
-	var orphanDBSweepDeprovisioner ResourceDeprovisioner
-	if provClient != nil {
-		orphanDBSweepDeprovisioner = provClient
-	}
+	// permanently unreachable regardless of the flags. The typed-nil-safe
+	// conversion lives in orphanDBSweepDeprovisionerFor (unit-tested) so a nil
+	// *provisioner.Client never becomes a non-nil interface that panics on call.
 	river.AddWorker(workers, WithObservability(
-		NewOrphanDBSweepWorker(db, nsLister, orphanDBSweepDeprovisioner, OrphanDBSweepConfig{
+		NewOrphanDBSweepWorker(db, nsLister, orphanDBSweepDeprovisionerFor(provClient), OrphanDBSweepConfig{
 			Enabled:            cfg.OrphanDBSweepEnabled,
 			DestructiveEnabled: cfg.OrphanDBSweepDestructiveEnabled,
 		}),
@@ -1056,6 +1054,22 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		cancel:  cancel,
 		started: true,
 	}
+}
+
+// orphanDBSweepDeprovisionerFor converts a *provisioner.Client into the
+// ResourceDeprovisioner interface the audit-only orphan-DB sweep needs for its
+// flag-gated destructive arm — typed-nil-safe. A typed-nil *provisioner.Client
+// assigned straight into the interface would make `provisioner != nil` true and
+// panic on the first DeprovisionResource call; returning a genuine nil
+// interface when the pointer is nil keeps the sweep's destructiveArmed() guard
+// honest (nil provisioner → destructive arm permanently unreachable). Extracted
+// from StartWorkers so this branch is unit-testable without standing up the
+// whole River boot (mirrors NewExpireAnonymousWorker's typed-nil handling).
+func orphanDBSweepDeprovisionerFor(provClient *provisioner.Client) ResourceDeprovisioner {
+	if provClient == nil {
+		return nil
+	}
+	return provClient
 }
 
 // buildPeriodicJobs constructs the full set of periodic jobs the worker
