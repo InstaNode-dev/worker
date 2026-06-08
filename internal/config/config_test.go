@@ -124,6 +124,44 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.SESTemplateNames == nil || len(cfg.SESTemplateNames) != 0 {
 		t.Errorf("SESTemplateNames = %v", cfg.SESTemplateNames)
 	}
+	// Audit-only orphan-DB sweep flags both default OFF / fail-closed.
+	if cfg.OrphanDBSweepEnabled {
+		t.Error("OrphanDBSweepEnabled should default false (fail-closed)")
+	}
+	if cfg.OrphanDBSweepDestructiveEnabled {
+		t.Error("OrphanDBSweepDestructiveEnabled should default false (fail-closed)")
+	}
+}
+
+// TestLoad_OrphanDBSweepFlags pins the two env-driven flags of the audit-only
+// orphan-DB sweep: each is set ONLY by its exact env var being literally "true".
+func TestLoad_OrphanDBSweepFlags(t *testing.T) {
+	t.Run("both true", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost/db")
+		t.Setenv("ORPHAN_DB_SWEEP_ENABLED", "true")
+		t.Setenv("ORPHAN_DB_SWEEP_DESTRUCTIVE_ENABLED", "true")
+		cfg := Load()
+		if !cfg.OrphanDBSweepEnabled {
+			t.Error("OrphanDBSweepEnabled should be true when env is 'true'")
+		}
+		if !cfg.OrphanDBSweepDestructiveEnabled {
+			t.Error("OrphanDBSweepDestructiveEnabled should be true when env is 'true'")
+		}
+	})
+	t.Run("non-true is off", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost/db")
+		t.Setenv("ORPHAN_DB_SWEEP_ENABLED", "1")     // not exactly "true"
+		t.Setenv("ORPHAN_DB_SWEEP_DESTRUCTIVE_ENABLED", "yes")
+		cfg := Load()
+		if cfg.OrphanDBSweepEnabled {
+			t.Error("OrphanDBSweepEnabled should be false for non-'true' value")
+		}
+		if cfg.OrphanDBSweepDestructiveEnabled {
+			t.Error("OrphanDBSweepDestructiveEnabled should be false for non-'true' value")
+		}
+	})
 }
 
 // TestLoad_DeployScaleToZeroIdleMinutes exercises the env-parse branch for

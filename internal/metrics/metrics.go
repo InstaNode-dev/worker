@@ -990,6 +990,56 @@ var (
 		Name: "instant_flow_synthetic_reaped_total",
 		Help: "Synthetic-runner resource reaps per flow and outcome (reaped|leaked|skip). leaked MUST stay 0.",
 	}, []string{"flow", "outcome"})
+
+	// OrphanDBSweepCandidatesTotal — the AUDIT-ONLY orphan-customer-DB /
+	// orphan-redis-namespace sweep (orphan_db_sweep.go) increments this once per
+	// detected orphan candidate, labelled by `kind` (customer_namespace |
+	// redis_namespace). A candidate is a per-tenant namespace (instant-customer-*)
+	// whose token has NO non-terminal resources row — i.e. nothing the platform
+	// still considers a live resource — and which is past the provisioning grace
+	// window. The sweep ONLY logs + counts; it never drops anything in
+	// audit-only mode (the truehomie-2026-06-03 safety posture: no manual/raw
+	// DROP, ever). A non-zero steady-state count is the drain-backlog signal that
+	// gates whether an operator should review the dry-run list and (separately)
+	// enable the destructive flag that routes through the audited provisioner
+	// DeprovisionResource chokepoint.
+	//
+	// LAZY *Vec — series first appear at /metrics only after a real observation
+	// (or the metrics_test priming of both `kind` label values). The sweep is
+	// itself flag-gated OFF by default (ORPHAN_DB_SWEEP_ENABLED), so in prod the
+	// series stay flat at the primed zero until an operator lights the flag.
+	//
+	// NR alert (suggested — infra follow-up, this repo doesn't own infra/):
+	//   sum(instant_orphan_db_sweep_candidates_total) by (kind) > 0
+	//     for 1h → P2 page. A standing backlog of orphan customer namespaces is
+	//     real cost (a live Postgres/Redis pod with no owner). Review the
+	//     dry-run candidate log before enabling destructive reclamation.
+	OrphanDBSweepCandidatesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_orphan_db_sweep_candidates_total",
+		Help: "Audit-only orphan-DB/redis-namespace sweep candidates detected, labelled by kind (customer_namespace|redis_namespace). Detection only — no drop in audit mode.",
+	}, []string{"kind"})
+
+	// OrphanDBSweepCandidatesCurrent — the gauge companion to
+	// OrphanDBSweepCandidatesTotal: the number of orphan candidates the MOST
+	// RECENT sweep tick saw, labelled by `kind`. Where the counter is "how many
+	// candidate-detections have we ever made" (monotonic), this gauge answers
+	// "how big is the orphan backlog RIGHT NOW" — it is Set() to the per-kind
+	// count at the end of every sweep, so it falls back to 0 once the backlog is
+	// drained. This is the tile an operator watches to know the dry-run list is
+	// shrinking after the destructive flag is (eventually, carefully) enabled.
+	//
+	// LAZY *Vec — primed in metrics_test for both `kind` values so the dashboard
+	// tile renders from process start instead of staying empty until the first
+	// real sweep.
+	//
+	// NR alert (suggested — infra follow-up):
+	//   max(instant_orphan_db_sweep_candidates_current) by (kind) > 25
+	//     → P2 page. 25 is the documented drain-backlog from the task brief;
+	//     above it the orphan accumulation is outpacing reclamation.
+	OrphanDBSweepCandidatesCurrent = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_orphan_db_sweep_candidates_current",
+		Help: "Audit-only orphan-DB/redis-namespace sweep: orphan candidate count observed by the most recent tick, labelled by kind. Falls to 0 when the backlog drains.",
+	}, []string{"kind"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check on this service.

@@ -206,6 +206,31 @@ type Config struct {
 	// pathological flapping). Enabling is an operator action after a canary.
 	DeployScaleToZeroEnabled     bool // DEPLOY_SCALE_TO_ZERO_ENABLED — master flag (default false)
 	DeployScaleToZeroIdleMinutes int  // DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES — idle threshold (default 30)
+
+	// Audit-only orphan-customer-DB / orphan-redis-namespace sweep
+	// (orphan_db_sweep.go). TWO independent flags, both default OFF / fail-closed
+	// (project_feature_flag_decision: every new feature ships flag-gated,
+	// default-off, fail-closed).
+	//
+	// OrphanDBSweepEnabled — the MASTER flag. When false (the default) the sweep
+	// Work method no-ops immediately: no namespace List, no DB read, no metric,
+	// no log beyond a single DEBUG. A single env flip turns the whole detection
+	// layer on. In audit-only mode (the destructive flag below OFF) an enabled
+	// sweep ONLY logs masked orphan candidates + emits the candidate metrics — it
+	// drops NOTHING.
+	//
+	// OrphanDBSweepDestructiveEnabled — the SECOND, destructive flag. Default
+	// OFF. It is meaningless unless the master flag is ALSO on. When (and only
+	// when) BOTH are true does the sweep route a confirmed orphan through the
+	// AUDITED provisioner DeprovisionResource chokepoint (the SAME path the TTL
+	// reaper uses) — NEVER a manual/raw DROP. This is the truehomie-2026-06-03
+	// safety posture: an active Pro customer's DB+role were dropped by an
+	// unaudited path, so this job must never improvise a DROP. For THIS PR the
+	// destructive path is wired but intentionally left UNREACHABLE-BY-DEFAULT:
+	// we ship audit-only, review the dry-run candidate list, and only then (in a
+	// later, deliberate operator action) consider lighting the destructive flag.
+	OrphanDBSweepEnabled            bool // ORPHAN_DB_SWEEP_ENABLED — master flag (default false)
+	OrphanDBSweepDestructiveEnabled bool // ORPHAN_DB_SWEEP_DESTRUCTIVE_ENABLED — destructive flag (default false; requires master on; routes through audited provisioner only)
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -340,6 +365,13 @@ func Load() *Config {
 		// Scale-to-zero idle-scaler (Task #54). Default OFF; idle threshold
 		// default 30 min (parsed below).
 		DeployScaleToZeroEnabled: os.Getenv("DEPLOY_SCALE_TO_ZERO_ENABLED") == "true",
+
+		// Audit-only orphan-DB sweep. BOTH default OFF / fail-closed. The
+		// destructive flag is inert unless the master flag is also on (the sweep
+		// enforces that ordering at runtime). Shipping audit-only: the
+		// destructive flag stays unset until we've reviewed the dry-run list.
+		OrphanDBSweepEnabled:            os.Getenv("ORPHAN_DB_SWEEP_ENABLED") == "true",
+		OrphanDBSweepDestructiveEnabled: os.Getenv("ORPHAN_DB_SWEEP_DESTRUCTIVE_ENABLED") == "true",
 	}
 
 	// DEPLOY_SCALE_TO_ZERO_IDLE_MINUTES: minutes of no-activity before an app is
