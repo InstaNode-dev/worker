@@ -732,6 +732,37 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// always non-nil here (it was constructed above), so the job never
 	// fail-open-skips in production. See e2e_cohort_sweep.go.
 	river.AddWorker(workers, WithObservability(NewE2ECohortSweepWorker(db, teamDeletionExecutor), nrApp))
+	// Audit-only orphan-customer-DB / orphan-redis-namespace sweep
+	// (orphan_db_sweep.go). The observability-first surface for the ~25 orphaned
+	// customer DB / redis namespace drain-backlog. DETECTION / DRY-RUN ONLY by
+	// default: it lists instant-customer-* namespaces, flags the ones with no
+	// live resources row past the provisioning grace, and LOGS them (masked) +
+	// emits instant_orphan_db_sweep_candidates_total/_current. It DROPS NOTHING
+	// in audit-only mode (truehomie-2026-06-03 safety: never a manual/raw DROP).
+	//
+	// TWO flag gates, BOTH default OFF / fail-closed:
+	//   ORPHAN_DB_SWEEP_ENABLED            — master flag; off → Work no-ops.
+	//   ORPHAN_DB_SWEEP_DESTRUCTIVE_ENABLED — destructive flag; meaningless
+	//     unless the master is also on. When BOTH on, a confirmed orphan routes
+	//     through the AUDITED provisioner DeprovisionResource chokepoint (the
+	//     SAME path the TTL reaper uses) — never a raw DROP. Shipped default:
+	//     both off → destructive path is unreachable; review the dry-run list
+	//     first.
+	//
+	// Reuses the SAME seams as the orphan-sweep reconciler: nsLister for the
+	// namespace List + age check, and provClient (the audited deprovisioner) for
+	// the flag-gated destructive arm. nsLister nil (CI / docker-compose) → the
+	// sweep WARN-skips each tick. provClient nil → the destructive arm is
+	// permanently unreachable regardless of the flags. The typed-nil-safe
+	// conversion lives in orphanDBSweepDeprovisionerFor (unit-tested) so a nil
+	// *provisioner.Client never becomes a non-nil interface that panics on call.
+	river.AddWorker(workers, WithObservability(
+		NewOrphanDBSweepWorker(db, nsLister, orphanDBSweepDeprovisionerFor(provClient), OrphanDBSweepConfig{
+			Enabled:            cfg.OrphanDBSweepEnabled,
+			DestructiveEnabled: cfg.OrphanDBSweepDestructiveEnabled,
+		}),
+		nrApp,
+	))
 	// Provisioner-reconciler (W5-A). Every 2min, recovers or abandons
 	// stuck pending resources.
 	//
@@ -1023,6 +1054,22 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 		cancel:  cancel,
 		started: true,
 	}
+}
+
+// orphanDBSweepDeprovisionerFor converts a *provisioner.Client into the
+// ResourceDeprovisioner interface the audit-only orphan-DB sweep needs for its
+// flag-gated destructive arm — typed-nil-safe. A typed-nil *provisioner.Client
+// assigned straight into the interface would make `provisioner != nil` true and
+// panic on the first DeprovisionResource call; returning a genuine nil
+// interface when the pointer is nil keeps the sweep's destructiveArmed() guard
+// honest (nil provisioner → destructive arm permanently unreachable). Extracted
+// from StartWorkers so this branch is unit-testable without standing up the
+// whole River boot (mirrors NewExpireAnonymousWorker's typed-nil handling).
+func orphanDBSweepDeprovisionerFor(provClient *provisioner.Client) ResourceDeprovisioner {
+	if provClient == nil {
+		return nil
+	}
+	return provClient
 }
 
 // buildPeriodicJobs constructs the full set of periodic jobs the worker
@@ -1397,6 +1444,22 @@ func buildPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 				return E2ECohortSweepArgs{}, reconcileInsertOpts(cohortSweepInterval)
 			},
 			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		// Audit-only orphan-customer-DB / orphan-redis-namespace sweep — hourly.
+		// DETECTION / DRY-RUN ONLY by default (both flags off, fail-closed); it
+		// LOGS orphan candidates + emits the candidate metrics and DROPS NOTHING.
+		// Routed to the reconcile queue so a default-queue fan-out can't starve
+		// it; UniqueOpts (reconcileInsertOpts) so replicas:2 doesn't double-run.
+		// RunOnStart=false: this is a slow drain-backlog snapshot, not a
+		// time-sensitive money/compute reclaim — the next hourly tick is fine and
+		// a restart inside the hour adds no signal. The Work method is a DEBUG
+		// no-op every tick until ORPHAN_DB_SWEEP_ENABLED is lit.
+		river.NewPeriodicJob(
+			river.PeriodicInterval(orphanDBSweepInterval),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return OrphanDBSweepArgs{}, reconcileInsertOpts(orphanDBSweepInterval)
+			},
+			&river.PeriodicJobOpts{RunOnStart: false},
 		),
 		// Provisioner-reconciler (W5-A) — every 2min, reconcile queue.
 		// RunOnStart=true.

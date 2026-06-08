@@ -130,6 +130,13 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	PaymentProbeOutcomeTotal.WithLabelValues("upgrade_webhook_e2e", "degraded").Add(0)
 	PaymentProbeLatencySeconds.WithLabelValues("checkout_reachable").Observe(0)
 
+	// Prime both kind label values of the audit-only orphan-DB sweep counter so
+	// /metrics exposes the series from process start (lazy *Vec otherwise leaves
+	// the dashboard tile empty until the operator lights ORPHAN_DB_SWEEP_ENABLED
+	// and the first tick detects a candidate).
+	OrphanDBSweepCandidatesTotal.WithLabelValues("customer_namespace").Add(0)
+	OrphanDBSweepCandidatesTotal.WithLabelValues("redis_namespace").Add(0)
+
 	// Plain gauge
 	DeployIdleApps.Set(0)
 
@@ -142,4 +149,8 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	PGPoolMax.WithLabelValues("platform_db").Set(0)
 	PGPoolWaitCount.WithLabelValues("platform_db").Set(0)
 	PGPoolWaitDurationSeconds.WithLabelValues("platform_db").Set(0)
+	// Prime both kind label values of the audit-only orphan-DB sweep gauge so
+	// the backlog tile renders from process start.
+	OrphanDBSweepCandidatesCurrent.WithLabelValues("customer_namespace").Set(0)
+	OrphanDBSweepCandidatesCurrent.WithLabelValues("redis_namespace").Set(0)
 }
