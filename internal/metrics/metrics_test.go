@@ -101,6 +101,10 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	E2ECohortSweptTotal.WithLabelValues("failed").Add(0)
 	E2ECohortSweptTotal.WithLabelValues("skipped_not_cohort").Add(0)
 	DeployJobFailedDetectedTotal.WithLabelValues("BackoffLimitExceeded").Add(0)
+	// Prime the runtime-failure detector label so /metrics exposes it from
+	// process start (lazy *Vec; first real observation is a ProgressDeadlineExceeded
+	// detection in deploy_status_reconcile).
+	DeployRuntimeFailedDetectedTotal.WithLabelValues("progress_deadline_exceeded").Add(0)
 	// Prime all four DeployAutopsyCapturedTotal outcome label values so
 	// /metrics exposes them from process start (lazy emit otherwise leaves
 	// the panel empty until the first real autopsy fires).

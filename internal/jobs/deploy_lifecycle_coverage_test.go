@@ -215,6 +215,54 @@ func TestDeploymentStatusFromK8s_Matrix(t *testing.T) {
 			want: deployStatusDeploying,
 		},
 		{
+			// Broken-image runtime silent-failure: progress deadline exceeded,
+			// no available replica → failed (pre-fix this was "deploying" forever).
+			name: "ProgressDeadlineExceeded with zero available is failed",
+			d: &appsv1.Deployment{
+				Status: appsv1.DeploymentStatus{
+					UnavailableReplicas: 1,
+					Conditions: []appsv1.DeploymentCondition{{
+						Type:   appsv1.DeploymentProgressing,
+						Status: corev1.ConditionFalse,
+						Reason: progressDeadlineExceededReason,
+					}},
+				},
+			},
+			want: deployStatusFailed,
+		},
+		{
+			// A serving deploy whose newest rollout timed out (failed redeploy,
+			// previous ReplicaSet still serving) stays healthy — available-replica
+			// check precedes the deadline check.
+			name: "ProgressDeadlineExceeded but a replica is available stays healthy",
+			d: &appsv1.Deployment{
+				Status: appsv1.DeploymentStatus{
+					AvailableReplicas: 1,
+					Conditions: []appsv1.DeploymentCondition{{
+						Type:   appsv1.DeploymentProgressing,
+						Status: corev1.ConditionFalse,
+						Reason: progressDeadlineExceededReason,
+					}},
+				},
+			},
+			want: deployStatusHealthy,
+		},
+		{
+			// Progressing=True (rollout within deadline) is NOT a deadline failure.
+			name: "Progressing True with zero available is deploying",
+			d: &appsv1.Deployment{
+				Status: appsv1.DeploymentStatus{
+					UnavailableReplicas: 1,
+					Conditions: []appsv1.DeploymentCondition{{
+						Type:   appsv1.DeploymentProgressing,
+						Status: corev1.ConditionTrue,
+						Reason: "ReplicaSetUpdated",
+					}},
+				},
+			},
+			want: deployStatusDeploying,
+		},
+		{
 			name: "all zeros is building",
 			d:    &appsv1.Deployment{Status: appsv1.DeploymentStatus{}},
 			want: deployStatusBuilding,
