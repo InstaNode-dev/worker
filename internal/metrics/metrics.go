@@ -665,6 +665,34 @@ var (
 		Help: "Kaniko build Jobs detected in Failed state by deploy_status_reconcile (silent-deploy-failure fix, 2026-05-30). Labelled by Job Failed-condition reason.",
 	}, []string{"reason"})
 
+	// ── deploy_status_reconcile — runtime rollout-failure detector (2026-06-08) ──
+	//
+	// The build-side twin of DeployJobFailedDetectedTotal. Increments when the
+	// reconciler flips a deployment to "failed" because the runtime k8s
+	// Deployment exceeded its progress deadline with NO available replica
+	// (Progressing=False, reason=ProgressDeadlineExceeded). This catches the
+	// silent RUNTIME failure class the build-Job detector misses: the build
+	// SUCCEEDED but the produced image cannot start (CreateContainerError "no
+	// command specified", ImagePullBackOff, CrashLoopBackOff). Pre-fix these
+	// deploys reported "deploying" forever and never autopsied or emailed.
+	//
+	// Label `reason`: bounded — currently only "progress_deadline_exceeded".
+	//
+	// NR alert (infra/newrelic/alerts/deploy-runtime-failed.json):
+	//   sum(rate(instant_deploy_runtime_failed_detected_total[15m])) > 0
+	//     for 15m → P1 page (user-visible recoverable: deploys are failing to
+	//     start at runtime — likely a broken base image, a registry/pull-secret
+	//     regression, or a platform image-build defect producing empty images).
+	//
+	// Catalog row (infra/observability/METRICS-CATALOG.md):
+	//   instant_deploy_runtime_failed_detected_total | counter | reason | lazy
+	//   (first observation is a real runtime-failure detection; the label is
+	//   primed in metrics_test.go so /metrics exposes it from process start).
+	DeployRuntimeFailedDetectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_runtime_failed_detected_total",
+		Help: "Runtime Deployments detected as failed-to-progress by deploy_status_reconcile (ProgressDeadlineExceeded with no available replica — broken-image silent-failure fix, 2026-06-08). Labelled by detection reason.",
+	}, []string{"reason"})
+
 	// ── deploy_failure_autopsy — capture outcome counter (PR 2, 2026-05-30) ──
 	//
 	// Increments once per captureDeploymentAutopsy call, labelled by outcome.

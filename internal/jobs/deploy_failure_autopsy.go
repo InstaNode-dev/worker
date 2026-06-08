@@ -121,6 +121,7 @@ const (
 	workerFailureReasonCrashLoopBackOff = "CrashLoopBackOff"
 	workerFailureReasonBuildFailed      = "BuildFailed"
 	workerFailureReasonDeadlineExceeded = "DeadlineExceeded"
+	workerFailureReasonStartFailed      = "StartFailed"
 	workerFailureReasonError            = "Error"
 	workerFailureReasonUnknown          = "Unknown"
 )
@@ -157,6 +158,11 @@ var workerFailureHint = map[string]string{
 	workerFailureReasonDeadlineExceeded: "The build or rollout timed out after 10 minutes. " +
 		"Large base images or slow package installs can cause this. " +
 		"Try a smaller base image (e.g. alpine) and pre-install dependencies in the Dockerfile.",
+
+	workerFailureReasonStartFailed: "Kubernetes created your app's pod but the container could not start. " +
+		"The most common cause is a built image with no CMD/ENTRYPOINT (nothing to run) " +
+		"or an invalid container configuration. Make sure your Dockerfile ends with a " +
+		"CMD or ENTRYPOINT instruction, then re-deploy.",
 
 	workerFailureReasonError: "A Kubernetes replica failure was detected. " +
 		"This is often a transient scheduling or resource constraint. " +
@@ -708,6 +714,14 @@ func extractPodFailure(pod *corev1.Pod, result *autopsyResult) {
 				result.event = fmt.Sprintf("ImagePullBackOff: %s", w.Message)
 			case "CrashLoopBackOff":
 				result.reason = workerFailureReasonCrashLoopBackOff
+			case "CreateContainerError", "CreateContainerConfigError", "RunContainerError":
+				// The pod was created but its container can't start — modal
+				// cause is a built image with no CMD/ENTRYPOINT ("no command
+				// specified") or an invalid container config. The container
+				// never runs, so there are no app logs; the waiting Message is
+				// the most useful diagnostic we can surface.
+				result.reason = workerFailureReasonStartFailed
+				result.event = fmt.Sprintf("%s: %s", w.Reason, w.Message)
 			}
 		}
 		// lastState gives us the terminated exit code even for CrashLoopBackOff.
