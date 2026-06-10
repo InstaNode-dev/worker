@@ -4,10 +4,10 @@
 // We keep this as a tiny interface (Upload / Download / Delete / List) instead
 // of passing *minio.Client around directly so:
 //
-//   1. The runner / restore-runner / retention sweep tests can use a fake that
-//      exercises the exact streaming path without dialing a real S3.
-//   2. A future cutover from MinIO to a real DO-Spaces SDK (or AWS SDK v2) is a
-//      one-file change — every consumer of this interface stays the same.
+//  1. The runner / restore-runner / retention sweep tests can use a fake that
+//     exercises the exact streaming path without dialing a real S3.
+//  2. A future cutover from MinIO to a real DO-Spaces SDK (or AWS SDK v2) is a
+//     one-file change — every consumer of this interface stays the same.
 //
 // All four methods take the bucket as an explicit argument so the same client
 // can serve a separate retention sweep on a different bucket later (e.g.
@@ -44,6 +44,16 @@ type BackupPlanRegistry interface {
 	// tier — e.g. a Pro→Free downgrade — cannot stick around past
 	// policy).
 	BackupRetentionDays(tier string) int
+	// RPOMinutes returns the per-tier Recovery Point Objective in minutes
+	// from plans.yaml. This is the SOURCE OF TRUTH the backup SCHEDULER
+	// uses to pick a cadence: a tier promising rpo_minutes<=60 must be
+	// backed up hourly (else the effective RPO is ~24h and the product
+	// over-promises), a tier with rpo_minutes>60 gets the once-daily slot,
+	// and rpo_minutes==0 ("not promised" — anonymous/free) is never
+	// enqueued. Keeping the cadence derived from this value (rather than a
+	// hardcoded tier list) means changing rpo_minutes in plans.yaml
+	// automatically moves the cadence, with no scheduler code change.
+	RPOMinutes(tier string) int
 	// TierNames lists the tier names the sweep should iterate. We sweep
 	// per-tier because the SQL hits a partial index on tier_at_backup;
 	// iterating an explicit list (rather than scanning DISTINCT) keeps
@@ -78,6 +88,13 @@ func NewBackupPlanRegistry(reg *commonplans.Registry) BackupPlanRegistry {
 // is 0 / no backups).
 func (a *commonPlanRegistryAdapter) BackupRetentionDays(tier string) int {
 	return a.reg.BackupRetentionDays(tier)
+}
+
+// RPOMinutes delegates to the common Registry. Returns 0 for unknown tiers
+// (common's Get falls back to "anonymous", whose RPO is 0 / no scheduled
+// backups). The scheduler reads this to choose hourly vs daily cadence.
+func (a *commonPlanRegistryAdapter) RPOMinutes(tier string) int {
+	return a.reg.RPOMinutes(tier)
 }
 
 // TierNames returns every tier name registered in plans.yaml. Sorted

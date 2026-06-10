@@ -39,6 +39,7 @@ var workerKnownReasons = []string{
 	workerFailureReasonCrashLoopBackOff,
 	workerFailureReasonBuildFailed,
 	workerFailureReasonDeadlineExceeded,
+	workerFailureReasonStartFailed,
 	workerFailureReasonError,
 	workerFailureReasonUnknown,
 }
@@ -190,6 +191,28 @@ func TestExtractPodFailure_ImagePullBackOff(t *testing.T) {
 
 	if result.reason != workerFailureReasonImagePullBackOff {
 		t.Errorf("reason = %q, want ImagePullBackOff", result.reason)
+	}
+}
+
+// TestExtractPodFailure_StartFailed covers the broken-image runtime case: the
+// pod is created but the container can't start (CreateContainerError "no command
+// specified" from a 474-byte empty image, CreateContainerConfigError, or
+// RunContainerError). The reason must classify as StartFailed and the waiting
+// message must be surfaced in event (the only diagnostic — there are no logs).
+func TestExtractPodFailure_StartFailed(t *testing.T) {
+	for _, waitReason := range []string{"CreateContainerError", "CreateContainerConfigError", "RunContainerError"} {
+		t.Run(waitReason, func(t *testing.T) {
+			pod := buildPodWithWaiting(waitReason, "failed to generate spec: no command specified")
+			result := &autopsyResult{reason: workerFailureReasonUnknown}
+			extractPodFailure(pod, result)
+
+			if result.reason != workerFailureReasonStartFailed {
+				t.Errorf("reason = %q, want StartFailed", result.reason)
+			}
+			if result.event == "" {
+				t.Error("expected non-empty event carrying the waiting message")
+			}
+		})
 	}
 }
 

@@ -101,6 +101,10 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	E2ECohortSweptTotal.WithLabelValues("failed").Add(0)
 	E2ECohortSweptTotal.WithLabelValues("skipped_not_cohort").Add(0)
 	DeployJobFailedDetectedTotal.WithLabelValues("BackoffLimitExceeded").Add(0)
+	// Prime the runtime-failure detector label so /metrics exposes it from
+	// process start (lazy *Vec; first real observation is a ProgressDeadlineExceeded
+	// detection in deploy_status_reconcile).
+	DeployRuntimeFailedDetectedTotal.WithLabelValues("progress_deadline_exceeded").Add(0)
 	// Prime all four DeployAutopsyCapturedTotal outcome label values so
 	// /metrics exposes them from process start (lazy emit otherwise leaves
 	// the panel empty until the first real autopsy fires).
@@ -126,6 +130,22 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	PaymentProbeOutcomeTotal.WithLabelValues("upgrade_webhook_e2e", "degraded").Add(0)
 	PaymentProbeLatencySeconds.WithLabelValues("checkout_reachable").Observe(0)
 
+	// Prime both kind label values of the audit-only orphan-DB sweep counter so
+	// /metrics exposes the series from process start (lazy *Vec otherwise leaves
+	// the dashboard tile empty until the operator lights ORPHAN_DB_SWEEP_ENABLED
+	// and the first tick detects a candidate).
+	OrphanDBSweepCandidatesTotal.WithLabelValues("customer_namespace").Add(0)
+	OrphanDBSweepCandidatesTotal.WithLabelValues("redis_namespace").Add(0)
+
+	// Prime the R2 per-resource_type customer-backup counter for every
+	// (type,result) pair so the backup-health dashboard tile renders from
+	// process start (lazy *Vec otherwise leaves the Mongo/Redis series empty
+	// until the first real backup of each type).
+	for _, rt := range []string{"postgres", "vector", "mongodb", "redis"} {
+		CustomerBackupByTypeTotal.WithLabelValues(rt, "ok").Add(0)
+		CustomerBackupByTypeTotal.WithLabelValues(rt, "failed").Add(0)
+	}
+
 	// Plain gauge
 	DeployIdleApps.Set(0)
 
@@ -138,4 +158,8 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	PGPoolMax.WithLabelValues("platform_db").Set(0)
 	PGPoolWaitCount.WithLabelValues("platform_db").Set(0)
 	PGPoolWaitDurationSeconds.WithLabelValues("platform_db").Set(0)
+	// Prime both kind label values of the audit-only orphan-DB sweep gauge so
+	// the backlog tile renders from process start.
+	OrphanDBSweepCandidatesCurrent.WithLabelValues("customer_namespace").Set(0)
+	OrphanDBSweepCandidatesCurrent.WithLabelValues("redis_namespace").Set(0)
 }

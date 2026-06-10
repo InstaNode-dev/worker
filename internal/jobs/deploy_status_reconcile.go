@@ -142,6 +142,20 @@ const (
 	deployStatusFailed    = "failed"
 	deployStatusStopped   = "stopped"
 
+	// progressDeadlineExceededReason is the Reason k8s stamps on a Deployment's
+	// Progressing condition (status=False) when a rollout fails to make progress
+	// within spec.progressDeadlineSeconds (default 600s). k8s does not export it
+	// as a typed constant (deploymentutil.TimedOutReason internally), so it is
+	// named here per the no-hardcoded-strings rule. Kept verbatim in sync with
+	// the api's k8s provider (progressDeadlineExceededReason in client.go).
+	progressDeadlineExceededReason = "ProgressDeadlineExceeded"
+
+	// runtimeFailReasonProgressDeadline is the bounded `reason` label on
+	// instant_deploy_runtime_failed_detected_total for a rollout that exceeded
+	// its progress deadline with no available replica (the broken-image runtime
+	// silent-failure class).
+	runtimeFailReasonProgressDeadline = "progress_deadline_exceeded"
+
 	// stuckBuildingReapMessage is stamped onto a reaped row's error_message
 	// (only when the api hadn't already written one) so the user-facing
 	// failure surface explains why the build never produced an app.
@@ -607,7 +621,15 @@ func (w *DeployStatusReconciler) computeNewStatus(ctx context.Context, providerI
 		return deployStatusBuilding, nil
 	}
 
-	return deploymentStatusFromK8s(deploy), nil
+	status := deploymentStatusFromK8s(deploy)
+	if status == deployStatusFailed && deploymentProgressDeadlineExceeded(deploy) {
+		// Runtime rollout-failure detection (broken-image silent-failure fix,
+		// 2026-06-08). Attribute ONLY the progress-deadline path —
+		// DeploymentReplicaFailure also maps to failed but is a distinct cause
+		// (the ReplicaSet could not create pods) and is not this counter's scope.
+		metrics.DeployRuntimeFailedDetectedTotal.WithLabelValues(runtimeFailReasonProgressDeadline).Inc()
+	}
+	return status, nil
 }
 
 // jobIsFailed reports whether a kaniko build Job has reached a terminal
@@ -674,10 +696,38 @@ func deploymentStatusFromK8s(deploy *appsv1.Deployment) string {
 	if deploy.Status.AvailableReplicas >= 1 {
 		return deployStatusHealthy
 	}
+	// Rollout exceeded its progress deadline with NO available replica: the
+	// pods were created but their containers cannot start — the modal cause is
+	// a broken built image (CreateContainerError "no command specified",
+	// ImagePullBackOff, or CrashLoopBackOff). k8s does NOT retry past the
+	// deadline, so this is terminal. Without this branch such a deploy reports
+	// "deploying" forever (UnavailableReplicas>0 below) and never transitions to
+	// failed — so the failure-autopsy (gated on newStatus==failed) never fires
+	// and the user gets no failure email. This is the runtime twin of the
+	// build-Job-failed override (jobIsFailed). Checked AFTER the healthy branch
+	// so a partially-failed redeploy whose previous ReplicaSet still serves is
+	// reported healthy, not failed. Kept in sync with the api's deploymentStatus.
+	if deploymentProgressDeadlineExceeded(deploy) {
+		return deployStatusFailed
+	}
 	if deploy.Status.UpdatedReplicas > 0 || deploy.Status.UnavailableReplicas > 0 {
 		return deployStatusDeploying
 	}
 	return deployStatusBuilding
+}
+
+// deploymentProgressDeadlineExceeded reports whether the Deployment's
+// Progressing condition is False with reason ProgressDeadlineExceeded — k8s's
+// definitive "this rollout will not make progress" verdict.
+func deploymentProgressDeadlineExceeded(deploy *appsv1.Deployment) bool {
+	for _, cond := range deploy.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing &&
+			cond.Status == corev1.ConditionFalse &&
+			cond.Reason == progressDeadlineExceededReason {
+			return true
+		}
+	}
+	return false
 }
 
 // deployNamespaceFromProviderID derives the per-deployment namespace from the
