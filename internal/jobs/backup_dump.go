@@ -113,11 +113,34 @@ func (realMongoDumpRunner) Run(ctx context.Context, connURL string, w io.Writer)
 	return nil
 }
 
+// Test seams for writeMongoConfig's filesystem operations. The chmod / write /
+// sync failure arms cannot be forced against a real, freshly created temp file
+// (a healthy fd accepts all three), so each op routes through an injectable
+// package var — same seam pattern as txtLookupFunc (custom_domain_reconcile.go)
+// and deployNotifyResolver (deploy_notify_webhook.go). Production behavior is
+// the default literal; tests swap + defer-restore.
+var (
+	mongoCfgCreateTemp = func() (*os.File, error) {
+		return os.CreateTemp("", "instant-mongodump-*.yaml")
+	}
+	// 0600 — only the worker process can read the URI. CreateTemp already
+	// uses 0600 on unix, but set it explicitly so the contract is loud.
+	mongoCfgChmod = func(f *os.File) error { return f.Chmod(0o600) }
+	// mongodump config YAML: a single `uri:` key. Quote the value so a URI
+	// with YAML-special characters (e.g. a password containing ':' or '@')
+	// is parsed as a single scalar.
+	mongoCfgWriteURI = func(f *os.File, connURL string) error {
+		_, err := fmt.Fprintf(f, "uri: %q\n", connURL)
+		return err
+	}
+	mongoCfgSync = func(f *os.File) error { return f.Sync() }
+)
+
 // writeMongoConfig writes a mongodump YAML config carrying the connection URI
 // to a 0600 temp file and returns its path plus a cleanup func. Keeps the
 // password out of argv. The caller MUST invoke cleanup() to remove the file.
 func writeMongoConfig(connURL string) (path string, cleanup func(), err error) {
-	f, err := os.CreateTemp("", "instant-mongodump-*.yaml")
+	f, err := mongoCfgCreateTemp()
 	if err != nil {
 		return "", func() {}, fmt.Errorf("create mongodump config: %w", err)
 	}
@@ -125,20 +148,15 @@ func writeMongoConfig(connURL string) (path string, cleanup func(), err error) {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
 	}
-	// 0600 — only the worker process can read the URI. CreateTemp already
-	// uses 0600 on unix, but set it explicitly so the contract is loud.
-	if chmodErr := f.Chmod(0o600); chmodErr != nil {
+	if chmodErr := mongoCfgChmod(f); chmodErr != nil {
 		cleanup()
 		return "", func() {}, fmt.Errorf("chmod mongodump config: %w", chmodErr)
 	}
-	// mongodump config YAML: a single `uri:` key. Quote the value so a URI
-	// with YAML-special characters (e.g. a password containing ':' or '@')
-	// is parsed as a single scalar.
-	if _, wErr := fmt.Fprintf(f, "uri: %q\n", connURL); wErr != nil {
+	if wErr := mongoCfgWriteURI(f, connURL); wErr != nil {
 		cleanup()
 		return "", func() {}, fmt.Errorf("write mongodump config: %w", wErr)
 	}
-	if syncErr := f.Sync(); syncErr != nil {
+	if syncErr := mongoCfgSync(f); syncErr != nil {
 		cleanup()
 		return "", func() {}, fmt.Errorf("sync mongodump config: %w", syncErr)
 	}
