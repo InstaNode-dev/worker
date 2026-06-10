@@ -603,7 +603,11 @@ func StartWorkers(ctx context.Context, db *sql.DB, rdb *redis.Client, cfg *confi
 	// unset — fail-open so a dev environment that doesn't ship AES keys
 	// doesn't block worker boot. See each worker's Work() top for the
 	// exact WARN line emitted.
-	river.AddWorker(workers, WithObservability(NewCustomerBackupSchedulerWorker(db), nrApp))
+	// backupPlans drives the scheduler's RPO-aware cadence: tiers promising
+	// rpo_minutes<=60 (pro/growth/team) get hourly backups; coarser-RPO
+	// tiers (hobby/hobby_plus = 1440) get the once-daily slot; anonymous/free
+	// (rpo_minutes:0) are never enqueued. nil → legacy hardcoded fallback.
+	river.AddWorker(workers, WithObservability(NewCustomerBackupSchedulerWorker(db, backupPlans), nrApp))
 	// FIX-H #65/#Q47 — wire the refund client so terminal MANUAL backup
 	// failures credit the team's daily counter via the api's internal
 	// /internal/teams/:id/backup-quota/refund endpoint. Empty apiBase /

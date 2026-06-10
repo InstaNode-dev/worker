@@ -450,12 +450,31 @@ func TestBackupObjectKey(t *testing.T) {
 // flips a tier, the test fails on the assertion, not on a moved goalpost.
 type fakeBackupPlanRegistry struct {
 	days  map[string]int
+	rpo   map[string]int // tier→rpo_minutes for the scheduler cadence gate
 	tiers []string
 }
 
 func (f *fakeBackupPlanRegistry) BackupRetentionDays(tier string) int {
 	if d, ok := f.days[tier]; ok {
 		return d
+	}
+	return 0
+}
+
+// RPOMinutes returns the per-tier RPO the scheduler uses to pick cadence.
+// When the test didn't declare an rpo map (runner tests don't care), fall
+// back to deriving a sane value from retention days so those fakes keep
+// satisfying the interface: any tier that takes backups (days>0) reports a
+// 60-minute RPO (hourly), tiers with 0 retention report 0 (never).
+func (f *fakeBackupPlanRegistry) RPOMinutes(tier string) int {
+	if f.rpo != nil {
+		if m, ok := f.rpo[tier]; ok {
+			return m
+		}
+		return 0
+	}
+	if f.BackupRetentionDays(tier) > 0 {
+		return 60
 	}
 	return 0
 }

@@ -728,7 +728,7 @@ func TestScheduler_Work_ScanError_SkipsRow(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}).
 			AddRow("fffffff0-1111-2222-3333-444444444444", "pro", "not-a-uuid"))
 
-	w := NewCustomerBackupSchedulerWorker(db)
+	w := NewCustomerBackupSchedulerWorker(db, schedulerPlans())
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 14, 0, 0, 0, time.UTC) }
 	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
 		t.Fatalf("Work should skip unscannable row, got %v", err)
@@ -746,7 +746,7 @@ func TestScheduler_Work_RowsError_ReturnsError(t *testing.T) {
 		RowError(0, errors.New("rows boom"))
 	mock.ExpectQuery(`SELECT r.id::text, r.tier, r.team_id`).WillReturnRows(rows)
 
-	w := NewCustomerBackupSchedulerWorker(db)
+	w := NewCustomerBackupSchedulerWorker(db, schedulerPlans())
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 14, 0, 0, 0, time.UTC) }
 	if err := w.Work(context.Background(), fakeSchedulerJob()); err == nil ||
 		!strings.Contains(err.Error(), "rows error") {
