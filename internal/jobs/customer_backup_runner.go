@@ -145,16 +145,24 @@ func (realPgDumpRunner) Run(ctx context.Context, connURL string, w io.Writer) er
 // in production the constructor below requires both.
 type CustomerBackupRunnerWorker struct {
 	river.WorkerDefaults[CustomerBackupRunnerArgs]
-	db      *sql.DB
-	store   BackupObjectStore
-	pgDump  pgDumpRunner
-	bucket  string
-	prefix  string
-	aesKey  string // hex, decoded at use site via crypto.ParseAESKey
-	plans   BackupPlanRegistry
-	now     func() time.Time
-	timeout time.Duration
-	batchN  int
+	db    *sql.DB
+	store BackupObjectStore
+	// Per-resource_type dump strategies. pgDump serves postgres/vector;
+	// mongoDump serves mongodb; redisDump serves redis. All three write a
+	// RAW (uncompressed) archive into the runner's gzip pipeline — see
+	// backup_dump.go's gzip contract. A nil strategy makes that
+	// resource_type a fail-open skip (markFailed reason="config"), never a
+	// panic.
+	pgDump    pgDumpRunner
+	mongoDump mongoDumpRunner
+	redisDump redisDumpRunner
+	bucket    string
+	prefix    string
+	aesKey    string // hex, decoded at use site via crypto.ParseAESKey
+	plans     BackupPlanRegistry
+	now       func() time.Time
+	timeout   time.Duration
+	batchN    int
 
 	// apiBase / apiCli / jwtSecret — used by the FIX-H #65/#Q47 refund
 	// path. When apiBase or jwtSecret is empty the refund call is a
@@ -172,16 +180,18 @@ type CustomerBackupRunnerWorker struct {
 // logs a WARN; the sweep still runs but with a coarse policy.
 func NewCustomerBackupRunner(db *sql.DB, store BackupObjectStore, bucket, prefix, aesKey string, plans BackupPlanRegistry) *CustomerBackupRunnerWorker {
 	return &CustomerBackupRunnerWorker{
-		db:      db,
-		store:   store,
-		pgDump:  realPgDumpRunner{},
-		bucket:  bucket,
-		prefix:  prefix,
-		aesKey:  aesKey,
-		plans:   plans,
-		now:     time.Now,
-		timeout: backupPerRunTimeout,
-		batchN:  backupBatchSize,
+		db:        db,
+		store:     store,
+		pgDump:    realPgDumpRunner{},
+		mongoDump: realMongoDumpRunner{},
+		redisDump: realRedisDumpRunner{},
+		bucket:    bucket,
+		prefix:    prefix,
+		aesKey:    aesKey,
+		plans:     plans,
+		now:       time.Now,
+		timeout:   backupPerRunTimeout,
+		batchN:    backupBatchSize,
 	}
 }
 
@@ -428,14 +438,29 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 		return false
 	}
 
-	// Step 3 — stream pg_dump → gzip → (sha256 + S3) via io.Pipe.
+	// Step 2.5 — resolve the per-resource_type dump strategy. R2
+	// (2026-06-10): the runner backs up postgres/vector (pg_dump), mongodb
+	// (mongodump), and redis (redis-cli --rdb) through ONE pipeline. An
+	// unsupported type (or a nil strategy in a misconfigured boot) is a
+	// fail-open 'config' failure — never a panic. The scheduler's SQL filter
+	// only enqueues supported types, so this branch is defence-in-depth for
+	// a manual API backup against a type we don't dump.
+	dumpRun, unsupportedReason := w.dumpForResourceType(p.resourceType)
+	if dumpRun == nil {
+		w.markFailed(ctx, p.backupID, "config", unsupportedReason, start, p)
+		return false
+	}
+
+	// Step 3 — stream <dump tool> → gzip → (sha256 + S3) via io.Pipe.
 	//
 	// FIX-H #59 — the gzip output is teed into a SHA-256 hasher so the
 	// final hex digest is available at finalize time. We hash the
-	// COMPRESSED bytes (not the raw pg_dump output) because the
-	// compressed object is what lives in S3 and what the restore
-	// handler / runner will re-read for verification. Hashing happens
-	// inline on the writer side — no second pass over the bytes.
+	// COMPRESSED bytes (not the raw dump output) because the compressed
+	// object is what lives in S3 and what the restore handler / runner will
+	// re-read for verification. Hashing happens inline on the writer side —
+	// no second pass over the bytes. Every dump strategy writes RAW
+	// (uncompressed) bytes into the gzip writer (backup_dump.go gzip
+	// contract), so the pipeline is identical across resource types.
 	objectKey := backupObjectKey(w.prefix, p.token, p.backupID)
 	pr, pw := io.Pipe()
 	hasher := sha256.New()
@@ -453,15 +478,15 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 		// the Upload reader sees EOF instead of blocking forever.
 		defer func() {
 			if r := recover(); r != nil {
-				panicErr := fmt.Errorf("pg_dump goroutine panicked: %v", r)
+				panicErr := fmt.Errorf("backup dump goroutine panicked: %v", r)
 				_ = pw.CloseWithError(panicErr)
 				dumpDone <- panicErr
-				LogRecoveredPanic("customer_backup_runner.pg_dump_pipe", r)
+				LogRecoveredPanic("customer_backup_runner.dump_pipe", r)
 			}
 		}()
 		mw := io.MultiWriter(hasher, pw)
 		gz := gzip.NewWriter(mw)
-		runErr := w.pgDump.Run(ctx, plainConn, gz)
+		runErr := dumpRun(ctx, plainConn, gz)
 		// Close gzip first to flush the trailer, then the pipe so the
 		// Upload side sees EOF (not just the partial gzip stream). If
 		// pg_dump errored, propagate the close-error too.
@@ -483,7 +508,7 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	// actionable: "pg_dump: connection refused" vs "pipe: io: read/write
 	// on closed pipe").
 	if dumpErr != nil {
-		w.markFailed(ctx, p.backupID, backupFailReason(dumpErr), fmt.Sprintf("pg_dump failed: %v", dumpErr), start, p)
+		w.markFailed(ctx, p.backupID, backupFailReason(dumpErr), fmt.Sprintf("backup dump failed: %v", dumpErr), start, p)
 		// Best-effort cleanup of a half-written object so we don't pay
 		// for orphan bytes; failure to delete is logged but not fatal.
 		if delErr := w.store.DeleteObject(parentCtx, w.bucket, objectKey); delErr != nil {
@@ -545,6 +570,10 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 	}
 
 	metrics.CustomerBackupSucceededTotal.Inc()
+	// R2 (2026-06-10) per-resource_type breakdown — answers "is Mongo
+	// backing up but Redis silently failing?" which the aggregate counter
+	// can't. Labels: resource_type + result.
+	metrics.CustomerBackupByTypeTotal.WithLabelValues(p.resourceType, "ok").Inc()
 	slog.Info("jobs.customer_backup_runner.succeeded",
 		"backup_id", p.backupID,
 		"resource_id", p.resourceID,
@@ -627,6 +656,10 @@ func (w *CustomerBackupRunnerWorker) markFailed(
 	// (reason="auth", PAGE) is distinguishable from a transient dump/upload
 	// failure (retried next run). NR alert: customer-backup-failed.json.
 	metrics.CustomerBackupFailedTotal.WithLabelValues(reason).Inc()
+	// R2 (2026-06-10) per-resource_type breakdown of the failure. Pairs with
+	// the "ok" counter on the success path so the dashboard can compute a
+	// per-type success ratio (e.g. Redis failing while Mongo is healthy).
+	metrics.CustomerBackupByTypeTotal.WithLabelValues(p.resourceType, "failed").Inc()
 
 	// Two summaries: a SANITIZED, user-safe one persisted to the DB + audit
 	// (it surfaces on the customer's failure email and the backup-health

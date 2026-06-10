@@ -1,7 +1,14 @@
 // customer_restore_runner.go — every 30s, claim up to 5 pending rows from
-// resource_restores and run `pg_restore --clean --if-exists --no-owner --no-acl`
-// streaming the gzip'd dump from S3 back into the SAME resource the backup
-// came from.
+// resource_restores and run the per-resource_type restore tool
+// (postgres/vector → `pg_restore --clean --if-exists --no-owner --no-acl`;
+// mongodb → `mongorestore --archive --drop`), streaming the gzip'd dump from
+// S3 back into the SAME resource the backup came from.
+//
+// R2 (2026-06-10): mongodb restore added alongside the mongodb/redis backup
+// support. Redis RESTORE is NOT yet wired — an RDB restore-in-place needs
+// pod-level access the worker lacks; Redis backups are still taken + sha-
+// verified + downloadable, and Redis restore is the tracked R2 follow-up
+// (see restoreForResourceType).
 //
 // Why restore-into-same-resource only: backup objects in S3 are immutable;
 // the schema/data they encode is keyed to the resource_id at backup time. A
@@ -91,28 +98,100 @@ func (realPgRestoreRunner) Run(ctx context.Context, connURL string, r io.Reader)
 	return nil
 }
 
+// mongoRestoreRunner mirrors pgRestoreRunner for the mongodb branch. Run
+// reads the `mongodump --archive` BSON archive from r (already gunzipped by
+// the caller) and applies it with `mongorestore --archive --drop` so the
+// "rewind to this backup" semantics match pg_restore's --clean --if-exists.
+type mongoRestoreRunner interface {
+	Run(ctx context.Context, connURL string, r io.Reader) error
+}
+
+type realMongoRestoreRunner struct{}
+
+func (realMongoRestoreRunner) Run(ctx context.Context, connURL string, r io.Reader) error {
+	// --drop drops each collection before restoring it (the mongo analogue
+	// of pg_restore --clean --if-exists) so the restore is a true rewind, not
+	// a merge. Secret hygiene mirrors realMongoDumpRunner: pass the URI via a
+	// 0600 config file so the password stays out of argv; fail-open to --uri
+	// in argv on a temp-file error.
+	cfgPath, cleanup, cfgErr := writeMongoConfig(connURL)
+	var cmd *exec.Cmd
+	if cfgErr == nil {
+		defer cleanup()
+		cmd = exec.CommandContext(ctx, "mongorestore",
+			"--config", cfgPath,
+			"--archive",
+			"--drop",
+		)
+	} else {
+		cmd = exec.CommandContext(ctx, "mongorestore",
+			"--uri", connURL,
+			"--archive",
+			"--drop",
+		)
+	}
+	cmd.Stdin = r
+	var stderrBuf limitedBuffer
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mongorestore: %w (stderr: %s)", err, stderrBuf.String())
+	}
+	return nil
+}
+
 type CustomerRestoreRunnerWorker struct {
 	river.WorkerDefaults[CustomerRestoreRunnerArgs]
-	db        *sql.DB
-	store     BackupObjectStore
-	pgRestore pgRestoreRunner
-	bucket    string
-	aesKey    string
-	now       func() time.Time
-	timeout   time.Duration
-	batchN    int
+	db    *sql.DB
+	store BackupObjectStore
+	// Per-resource_type restore strategies. pgRestore serves postgres/vector;
+	// mongoRestore serves mongodb. Redis restore is NOT yet wired (see
+	// restoreForResourceType) — RDB restore-in-place needs pod-level access
+	// the worker doesn't have; tracked as the R2 follow-up.
+	pgRestore    pgRestoreRunner
+	mongoRestore mongoRestoreRunner
+	bucket       string
+	aesKey       string
+	now          func() time.Time
+	timeout      time.Duration
+	batchN       int
 }
 
 func NewCustomerRestoreRunner(db *sql.DB, store BackupObjectStore, bucket, aesKey string) *CustomerRestoreRunnerWorker {
 	return &CustomerRestoreRunnerWorker{
-		db:        db,
-		store:     store,
-		pgRestore: realPgRestoreRunner{},
-		bucket:    bucket,
-		aesKey:    aesKey,
-		now:       time.Now,
-		timeout:   restorePerRunTimeout,
-		batchN:    restoreBatchSize,
+		db:           db,
+		store:        store,
+		pgRestore:    realPgRestoreRunner{},
+		mongoRestore: realMongoRestoreRunner{},
+		bucket:       bucket,
+		aesKey:       aesKey,
+		now:          time.Now,
+		timeout:      restorePerRunTimeout,
+		batchN:       restoreBatchSize,
+	}
+}
+
+// restoreForResourceType returns the restore Run func for the given
+// resource_type, or nil + a reason when restore isn't supported for that
+// type. postgres/vector → pg_restore; mongodb → mongorestore. redis returns
+// nil with an explicit "not yet supported" reason: an RDB restore-in-place
+// requires replacing dump.rdb on the redis pod + a restart (or a per-key
+// RESTORE pass that parses the RDB), neither of which the worker can drive
+// from outside the pod. The Redis BACKUP ships in R2; Redis RESTORE is the
+// tracked follow-up. Mirrors dumpForResourceType on the backup runner so the
+// dispatch logic is symmetric and unit-testable.
+func (w *CustomerRestoreRunnerWorker) restoreForResourceType(resourceType string) (func(ctx context.Context, connURL string, r io.Reader) error, string) {
+	switch resourceType {
+	case resourceTypePostgres, resourceTypeVector:
+		return w.pgRestore.Run, ""
+	case resourceTypeMongoDB:
+		if w.mongoRestore == nil {
+			return nil, "mongo restore runner not configured"
+		}
+		return w.mongoRestore.Run, ""
+	case resourceTypeRedis:
+		return nil, "redis restore not yet supported (RDB restore-in-place requires pod-level access; tracked as R2 follow-up — backups are still taken and downloadable)"
+	default:
+		return nil, fmt.Sprintf("unsupported resource_type %q for restore", resourceType)
 	}
 }
 
@@ -305,6 +384,18 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 			})
 	}
 
+	// Resolve the per-resource_type restore strategy BEFORE downloading the
+	// (potentially multi-GB) object — no point streaming a Redis RDB from S3
+	// only to discover restore isn't wired for it. postgres/vector →
+	// pg_restore; mongodb → mongorestore; redis → not yet supported (R2
+	// follow-up). An unsupported type marks the row failed with an explicit,
+	// customer-readable reason rather than silently hanging.
+	restoreRun, unsupportedReason := w.restoreForResourceType(p.resourceType)
+	if restoreRun == nil {
+		w.markRestoreFailed(ctx, p.restoreID, unsupportedReason, start, p)
+		return false
+	}
+
 	// Validate backup is still present (retention sweep may have nulled
 	// s3_key out from under the api's check, in the race between the
 	// /restore POST and the runner picking it up).
@@ -414,8 +505,8 @@ func (w *CustomerRestoreRunnerWorker) processRestore(parentCtx context.Context, 
 	}
 	defer func() { _ = gzReader.Close() }()
 
-	if runErr := w.pgRestore.Run(ctx, plainConn, gzReader); runErr != nil {
-		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("pg_restore failed: %v", runErr), start, p)
+	if runErr := restoreRun(ctx, plainConn, gzReader); runErr != nil {
+		w.markRestoreFailed(ctx, p.restoreID, fmt.Sprintf("restore failed: %v", runErr), start, p)
 		return false
 	}
 

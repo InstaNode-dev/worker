@@ -93,6 +93,25 @@ var (
 		Help: "Customer backup runs that completed and were stored in S3.",
 	})
 
+	// CustomerBackupByTypeTotal is the per-resource_type breakdown of customer
+	// backup outcomes, added when the backup ladder grew from postgres/vector
+	// to also cover mongodb + redis (R2, 2026-06-10). Labels:
+	//   resource_type — postgres | vector | mongodb | redis
+	//   result        — ok | failed
+	// The pre-existing aggregate CustomerBackupSucceededTotal /
+	// CustomerBackupFailedTotal counters are retained (the old dashboard tiles
+	// + customer-backup-failed.json alert still read them); this Vec is the
+	// NEW surface that answers "is Mongo backing up but Redis silently
+	// failing?" — a question the aggregate counters can't. Rule 25: the
+	// matching alert + dashboard tile + METRICS-CATALOG row ship in the same
+	// PR (Prom rule: per-type success-ratio < threshold; NR tile: stacked by
+	// resource_type). Lazy *Vec — primed for all (type,result) pairs in
+	// metrics_test.go so /metrics exposes the series from process start.
+	CustomerBackupByTypeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_customer_backup_by_type_total",
+		Help: "Customer backup runs by resource_type (postgres|vector|mongodb|redis) and result (ok|failed).",
+	}, []string{"resource_type", "result"})
+
 	// ResourceDegradedGauge is sampled at the end of each heartbeat run.
 	// Labelled by resource_type so the dashboard can break down "how many
 	// of my Postgres instances are unreachable right now".
