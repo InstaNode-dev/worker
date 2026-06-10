@@ -30,5 +30,20 @@ RUN CGO_ENABLED=0 go build \
 # the same PR — pg_dump major version must be >= server major version, and
 # matching exactly keeps the dump format ABI predictable.
 FROM postgres:16-alpine
+# R2 (2026-06-10): the customer-backup ladder grew from postgres/vector
+# (pg_dump, already in this base) to also cover mongodb (mongodump/mongorestore)
+# and redis (redis-cli --rdb). Those binaries are NOT in postgres:16-alpine, so
+# install them here or the new dump strategies fail at exec with "executable
+# file not found" (the runner fail-opens → marks the row failed + increments
+# instant_customer_backup_by_type_total{result="failed"}; no data loss, but no
+# Mongo/Redis backup either). mongodb-tools = mongodump+mongorestore; redis =
+# redis-cli. --no-cache keeps the image lean.
+#
+# Version note (mirrors the pg_dump >= server rule above): mongodump's archive
+# format is forward-compatible within a major, and redis-cli --rdb speaks the
+# RDB version of the server it connects to, so alpine's packaged versions are
+# fine against the in-cluster mongodb/redis. Bump deliberately if the data-tier
+# images move a major version.
+RUN apk add --no-cache mongodb-tools redis
 COPY --from=builder /worker /worker
 ENTRYPOINT ["/worker"]

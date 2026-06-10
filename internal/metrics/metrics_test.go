@@ -137,6 +137,15 @@ func TestAllMetrics_AreRegistered(t *testing.T) {
 	OrphanDBSweepCandidatesTotal.WithLabelValues("customer_namespace").Add(0)
 	OrphanDBSweepCandidatesTotal.WithLabelValues("redis_namespace").Add(0)
 
+	// Prime the R2 per-resource_type customer-backup counter for every
+	// (type,result) pair so the backup-health dashboard tile renders from
+	// process start (lazy *Vec otherwise leaves the Mongo/Redis series empty
+	// until the first real backup of each type).
+	for _, rt := range []string{"postgres", "vector", "mongodb", "redis"} {
+		CustomerBackupByTypeTotal.WithLabelValues(rt, "ok").Add(0)
+		CustomerBackupByTypeTotal.WithLabelValues(rt, "failed").Add(0)
+	}
+
 	// Plain gauge
 	DeployIdleApps.Set(0)
 

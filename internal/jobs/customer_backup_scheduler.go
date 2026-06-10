@@ -1,6 +1,6 @@
 // customer_backup_scheduler.go — periodic sweep that INSERTs a `pending`
-// resource_backups row for every tier-eligible postgres/vector resource on
-// the platform.
+// resource_backups row for every tier-eligible postgres/vector/mongodb/redis
+// resource on the platform (R2, 2026-06-10: grew from postgres/vector only).
 //
 // Why a scheduler at all (vs. cron triggering the api directly): the worker
 // already owns the DB connection, the audit_log writer, and the periodic-job
@@ -68,7 +68,8 @@ func (CustomerBackupSchedulerArgs) Kind() string { return "customer_backup_sched
 
 // CustomerBackupSchedulerWorker scans the resources table once an hour and
 // inserts a resource_backups row in the 'pending' state for every active
-// postgres/vector resource whose tier is due for a backup this hour.
+// postgres/vector/mongodb/redis resource whose tier is due for a backup this
+// hour.
 type CustomerBackupSchedulerWorker struct {
 	river.WorkerDefaults[CustomerBackupSchedulerArgs]
 	db    *sql.DB
@@ -207,11 +208,21 @@ func (w *CustomerBackupSchedulerWorker) Work(ctx context.Context, job *river.Job
 	// dropped hobby_plus + every _yearly variant when first written; the
 	// registry-driven path removes that single-site-list failure mode
 	// entirely (root CLAUDE.md rule 18).
+	//
+	// R2 (2026-06-10) — the resource_type filter grew from ('postgres',
+	// 'vector') to also include ('mongodb', 'redis'). The product sells
+	// "backups + 1-click restore" for ALL paid resources, but pre-R2 the
+	// ladder backed up postgres/vector ONLY — Mongo/Redis had ZERO automated
+	// backup (worker #103 note + GAP-AUDIT-2026-06-10). The runner now has a
+	// mongodump + redis-cli dump strategy (backup_dump.go), so all four types
+	// are tier-gated/cadence-driven identically. The list is anchored on
+	// backupSupportedResourceType() so SQL and the runner's dispatch can't
+	// drift (root rule 16/18 — single source for "what's backed up").
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT r.id::text, r.tier, r.team_id
 		FROM resources r
 		WHERE r.status = 'active'
-		  AND r.resource_type IN ('postgres', 'vector')
+		  AND r.resource_type IN ('postgres', 'vector', 'mongodb', 'redis')
 		  AND r.tier NOT IN ('anonymous', 'free')
 	`)
 	if err != nil {
