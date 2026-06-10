@@ -185,14 +185,15 @@ const (
 	// several ticks rather than spamming the k8s API in one burst.
 	orphanStuckBuildBatchLimit = 25
 
-	// orphanLiveIDsBatchLimit caps how many ids fetchLiveStackIDs pulls per
-	// round-trip. The full live-id set is still materialized into the
+	// orphanLiveIDsBatchLimit caps how many slugs fetchLiveStackSlugs pulls
+	// per round-trip. The full live-slug set is still materialized into the
 	// returned map (PASS 5 needs the complete set to decide orphan-hood),
 	// but the rows are streamed in keyset-paginated batches rather than one
 	// unbounded SELECT — bounding the server-side cursor + per-fetch memory
 	// so a stacks table that grows to tens of thousands of rows cannot
-	// pin a multi-MB result set in one allocation. Keyset (id > $1 ORDER BY
-	// id) is restart-safe and index-friendly (PK scan, no OFFSET drift).
+	// pin a multi-MB result set in one allocation. Keyset (slug > $1 ORDER BY
+	// slug) is restart-safe and index-friendly (idx_stacks_slug, no OFFSET
+	// drift).
 	orphanLiveIDsBatchLimit = 1000
 )
 
@@ -870,26 +871,29 @@ func (w *OrphanSweepReconciler) fetchLiveResourceTokens(ctx context.Context) (ma
 
 // ── PASS 5 — orphaned k8s stack namespaces (T6 P0-1) ─────────────────────
 
-// sweepOrphanedStackNamespaces lists every instant-stack-<id> namespace and
+// sweepOrphanedStackNamespaces lists every instant-stack-<slug> namespace and
 // deletes the ones whose backing `stacks` row is gone — the durable fix for
 // the T6 P0-1 leak (BugBash 2026-05-20).
 //
 // THE LEAK THIS CLOSES. The pre-fix ExpireStacksWorker carried nsPrefix
 // "instant-apps-" (derived from cfg.KubeNamespaceApps), but real stack
-// namespaces are "instant-stack-<id>". The safety guard in
+// namespaces are "instant-stack-<slug>". The safety guard in
 // deleteK8sNamespace refused every real stack namespace (returning
 // nil-success), and ExpireStacksWorker then DELETE'd the `stacks` row,
 // leaving the namespace + pods + service + ingress + TLS cert running
 // indefinitely with NO DB pointer ever again. PASS 5 is the recurrence
 // guard plus the catch-up sweep for pre-fix orphans.
 //
-// SAFETY. A namespace is deleted ONLY when its <id> has no row in the
-// `stacks` table (the row was hard-deleted by the buggy expirer). A
-// namespace whose row is still present — even in terminal status — is left
-// alone so the per-stack teardown path stays in charge of it.
+// SAFETY. A namespace is deleted ONLY when its <slug> has no row in the
+// `stacks` table (the row was hard-deleted by the buggy expirer). The token
+// after the prefix is the SLUG (namespace = "instant-stack-{slug}", migration
+// 004), NOT the UUID id — comparing it against the id set reaped every live
+// stack (the P0 this corrects). A namespace whose row is still present — even
+// in terminal status — is left alone so the per-stack teardown path stays in
+// charge of it.
 //
 // FAIL-OPEN. Identical to PASS 3/4: a namespace List failure or a DB blip
-// on the live-stack-ids query degrades to one WARN and a zero-orphan
+// on the live-stack-slugs query degrades to one WARN and a zero-orphan
 // result. The pass never returns an error — PASS 1/2/3/4 have already run.
 func (w *OrphanSweepReconciler) sweepOrphanedStackNamespaces(ctx context.Context) (deleted, failed int) {
 	if w.k8s == nil {
@@ -909,29 +913,31 @@ func (w *OrphanSweepReconciler) sweepOrphanedStackNamespaces(ctx context.Context
 		return 0, 0
 	}
 
-	liveStackIDs, err := w.fetchLiveStackIDs(ctx)
+	liveStackSlugs, err := w.fetchLiveStackSlugs(ctx)
 	if err != nil {
-		// A DB blip on the live-stack-ids query must NOT cause a delete
+		// A DB blip on the live-stack-slugs query must NOT cause a delete
 		// decision off an empty set — that would tear down every stack
 		// namespace. Skip the pass this sweep.
-		slog.Warn("jobs.orphan_sweep.pass5_live_stack_ids_failed",
+		slog.Warn("jobs.orphan_sweep.pass5_live_stack_slugs_failed",
 			"error", err.Error(),
 			"detail", "stack-namespace orphan cleanup skipped this sweep; PASS 1/2/3/4 still ran")
 		return 0, 0
 	}
 
 	for _, ns := range namespaces {
-		// The id portion is everything after the "instant-stack-" prefix.
-		// Stack IDs are UUIDs; we don't parse here — the in-Go string
-		// comparison against the live-ids set is exact.
-		stackID := ns[len(ExpireStacksNamespacePrefix):]
-		if stackID == "" {
+		// The token after the "instant-stack-" prefix is the stack's SLUG,
+		// NOT its UUID id. The api stack provider builds the namespace as
+		// "instant-stack-{slug}" (migration 004: `slug TEXT UNIQUE NOT NULL
+		// -- short ID used in namespace, URLs`; e.g. "stk-4abb338c"). The
+		// in-Go string comparison against the live-SLUG set is exact.
+		stackSlug := ns[len(ExpireStacksNamespacePrefix):]
+		if stackSlug == "" {
 			continue
 		}
-		if liveStackIDs[stackID] {
+		if liveStackSlugs[stackSlug] {
 			continue // a row still owns this namespace — leave it
 		}
-		// Orphan: no stacks row for this id.
+		// Orphan: no stacks row for this slug.
 		if delErr := w.k8s.DeleteNamespace(ctx, ns); delErr != nil {
 			failed++
 			metrics.OrphanSweepReapFailedTotal.WithLabelValues(orphanReapReasonStackNoRow).Inc()
@@ -951,52 +957,58 @@ func (w *OrphanSweepReconciler) sweepOrphanedStackNamespaces(ctx context.Context
 	return deleted, failed
 }
 
-// fetchLiveStackIDs returns the set of stack ids that still have a row in
-// the `stacks` table. Note: unlike PASS 4 (resources), we do NOT filter on
-// status — even a terminal-status stacks row pins its namespace so the
-// per-stack teardown path owns the delete. The pass is a strict "no row at
-// all = orphan" sweep.
+// fetchLiveStackSlugs returns the set of stack SLUGS that still have a row in
+// the `stacks` table. The slug — NOT the UUID id — is the token PASS 5 compares
+// against, because the api stack provider builds the namespace as
+// "instant-stack-{slug}" (migration 004: `slug TEXT UNIQUE NOT NULL`; the
+// table's `id` UUID PK is a separate column never embedded in the namespace).
+// Keying the liveness set by `id` here judged EVERY live stack namespace as an
+// orphan (slug ∉ UUID set) and reaped it within minutes — the P0 this fixes.
 //
-// Batching (bug bash 2026-06-03): the previous `SELECT id::text FROM stacks`
-// loaded the ENTIRE stacks table into one result set/allocation. This now
-// streams the ids in keyset-paginated batches of orphanLiveIDsBatchLimit
-// (WHERE id > $1 ORDER BY id LIMIT $2), so the server-side cursor + per-fetch
-// memory stay bounded regardless of table size. The complete set is still
-// returned — PASS 5 must see every live id to avoid deleting a live
-// namespace — but it is assembled incrementally rather than in one shot.
+// Note: unlike PASS 4 (resources), we do NOT filter on status — even a
+// terminal-status stacks row pins its namespace so the per-stack teardown path
+// owns the delete. The pass is a strict "no row at all = orphan" sweep.
+//
+// Batching: the slugs are streamed in keyset-paginated batches of
+// orphanLiveIDsBatchLimit (WHERE slug > $1 ORDER BY slug LIMIT $2), so the
+// server-side cursor + per-fetch memory stay bounded regardless of table size.
+// The complete set is still returned — PASS 5 must see every live slug to avoid
+// deleting a live namespace — but it is assembled incrementally. slug is TEXT
+// UNIQUE with index idx_stacks_slug (migration 004), so the keyset scan is
+// index-friendly.
 //
 // Keyset over OFFSET: an OFFSET sweep re-scans skipped rows each page and can
-// skip/duplicate ids if rows are inserted/deleted mid-sweep; the (id > last)
-// predicate rides the primary-key index and is stable under concurrent writes
-// (a brand-new stack id either sorts after the cursor — seen this sweep — or
+// skip/duplicate slugs if rows are inserted/deleted mid-sweep; the (slug > last)
+// predicate rides the slug index and is stable under concurrent writes (a
+// brand-new stack slug either sorts after the cursor — seen this sweep — or
 // before it — already seen; either way it lands in the set). Newly-inserted
 // stacks during the sweep are the conservative case for PASS 5 anyway: a
-// missed live id can only ever PRESERVE a namespace, never wrongly delete one.
-func (w *OrphanSweepReconciler) fetchLiveStackIDs(ctx context.Context) (map[string]bool, error) {
+// missed live slug can only ever PRESERVE a namespace, never wrongly delete one.
+func (w *OrphanSweepReconciler) fetchLiveStackSlugs(ctx context.Context) (map[string]bool, error) {
 	out := make(map[string]bool)
-	lastID := "" // keyset cursor: empty string sorts before every real id
+	lastSlug := "" // keyset cursor: empty string sorts before every real slug
 	for {
 		rows, err := w.db.QueryContext(ctx, `
-			SELECT id::text
+			SELECT slug
 			  FROM stacks
-			 WHERE id::text > $1
-			 ORDER BY id::text ASC
+			 WHERE slug > $1
+			 ORDER BY slug ASC
 			 LIMIT $2
-		`, lastID, orphanLiveIDsBatchLimit)
+		`, lastSlug, orphanLiveIDsBatchLimit)
 		if err != nil {
 			return nil, err
 		}
 		batchCount := 0
 		for rows.Next() {
-			var id string
-			if scanErr := rows.Scan(&id); scanErr != nil {
+			var slug string
+			if scanErr := rows.Scan(&slug); scanErr != nil {
 				_ = rows.Close()
 				return nil, scanErr
 			}
 			batchCount++
-			lastID = id
-			if id != "" {
-				out[id] = true
+			lastSlug = slug
+			if slug != "" {
+				out[slug] = true
 			}
 		}
 		if rowsErr := rows.Err(); rowsErr != nil {

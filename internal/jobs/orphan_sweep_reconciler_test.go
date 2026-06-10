@@ -674,14 +674,26 @@ func TestOrphanSweep_Pass4_NoCustomerNamespaces_NoQuery(t *testing.T) {
 //
 // THE FIX: (a) ExpireStacksWorker now carries the correct
 // "instant-stack-" prefix (workers.go). (b) PASS 5 (this test) lists
-// every instant-stack-* namespace and deletes any whose <id> has no row
+// every instant-stack-* namespace and deletes any whose <slug> has no row
 // in `stacks`, catching pre-fix orphans and guarding against recurrence.
 //
-// THE ASSERTION: given two stack namespaces — one whose id IS still
-// present in `stacks`, one whose id is NOT — PASS 5 deletes ONLY the
-// orphan. If a future edit drops PASS 5 (or reintroduces the prefix
-// mismatch via ExpireStacksWorker only and never adds the backstop),
-// the orphan is never deleted and this test fails.
+// CRITICAL — slug, NOT id (the 2026-06-11 P0). The namespace is
+// "instant-stack-{slug}" (migration 004: `slug TEXT UNIQUE NOT NULL`); the
+// table's `id` is a SEPARATE UUID PK never embedded in the namespace. Live
+// prod evidence: namespace `instant-stack-stk-4abb338c` (slug "stk-4abb338c",
+// NOT a UUID). The earlier version of this test seeded id == slug (both the
+// same UUID), so the buggy id-keyed liveness set happened to contain the
+// namespace token and the test passed despite the bug. This version seeds
+// id ≠ slug (the reality): the live row's slug "stk-abc123" is what the
+// namespace carries, while its id is an unrelated UUID. On the OLD code
+// (`SELECT id::text FROM stacks` → returns the UUID), the set is {<uuid>},
+// the namespace token "stk-abc123" is NOT in it, and the live namespace is
+// WRONGLY deleted — this test reds. On the FIXED code (`SELECT slug`), the
+// set is {"stk-abc123"}, the live namespace is recognized and kept.
+//
+// THE ASSERTION: given two stack namespaces — one whose SLUG IS still
+// present in `stacks`, one whose slug is NOT — PASS 5 deletes ONLY the
+// orphan.
 func TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -689,21 +701,28 @@ func TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace(t *testing.T) {
 	}
 	defer db.Close()
 
-	liveStackID := "1111aaaa-bbbb-cccc-dddd-eeeeffff0000"
-	orphanStackID := "2222aaaa-bbbb-cccc-dddd-eeeeffff0000"
-	liveNS := ExpireStacksNamespacePrefix + liveStackID
-	orphanNS := ExpireStacksNamespacePrefix + orphanStackID
+	// id ≠ slug is the whole point — the namespace carries the slug, the live
+	// set must be keyed by slug. The unrelated UUID id must NEVER make the
+	// live namespace look orphaned.
+	liveStackSlug := "stk-abc123"
+	liveStackID := "1111aaaa-bbbb-cccc-dddd-eeeeffff0000" // unrelated UUID PK
+	orphanStackSlug := "stk-gone"
+	liveNS := ExpireStacksNamespacePrefix + liveStackSlug
+	orphanNS := ExpireStacksNamespacePrefix + orphanStackSlug
+	_ = liveStackID // documents that the row's id is NOT the namespace token
 
 	// PASS 1 + 2 skipped (nil executor, nil canceler).
 	// PASS 3 (no deploy namespaces — fake returns empty).
 	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
 		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
 	// PASS 4 (no customer namespaces — fake returns empty; short-circuits).
-	// PASS 5: live-stack-ids query returns ONLY liveStackID → orphanNS is
-	// the orphan.
-	mock.ExpectQuery(`SELECT id::text\s+FROM stacks\s+WHERE id::text > \$1\s+ORDER BY id::text ASC\s+LIMIT \$2`).
+	// PASS 5: live-stack-slugs query returns ONLY the live slug → orphanNS is
+	// the orphan. On the OLD id-keyed code this query would be
+	// `SELECT id::text` and return the UUID, mismatching the slug token and
+	// wrongly deleting the LIVE namespace.
+	mock.ExpectQuery(`SELECT slug\s+FROM stacks\s+WHERE slug > \$1\s+ORDER BY slug ASC\s+LIMIT \$2`).
 		WithArgs("", orphanLiveIDsBatchLimit).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(liveStackID))
+		WillReturnRows(sqlmock.NewRows([]string{"slug"}).AddRow(liveStackSlug))
 
 	lister := newFakeNamespaceLister().withStackNamespaces(liveNS, orphanNS)
 	w := NewOrphanSweepReconciler(db, nil, nil, lister)
@@ -715,8 +734,46 @@ func TestOrphanSweep_Pass5_ReclaimsOrphanedStackNamespace(t *testing.T) {
 	}
 	if len(lister.deleted) != 1 || lister.deleted[0] != orphanNS {
 		t.Errorf("T6 P0-1 regression: deleted stack namespaces = %v, want [%s] "+
-			"(the orphan must be reclaimed; the live-stack namespace must be kept)",
-			lister.deleted, orphanNS)
+			"(the orphan must be reclaimed; the live-stack namespace — whose slug "+
+			"%q has a row — must be kept; keying liveness by the UUID id reaps it)",
+			lister.deleted, orphanNS, liveStackSlug)
+	}
+}
+
+// TestOrphanSweep_Pass5_EmptySlugNamespaceSkipped covers the empty-slug guard:
+// a bare "instant-stack-" namespace (prefix with no slug suffix) must be
+// skipped, never deleted. This can only arise from a malformed/foreign
+// namespace name; the guard ensures the prefix-strip can never yield an empty
+// token that then mismatches every live slug and gets wrongly reaped.
+func TestOrphanSweep_Pass5_EmptySlugNamespaceSkipped(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Bare prefix — slug portion is "".
+	bareNS := ExpireStacksNamespacePrefix
+
+	// PASS 3 (empty deploy set).
+	mock.ExpectQuery(`SELECT d.app_id, d.status, t.status, d.created_at\s+FROM deployments d\s+JOIN teams t`).
+		WillReturnRows(sqlmock.NewRows([]string{"app_id", "d_status", "t_status", "created_at"}))
+	// PASS 5: live-slug set is empty; the bare-prefix namespace must STILL be
+	// skipped by the empty-slug guard (NOT treated as an orphan and deleted).
+	mock.ExpectQuery(`SELECT slug\s+FROM stacks\s+WHERE slug > \$1\s+ORDER BY slug ASC\s+LIMIT \$2`).
+		WithArgs("", orphanLiveIDsBatchLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"slug"}))
+
+	lister := newFakeNamespaceLister().withStackNamespaces(bareNS)
+	w := NewOrphanSweepReconciler(db, nil, nil, lister)
+	if err := w.Work(context.Background(), orphanFakeJob[OrphanSweepReconcilerArgs]()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+	if len(lister.deleted) != 0 {
+		t.Errorf("empty-slug namespace must be skipped, not deleted; got %v", lister.deleted)
 	}
 }
 

@@ -781,8 +781,8 @@ var (
 	//                                   namespace whose token has no
 	//                                   active/paused/suspended resources row
 	//                                   (the MR-P0-1b backstop).
-	//   reason="stack_no_row"         — PASS 5: instant-stack-<id> namespace
-	//                                   whose id has no stacks row (the
+	//   reason="stack_no_row"         — PASS 5: instant-stack-<slug> namespace
+	//                                   whose slug has no stacks row (the
 	//                                   T6 P0-1 prefix-mismatch backstop).
 	//
 	// NR alert (mandatory):
