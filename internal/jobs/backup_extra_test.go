@@ -121,6 +121,22 @@ func TestCommonPlanRegistryAdapter_Delegates(t *testing.T) {
 	if d := adapter.BackupRetentionDays("pro"); d <= 0 {
 		t.Errorf("BackupRetentionDays(pro) = %d; want > 0", d)
 	}
+	// RPOMinutes delegation — the scheduler cadence gate reads this. Pin the
+	// contract against the real embedded plans.yaml: pro/growth/team promise
+	// a 60-minute RPO (→ hourly cadence) while anonymous promises 0 (→ never
+	// backed up). A plans.yaml edit that breaks either trips here.
+	for _, tier := range []string{"pro", "growth", "team"} {
+		if m := adapter.RPOMinutes(tier); m != 60 {
+			t.Errorf("RPOMinutes(%q) = %d; want 60 (hourly-cadence promise)", tier, m)
+		}
+	}
+	if m := adapter.RPOMinutes("anonymous"); m != 0 {
+		t.Errorf("RPOMinutes(anonymous) = %d; want 0 (never backed up)", m)
+	}
+	// hobby promises a coarser daily RPO (1440) → daily cadence.
+	if m := adapter.RPOMinutes("hobby"); m <= 60 {
+		t.Errorf("RPOMinutes(hobby) = %d; want > 60 (daily cadence)", m)
+	}
 	names := adapter.TierNames()
 	if len(names) == 0 {
 		t.Fatal("TierNames returned empty slice")
@@ -719,8 +735,8 @@ func TestRunner_ProcessBackup_BadAESKey(t *testing.T) {
 	w := &CustomerBackupRunnerWorker{
 		db: db, store: newFakeBackupStore(), pgDump: &fakePgDump{},
 		bucket: "b", prefix: "p",
-		aesKey:  "not-hex-not-valid-please-fail",
-		now:     time.Now, timeout: time.Minute, batchN: backupBatchSize,
+		aesKey: "not-hex-not-valid-please-fail",
+		now:    time.Now, timeout: time.Minute, batchN: backupBatchSize,
 	}
 	if err := w.Work(context.Background(), fakeRunnerJob()); err != nil {
 		t.Fatalf("Work: %v", err)
@@ -922,12 +938,11 @@ func TestCustomerBackupSchedulerArgs_Kind(t *testing.T) {
 	}
 }
 
-// TestScheduler_AnonymousTier_DoesNotInsert — defensive: an anonymous row
-// in resource.tier slips the SQL filter (it shouldn't, but the cadence
-// switch also gates it). canonicalTier returns "anonymous"; the switch
-// has no case for it, so the row proceeds to the dedupe INSERT — which
-// is fine because the SQL filter excludes anonymous-tier rows in the
-// first place. This test pins that contract via the SELECT shape.
+// TestScheduler_AnonymousTier_DoesNotInsert — defensive: anonymous rows are
+// excluded by the SQL WHERE clause (`tier NOT IN ('anonymous','free')`), so
+// the candidate set is empty and no INSERT fires. Even if one leaked through,
+// the registry cadence gate (rpo_minutes:0 → cadenceNever) skips it. This
+// test pins the SQL-exclusion contract via the empty SELECT.
 func TestScheduler_AnonymousTier_DoesNotInsert(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -939,7 +954,7 @@ func TestScheduler_AnonymousTier_DoesNotInsert(t *testing.T) {
 	mock.ExpectQuery(`SELECT r\.id::text`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tier", "team_id"}))
 
-	w := NewCustomerBackupSchedulerWorker(db)
+	w := NewCustomerBackupSchedulerWorker(db, schedulerPlans())
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 0, 0, 0, 0, time.UTC) }
 	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
 		t.Fatalf("Work: %v", err)
@@ -961,7 +976,7 @@ func TestScheduler_HobbyMissingTeamID_Skips(t *testing.T) {
 			AddRow(resID, "hobby", nil))
 	// No INSERT expected.
 
-	w := NewCustomerBackupSchedulerWorker(db)
+	w := NewCustomerBackupSchedulerWorker(db, schedulerPlans())
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 0, 0, 0, 0, time.UTC) }
 	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
 		t.Fatalf("Work: %v", err)
@@ -987,7 +1002,7 @@ func TestScheduler_InsertError_LoggedNonFatal(t *testing.T) {
 		WithArgs(uuid.MustParse(resID), "pro").
 		WillReturnError(errors.New("db hiccup"))
 
-	w := NewCustomerBackupSchedulerWorker(db)
+	w := NewCustomerBackupSchedulerWorker(db, schedulerPlans())
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 14, 0, 0, 0, time.UTC) }
 	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
 		t.Errorf("Work: per-row insert error must be non-fatal: %v", err)
@@ -1010,7 +1025,7 @@ func TestScheduler_BadUUIDInRow_Skipped(t *testing.T) {
 			AddRow("not-a-uuid", "pro", teamID))
 	// No INSERT expected — bad UUID short-circuits the per-row body.
 
-	w := NewCustomerBackupSchedulerWorker(db)
+	w := NewCustomerBackupSchedulerWorker(db, schedulerPlans())
 	w.now = func() time.Time { return time.Date(2026, 5, 13, 14, 0, 0, 0, time.UTC) }
 	if err := w.Work(context.Background(), fakeSchedulerJob()); err != nil {
 		t.Fatalf("Work: %v", err)
