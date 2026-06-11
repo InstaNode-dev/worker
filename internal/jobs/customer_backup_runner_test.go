@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -422,6 +423,82 @@ func TestRunner_RecoversStuckRunningRows(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("stuck-row recovery did not run before the pending sweep — P2-W4 regressed: %v", err)
+	}
+}
+
+// TestRecoverStuckRows_NeverBindsNullStartedAt is the regression test for the
+// 2026-06-11 P1: recoverStuckRows shipped with `SET ... started_at = NULL`,
+// but resource_backups.started_at is `TIMESTAMPTZ NOT NULL` (api migration
+// 031_backups.sql). In prod that UPDATE failed on EVERY 30-60s tick with
+//
+//	pq: null value in column "started_at" of relation "resource_backups"
+//	violates not-null constraint
+//
+// so stuck-row recovery NEVER worked and the log flooded. sqlmock does NOT
+// enforce NOT-NULL, which is exactly why the prior regex-matcher test stayed
+// green through the bug. This test inspects the literal SQL the runner emits
+// for the recovery UPDATE and FAILS if it ever sets started_at to NULL again.
+// It reds on the old code (which contained `started_at = NULL`) and greens on
+// the fix (which drops the clause, leaving started_at untouched on re-queue).
+func TestRecoverStuckRows_NeverBindsNullStartedAt(t *testing.T) {
+	var capturedRecoverySQL string
+	matcher := sqlmock.QueryMatcherFunc(func(expectedSQL, actualSQL string) error {
+		// The recovery UPDATE is the only statement that resets a row to
+		// 'pending'. Capture its exact text so we can assert on it below.
+		if strings.Contains(actualSQL, "SET status = 'pending'") &&
+			strings.Contains(actualSQL, "WHERE status = 'running'") {
+			capturedRecoverySQL = actualSQL
+		}
+		// Defer to the default regex semantics so the rest of the tick's
+		// expectations match exactly as in the other tests.
+		return sqlmock.QueryMatcherRegexp.Match(expectedSQL, actualSQL)
+	})
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec(`UPDATE resource_backups\s+SET status = 'pending'`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Pending sweep finds nothing else this tick.
+	mock.ExpectQuery(`SELECT b.id::text`).
+		WithArgs(backupBatchSize).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "resource_id", "tier_at_backup", "backup_kind",
+			"token", "connection_url", "resource_type", "team_id",
+		}))
+	// Retention sweep loops the five fallback tier names.
+	for i := 0; i < 5; i++ {
+		mock.ExpectQuery(`SELECT id::text, s3_key\s+FROM resource_backups`).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "s3_key"}))
+	}
+
+	w := &CustomerBackupRunnerWorker{
+		db:      db,
+		store:   newFakeBackupStore(),
+		pgDump:  &fakePgDump{payload: []byte("x")},
+		bucket:  "instant-shared",
+		prefix:  "backups",
+		aesKey:  testAESKeyHex,
+		now:     time.Now,
+		timeout: time.Minute,
+		batchN:  backupBatchSize,
+	}
+	if err := w.Work(context.Background(), fakeRunnerJob()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
+	if capturedRecoverySQL == "" {
+		t.Fatal("recovery UPDATE was never emitted — test did not exercise recoverStuckRows")
+	}
+	// The crux: the recovery UPDATE must NOT set started_at to NULL. The
+	// column is NOT NULL, so any `started_at = NULL` makes the statement
+	// fail in prod on every tick. Case-insensitive, whitespace-tolerant.
+	normalized := strings.ToLower(strings.Join(strings.Fields(capturedRecoverySQL), " "))
+	if strings.Contains(normalized, "started_at = null") {
+		t.Errorf("recovery UPDATE binds NULL to NOT-NULL started_at — P1 regression:\n%s", capturedRecoverySQL)
 	}
 }
 
