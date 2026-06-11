@@ -348,10 +348,19 @@ func (w *CustomerBackupRunnerWorker) Work(ctx context.Context, job *river.Job[Cu
 // failure here is logged and the sweep proceeds (the pending-row scan
 // still drains the normal queue).
 func (w *CustomerBackupRunnerWorker) recoverStuckRows(ctx context.Context) {
+	// We DELIBERATELY do not touch started_at here. The column is
+	// `TIMESTAMPTZ NOT NULL` (api migration 031_backups.sql), so an explicit
+	// `started_at = NULL` violates the constraint and makes the UPDATE fail
+	// on EVERY tick (the row stays orphaned at 'running', recovery never
+	// works, and the log floods with stuck_row_recovery_failed). Leaving the
+	// stale started_at in place is correct: the re-claim in processBackup
+	// runs `SET started_at = now()`, so the value is overwritten the instant
+	// the row is re-picked, and the WHERE-clause floor below (started_at <
+	// now() - timeout) only ever re-matches a row that has been 'running'
+	// again past the timeout — never a freshly-reset 'pending' row.
 	res, err := w.db.ExecContext(ctx, `
 		UPDATE resource_backups
 		   SET status = 'pending',
-		       started_at = NULL,
 		       error_summary = 'recovered: runner pod lost before finalize — re-queued'
 		 WHERE status = 'running'
 		   AND started_at IS NOT NULL
@@ -592,23 +601,43 @@ func (w *CustomerBackupRunnerWorker) processBackup(parentCtx context.Context, p 
 // the api's internal refund endpoint so the team's daily counter is
 // credited. Scheduled backups don't burn the manual-counter so no
 // refund is needed.
-// backupFailReason classifies a pg_dump failure into "auth" (the credential
-// was rejected — password auth failed, missing role, no password supplied:
-// credential drift that will NOT self-heal and is SLA-relevant) vs "dump" (any
-// other pg_dump failure — DB briefly unreachable, timeout: transient, retried
-// next run). The match is on Postgres' own error text, lower-cased so it's
-// resilient to surrounding formatting.
+// backupFailReason classifies a dump failure into "auth" (the credential was
+// rejected — credential drift that will NOT self-heal and is SLA-relevant,
+// PAGES ops) vs "dump" (any other failure — DB briefly unreachable, timeout:
+// transient, retried next run). The match is on the dump tool's own error
+// text, lower-cased so it's resilient to surrounding formatting.
+//
+// R2 (2026-06-11) — the matcher now spans all THREE dump tools, not just
+// pg_dump. The 2026-06-11 P1 incident showed mongodump auth errors
+// ("auth error: ... SCRAM-SHA-256") and redis-cli auth errors ("WRONGPASS",
+// "NOAUTH") were silently bucketed as transient "dump" — telling the customer
+// "briefly unreachable, we'll retry" for a credential failure that retrying
+// can NEVER fix, and NOT paging ops on a non-self-healing condition. Each
+// backend speaks its own auth dialect, so we match all of them here.
 func backupFailReason(err error) string {
 	if err == nil {
 		return "dump"
 	}
 	s := strings.ToLower(err.Error())
 	switch {
+	// Postgres (pg_dump) auth dialect.
 	case strings.Contains(s, "password authentication failed"),
 		strings.Contains(s, "authentication failed"),
 		strings.Contains(s, "no password supplied"),
 		strings.Contains(s, "role") && strings.Contains(s, "does not exist"),
-		strings.Contains(s, "permission denied for"):
+		strings.Contains(s, "permission denied for"),
+		// MongoDB (mongodump) auth dialect: the driver reports an
+		// "auth error" wrapping a SASL/SCRAM failure, and "authentication
+		// failed" on an outright user/db mismatch.
+		strings.Contains(s, "auth error"),
+		strings.Contains(s, "unable to authenticate"),
+		strings.Contains(s, "sasl"),
+		// Redis (redis-cli) auth dialect: WRONGPASS (bad user/pass),
+		// NOAUTH (server wants a password we didn't send), and the
+		// human-readable "invalid username-password pair".
+		strings.Contains(s, "wrongpass"),
+		strings.Contains(s, "noauth"),
+		strings.Contains(s, "invalid username-password"):
 		return "auth"
 	default:
 		return "dump"

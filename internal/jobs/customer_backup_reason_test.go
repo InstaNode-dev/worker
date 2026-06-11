@@ -27,8 +27,19 @@ func TestBackupFailReason(t *testing.T) {
 		{"no password supplied", errors.New("pg_dump: error: no password supplied"), "auth"},
 		{"role does not exist", errors.New(`FATAL: role "usr_abc" does not exist`), "auth"},
 		{"permission denied", errors.New("permission denied for table users"), "auth"},
+		// R2 (2026-06-11) — the exact mongo + redis prod stderr from the P1
+		// incident. Before the fix these classified "dump" (transient) and
+		// told the customer "briefly unreachable, we'll retry" for a
+		// non-self-healing credential failure, and never paged ops.
+		{"prod mongo SCRAM auth", errors.New(`mongodump: exit status 1 (stderr: Failed: can't create session: failed to connect to mongodb://usr_x:y@mongo.instanode.dev:27017/db_x?authSource=db_x: connection() error occurred during connection handshake: auth error: sasl conversation error: unable to authenticate using mechanism "SCRAM-SHA-256":  connection(mongo.instanode.dev:27017[-3]) socket was unexpectedly closed: EOF)`), "auth"},
+		{"mongo plain authentication failed", errors.New("mongodump: Failed: Authentication failed."), "auth"},
+		{"mongo unable to authenticate", errors.New("unable to authenticate using mechanism"), "auth"},
+		{"prod redis WRONGPASS", errors.New(`redis-cli --rdb: exit status 1 (stderr: AUTH failed: WRONGPASS invalid username-password pair or user is disabled.)`), "auth"},
+		{"redis NOAUTH", errors.New("redis-cli --rdb: NOAUTH Authentication required."), "auth"},
 		{"server unavailable is transient", errors.New("pg_dump: server unavailable"), "dump"},
 		{"connection refused is transient", errors.New("connection refused"), "dump"},
+		{"mongo connection refused is transient", errors.New("mongodump: Failed: can't create session: connection refused"), "dump"},
+		{"redis timeout is transient", errors.New("redis-cli --rdb: Could not connect to Redis: Connection timed out"), "dump"},
 		{"nil err defaults to dump", nil, "dump"},
 	}
 	for _, c := range cases {
