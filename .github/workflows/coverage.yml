@@ -71,21 +71,21 @@ jobs:
       # the drift-detection coverage. Mirrors ci.yml.
       INSTANT_API_REPO: ${{ github.workspace }}/../api
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: worker
           # Full history so diff-cover can resolve origin/<base_ref>.
           fetch-depth: 0
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           path: proto
 
       - name: Checkout common sibling (for go.mod replace ../common)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -97,7 +97,7 @@ jobs:
       # in CI, leaving cross-repo drift detection to developer machines
       # only. INSTANT_API_REPO env (set above) locates this checkout.
       - name: Checkout api sibling (for cross-repo registry-iterating tests)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
