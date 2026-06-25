@@ -938,7 +938,11 @@ func TestEventForwarder_CursorWriteErr_AfterPermanent(t *testing.T) {
 func TestForwarder_LedgerClaim_AllColumnsRoundtripThroughInsert(t *testing.T) {
 	db, mock, _ := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	defer db.Close()
-	mock.ExpectExec(`INSERT INTO forwarder_sent\s*\(audit_id, provider, provider_id, recipient, template_kind, classification\)`).
+	// SQL now includes audit_log_id (mig 072): the CASE expression sets it to
+	// $1::uuid when audit_id is UUID-shaped, NULL otherwise. The regex matches
+	// the new column list and the CASE expression so this test catches any
+	// future column drift.
+	mock.ExpectExec(`INSERT INTO forwarder_sent\s*\(audit_id, provider, provider_id, recipient, template_kind, classification, audit_log_id\)`).
 		WithArgs("a1", providerNoneMissingRenderer, providerIDMissingRenderer, "a***@example.com", "anon.expiry_warning", ledgerClassPermanentDrop).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
