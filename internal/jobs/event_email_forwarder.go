@@ -249,10 +249,21 @@ func (l *sqlSentLedger) isSent(ctx context.Context, auditID string) (bool, error
 // answer "what happened to email X" without log-spelunking. The caller
 // MUST pre-mask the recipient (see ledgerClaim doc).
 func (l *sqlSentLedger) markSent(ctx context.Context, c ledgerClaim) (bool, error) {
+	// audit_log_id is the real UUID FK companion to the soft-FK audit_id TEXT
+	// column (mig 072). Populate it when audit_id is UUID-shaped so the
+	// orphan-reconciler and team-deletion cascade can use a typed JOIN.
+	// Placeholder IDs ("reminder-<resource_id>-<stage>", "provider-<grace_id>")
+	// leave audit_log_id NULL — the SQL CASE never casts them.
 	res, err := l.db.ExecContext(ctx, `
 		INSERT INTO forwarder_sent
-			(audit_id, provider, provider_id, recipient, template_kind, classification)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(audit_id, provider, provider_id, recipient, template_kind, classification, audit_log_id)
+		VALUES (
+			$1, $2, $3, $4, $5, $6,
+			CASE WHEN $1 ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+			     THEN $1::uuid
+			     ELSE NULL
+			END
+		)
 		ON CONFLICT (audit_id) DO NOTHING
 	`, c.AuditID, c.Provider, c.ProviderID, c.Recipient, c.TemplateKind, c.Classification)
 	if err != nil {
