@@ -97,10 +97,10 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
       TEST_REDIS_URL: redis://localhost:6379/15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Checkout proto sibling (replace ../proto)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -108,7 +108,7 @@ jobs:
       - run: mv _proto_ci ../proto
 
       - name: Checkout common sibling (replace ../common)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -116,7 +116,7 @@ jobs:
       - run: mv _common_ci ../common
 
       - name: Checkout api sibling (for migrations + cross-repo tests)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -159,12 +159,12 @@ jobs:
     needs: integration
     steps:
       - name: Checkout worker (this repo) into ./worker
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: worker
 
       - name: Checkout common sibling into ./common
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           # 2026-05-15: GITHUB_TOKEN is scoped to THIS repo only and 404s
@@ -175,7 +175,7 @@ jobs:
           path: common
 
       - name: Checkout proto sibling into ./proto
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -188,7 +188,7 @@ jobs:
       # detection to developer machines only. INSTANT_API_REPO is set on the
       # test step below so findApiRepoRoot() locates the sibling deterministically.
       - name: Checkout api sibling into ./api (for cross-repo registry-iterating tests)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.API_REPO || format('{0}/api', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
