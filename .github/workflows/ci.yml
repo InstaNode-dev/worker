@@ -88,7 +88,7 @@ jobs:
           fetch-depth: 1
       - run: mv _api_ci ../api
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
 
@@ -195,7 +195,7 @@ jobs:
           fetch-depth: 1
       - run: mv _api_ci ../api
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
 
