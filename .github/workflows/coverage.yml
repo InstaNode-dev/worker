@@ -105,7 +105,7 @@ jobs:
           fetch-depth: 1
       - run: mv _api_ci ../api
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: worker/go.mod
 
@@ -166,7 +166,7 @@ jobs:
       # "Generate coverage" step is `|| true` so it still produces
       # coverage.out even on a flaky test — the gate reads that file.
       # ------------------------------------------------------------------
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: github.event_name == 'pull_request'
         with:
           python-version: '3.12'
